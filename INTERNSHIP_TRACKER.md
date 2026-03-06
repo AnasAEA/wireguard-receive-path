@@ -26,8 +26,9 @@ io_uring-based implementations in applications like **WireGuard** are slower tha
 - Non-optimal queueing/scheduling policies
 
 ### Specific Tasks
-- [ ] Evaluate io_uring performance for transparent file system access in heterogeneous environments
-- [ ] Analyze queueing/scheduling bottlenecks related to kernel threads and workqueues in async I/O path
+- [x] Evaluate io_uring performance for transparent file system access in heterogeneous environments — *baseline investigation complete, see IO_URING_REFERENCE.md*
+- [x] Understand how io-wq workers are triggered and what changed between kernel versions (`IORING_FEAT_NO_IOWAIT` discovery)
+- [ ] Analyze queueing/scheduling bottlenecks related to kernel threads and workqueues in async I/O path — *in progress: tools verified, need network workload next*
 - [ ] Reproduce and characterize overhead (latency, context switches, contention, CPU cycles) caused by non-optimal queueing policies
 - [ ] Stress test I/O-intensive applications (microbench + application workloads) to highlight performance limits and variability
 - [ ] Propose and evaluate scheduling/queue management solutions to reduce overhead (batching, CPU affinity, wakeup reduction, worker tuning)
@@ -45,14 +46,14 @@ io_uring-based implementations in applications like **WireGuard** are slower tha
 - [ ] **Document** reproducible scripts + configs so someone else can rerun everything in one command
 
 ### Milestones
-| Phase | Deliverable | Target Date |
-|-------|-------------|-------------|
-| 0. Setup | Linux environment (Fedora Asahi Remix) on MacBook | **Feb 6-7** |
-| 1. Understand | Reading summaries + knowledge base | Mid-February |
-| 2. Reproduce | Clean baseline benchmark with <10% variance | End of February |
-| 3. Measure | Overhead attribution report (context switches, migrations, etc.) | Mid-March |
-| 4. Mitigate | Tested improvement with one approach | April |
-| 5. Document | Final report + reproducibility pack | End of internship |
+| Phase | Deliverable | Target Date | Status |
+|-------|-------------|-------------|--------|
+| 0. Setup | Linux environment (Fedora Asahi Remix) on MacBook | **Feb 6-7** | ✅ Done |
+| 1. Understand | Reading summaries + knowledge base | Mid-February | ✅ Done — io_uring architecture fully understood, live investigation complete |
+| 2. Reproduce | Clean baseline benchmark with <10% variance | End of February | 🟡 In Progress — need WireGuard/network workload |
+| 3. Measure | Overhead attribution report (context switches, migrations, etc.) | Mid-March | ⬜ Not started |
+| 4. Mitigate | Tested improvement with one approach | April | ⬜ Not started |
+| 5. Document | Final report + reproducibility pack | End of internship | ⬜ Not started |
 
 ---
 
@@ -157,8 +158,8 @@ io_uring-based implementations in applications like **WireGuard** are slower tha
 ### From André Freyssinet
 | Resource | Link | Status | Notes |
 |----------|------|--------|-------|
-| Lord of the io_uring | https://unixism.net/loti/ | 🟡 In Progress | Started Jan 31 - covered async models, Linux AIO limitations, regular file problem |
-| Cloudflare: Missing Manuals - io_uring Worker Pool | https://blog.cloudflare.com/missing-manuals-io_uring-worker-pool/ | ⬜ Not Started | About workqueues usage in io_uring |
+| Lord of the io_uring | https://unixism.net/loti/ | ✅ Done | Fully read + notes + live investigation — see `notes/notes_Lord_of_io_uring.md` and `IO_URING_REFERENCE.md` |
+| Cloudflare: Missing Manuals - io_uring Worker Pool | https://blog.cloudflare.com/missing-manuals-io_uring-worker-pool/ | 🔴 **Priority Next** | Directly describes the worker pool behavior we are now investigating |
 | LWN: io_uring Article (803070) | https://lwn.net/Articles/803070/ | ⬜ Not Started | |
 | LWN: Asynchronism in Kernel (223899) | https://lwn.net/Articles/223899/ | ⬜ Not Started | Old article on workqueues |
 | LWN: Asynchronism in Kernel (236206) | https://lwn.net/Articles/236206/ | ⬜ Not Started | Old article on workqueues |
@@ -166,7 +167,7 @@ io_uring-based implementations in applications like **WireGuard** are slower tha
 ### From Alain Tchana
 | Resource | Status | Notes |
 |----------|--------|-------|
-| Paper: "The Impact of Kernel Asynchronous APIs on the Performance of a Kernel VPN" | ⬜ Not Started | Key paper - demonstrates 4.7× throughput increase, 65% tail latency reduction |
+| Paper: "The Impact of Kernel Asynchronous APIs on the Performance of a Kernel VPN" | 🔴 **Priority Next** | Key paper - demonstrates 4.7× throughput increase, 65% tail latency reduction. Now that we understand io_uring internals, this paper will read differently. |
 
 ### Additional Reading (From Notes)
 | Resource | Status | Notes |
@@ -249,6 +250,45 @@ io_uring-based implementations in applications like **WireGuard** are slower tha
 - Continue reading "Lord of the io_uring" (architecture, usage patterns)
 - Read Cloudflare worker pool article
 - Take notes on when/why io_uring offloads to workers
+
+**Blockers:**
+- None
+
+---
+
+### Week N (March 6, 2026) — Live Kernel Investigation
+
+#### Friday, March 6
+**What I did:**
+- ✅ Completed full read of "Lord of the io_uring" — from async models through raw API, SQE/CQE structure, and low-level cat example
+- ✅ Built and ran `cat_uring` (raw io_uring, no liburing) — successfully reads and prints files
+- ✅ Ran live kernel investigation using strace, perf, and bpftrace
+- ✅ Created `IO_URING_REFERENCE.md` — structured reference document for supervisor discussions
+- ✅ Set up git repo `git@github.com:AnasAEA/Io-uring-Internship.git` — all work committed and pushed
+
+**What I learned:**
+1. **`IORING_FEAT_NO_IOWAIT` changes everything for file reads** — on kernel 5.18+, buffered reads block inline inside `io_uring_enter()` rather than spawning io-wq workers. `io_uring_queue_async_work` never fired, even with cold cache.
+2. **Warm vs cold cache latency:** 3.7µs (warm) vs 132µs (cold) — 35.9× difference. Pure storage latency.
+3. **Context switches confirmed at small scale:** 4 ctx switches + 1 CPU migration for a single cold 11KB read. At WireGuard scale, this penalty multiplies.
+4. **The io-wq bottleneck is network-path, not file-path on modern kernels.** WireGuard research must focus on the socket/network operations in io_uring, not file reads.
+5. **17 io_uring kernel tracepoints available** on this kernel. The suite of tools (bpftrace, perf, strace, trace-cmd) all confirmed working.
+6. **`IORING_FEAT_NATIVE_WORKERS` present** — io-wq workers are native threads since 5.12, which reduces but does not eliminate worker overhead.
+
+**What surprised me:**
+- The textbook "buffered read → io-wq worker" path is obsolete on modern kernels. The architecture changed in 5.18 with `NO_IOWAIT`. Old io_uring articles describe behavior that no longer applies.
+- Zero sys time with warm cache — the program completes without the kernel scheduling anything at all.
+
+**Concrete outputs:**
+- `io_uring_examples/cat_program_io_uring/cat_uring` — compiled and working
+- `io_uring_examples/cat_program_io_uring/Makefile` — build + run + clean targets
+- `notes/notes_Lord_of_io_uring.md` — full notes with deep analysis + live results
+- `IO_URING_REFERENCE.md` — **new** structured reference document
+- GitHub: 3 commits pushed
+
+**Next steps:**
+- Read Cloudflare worker pool article (NOW high priority — need to understand io-wq network path)
+- Read the Kernel VPN paper (understand the WireGuard result before trying to reproduce)
+- Write a minimal io_uring TCP server and attach bpftrace to see if io-wq fires on the network path
 
 **Blockers:**
 - None
@@ -389,10 +429,12 @@ io_uring-based implementations in applications like **WireGuard** are slower tha
 ### Hypotheses to Test
 | ID | Hypothesis | How to Test | Status |
 |----|------------|-------------|--------|
-| H1 | io_uring workers cause excessive context switches | Measure ctx switches with/without worker offload | ⬜ |
-| H2 | Workers migrate between CPUs, causing cache misses | Track CPU migrations with `perf stat` | ⬜ |
+| H1 | io_uring workers cause excessive context switches | Measure ctx switches with/without worker offload | 🟡 Partially confirmed — 4 ctx switches seen even for 1 tiny cold read. Need scale. |
+| H2 | Workers migrate between CPUs, causing cache misses | Track CPU migrations with `perf stat` | 🟡 Partially confirmed — 1 CPU migration seen on cold read. Need scale. |
 | H3 | Batching SQEs reduces wakeup overhead | Compare throughput at batch sizes 1/8/32/128 | ⬜ |
 | H4 | CPU pinning workers improves tail latency | Test with taskset/cgroups | ⬜ |
+| H5 | `IORING_FEAT_NO_IOWAIT` means io-wq is NOT taken for buffered reads on modern kernels | Verified with bpftrace — `io_uring_queue_async_work` never fired | ✅ Confirmed on kernel 6.18 |
+| H6 | io-wq IS triggered for network socket operations (WireGuard-relevant path) | Run bpftrace on loopback TCP with io_uring RECV | ⬜ To test |
 
 ---
 
@@ -409,48 +451,54 @@ io_uring-based implementations in applications like **WireGuard** are slower tha
 ```
 Internship-Io-uring/
 ├── INTERNSHIP_TRACKER.md           # This file
+├── IO_URING_REFERENCE.md           # ✅ NEW — structured reference for supervisor discussions
 ├── notes/
+│   ├── notes_Lord_of_io_uring.md   # ✅ Full notes: async models → raw API → live investigation
 │   ├── notes_io_uring for High-Performance DBMSs...md
 │   └── setup_fedora_asahi_remix_dual_boot.md
-├── readings/                       # Summaries of papers/articles
-│   ├── cloudflare_worker_pool.md
-│   ├── kernel_vpn_paper.md
-│   └── lwn_workqueues.md
-├── experiments/                    # Experiment configs and raw data
+├── io_uring_examples/
+│   └── cat_program_io_uring/
+│       ├── cat.c                   # ✅ Raw io_uring cat implementation (372 lines, no liburing)
+│       ├── cat_uring               # ✅ Compiled binary
+│       └── Makefile                # ✅ Build + run + clean
+├── readings/                       # Summaries of papers/articles (to be filled)
+├── experiments/                    # Experiment configs and raw data (to be filled)
 │   ├── baseline/
-│   ├── exp-001-sqpoll/
-│   └── exp-002-affinity/
+│   └── exp-001-network-io-wq/      # Next experiment: does io-wq fire on network path?
 ├── scripts/
 │   ├── run_all.sh                  # Holy grail: reproduce everything
-│   ├── setup_env.sh
 │   └── collect_metrics.sh
-├── results/                        # Processed results and graphs
-├── reports/                        # Weekly/monthly reports
-└── code/                           # Any code written
+├── results/
+└── .vscode/
+    ├── settings.json               # ✅ C11, format-on-save, hide binaries
+    └── extensions.json             # ✅ Recommended extensions
 ```
 
 ---
 
 ## ✅ Next Actions (Priority Order)
 
-### This Week (Jan 31)
+### Completed
 1. ✅ Created internship tracker
-2. ✅ Started reading "Lord of the io_uring" tutorial
+2. ✅ Installed Fedora Asahi Remix on MacBook M1 Pro
+3. ✅ Installed dev tools (`perf`, `bpftrace`, `trace-cmd`, `gcc`, `git`)
+4. ✅ Read "Lord of the io_uring" — full tutorial, detailed notes
+5. ✅ Built and ran `cat_uring` — raw io_uring working
+6. ✅ Live kernel investigation with strace, perf, bpftrace
+7. ✅ Created `IO_URING_REFERENCE.md` — structured supervisor reference
+8. ✅ Set up GitHub repo and pushed all work
 
-### This Week (Feb 5-7)
-3. 🔴 **PRIORITY: Install Fedora Asahi Remix** → See `notes/setup_fedora_asahi_remix_dual_boot.md`
-4. ⬜ After Linux is running: install dev tools (`liburing-devel`, `perf`, `bpftrace`, `fio`)
-5. ⬜ Read Cloudflare worker pool article → Output: 1-page summary
-6. ⬜ **Fri (Feb 7):** Read Kernel VPN paper → Output: extraction of setup/metrics/results
+### Now (March 2026)
+1. 🔴 **Read Cloudflare worker pool article** — describes io-wq network path, directly relevant
+2. 🔴 **Read Kernel VPN paper** (Alain's paper) — understand the 4.7× result before reproducing
+3. ⬜ Write minimal io_uring TCP server → attach bpftrace → verify io-wq fires on network path
+4. ⬜ Contact Toulouse researcher for existing benchmark suite
+5. ⬜ Get WireGuard setup from Brice/Teo
 
-### Week After (Feb 10-14)
-5. ⬜ Read LWN workqueue articles (223899, 236206)
-6. ⬜ Contact Toulouse researcher for benchmark setup
-7. ⬜ Get WireGuard setup info from Brice/Teo
-
-### Before End of February
-8. ⬜ Have benchmark environment running
-9. ⬜ Reproduce baseline slowdown with <10% variance
+### Before End of March
+6. ⬜ Have WireGuard benchmark environment running
+7. ⬜ Reproduce the io_uring vs Go slowdown with <10% variance
+8. ⬜ Attribute overhead to at least one measurable mechanism
 
 ---
 
@@ -467,4 +515,4 @@ Internship-Io-uring/
 
 ---
 
-*Last Updated: February 6, 2026*
+*Last Updated: March 6, 2026*
