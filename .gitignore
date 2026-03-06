@@ -1,0 +1,29 @@
+# ── Build artifacts ──────────────────────────────────────
+*.o
+*.out
+*.exe
+*.dSYM/
+
+# ── Compiled binaries (rebuild with make) ───────────────
+io_uring_examples/cat_program_io_uring/cat_uring
+io_uring_examples/**/build/
+
+# ── macOS junk ──────────────────────────────────────────
+.DS_Store
+._*
+
+# ── Editor/IDE ──────────────────────────────────────────
+.vscode/
+*.swp
+*.swo
+*~
+
+# ── OS ──────────────────────────────────────────────────
+Thumbs.db
+.Trash-*
+
+# ── Benchmark outputs (raw data stays in results/) ─────
+*.log
+*.csv
+!results/**/*.csv
+!results/**/*.log
