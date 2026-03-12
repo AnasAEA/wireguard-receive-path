@@ -6,7 +6,7 @@
 ### Evaluation
 - they evaluate it in two use cases:
   - Integrating io_uring into a storage base -bound buffer manager, this focuses on how to use io_uring to efficiently read and write data pages from/to disk.
-  - Using io_uring for high-throughput data shuffling (e.g., during joins or aggregations), this means using io_uring to move data between different parts of the system efficiently. 
+  - Using io_uring for high-throughput data shuffling (e.g., during joins or aggregations), this means using io_uring to move data between different parts of the system efficiently.
 - they further analyze how advanced io_uring features , such as registered buffers (which allow pre-registering memory regions for I/O operations) and passthrough I/O (which allows direct I/O operations bypassing the kernel), affect end-to-end performance.
 - they show when low-level optimizations translate into tangible system-wide gains and how architechtural choices influence these benefits.
 - they derive practical guidelines for designing I/O-intensive systems using io-uring and validate their effectiveness in a case study of PostgreSQL's recent io_uring integration (PG18).
@@ -29,9 +29,9 @@ The io_uring method uses Linux's io_uring interface, which requires kernel versi
   - Thirdly, batched submission and completion process multiple operations with a single system call, reducing overhead.
   - these features make io_uring particularly well-suited for high-performance database systems that issue large numbers of storage and network I/O operations.
 #### Low Overhread I/O with io_uring ?
-- they compare the performance of io_uring off the shelf instead of libaio for storage I/O in a buffer manager, or instead of epoll for network I/O in a data shuffling operator.
+- they compare the performance of io_uring off the shelf instead of libaio for storage I/O in a buffeQr manager, or instead of epoll for network I/O in a data shuffling operator.
 - only modest performance improvements are observed when simply replacing existing I/O interfaces with io_uring. (1.06x and 1.10 times faster, respectively).
-- In contrast , when the system is explicitly designed to leverage io_uring's capabilities (e.g., batching I/O operations) and using appropriate optimizations (e.g., registered buffers), the end to end performance become:  2.05x  for the buffer manager and 2.31x for the network shuffling operator. 
+- In contrast , when the system is explicitly designed to leverage io_uring's capabilities (e.g., batching I/O operations) and using appropriate optimizations (e.g., registered buffers), the end to end performance become:  2.05x  for the buffer manager and 2.31x for the network shuffling operator.
 ### Questions the paper tries to answer
 - When to use io_uring? Under which system conditions - especially high I/O intensive scenarios - does io_uring provide the greatest benefit?
 - How to integrate io_uring? How should a DBMS architecture incorporate io_uring to exploit its capabilities effectively?

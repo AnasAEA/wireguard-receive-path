@@ -341,15 +341,15 @@ io_uring-based implementations in applications like **WireGuard** are slower tha
 - *Fill in*
 
 **What I learned:**
-1. 
-2. 
-3. 
+1.
+2.
+3.
 
 **What surprised me:**
-- 
+-
 
 **Blockers:**
-- 
+-
 
 ---
 

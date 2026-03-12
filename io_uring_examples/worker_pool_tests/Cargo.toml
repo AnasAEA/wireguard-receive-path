@@ -1,0 +1,11 @@
+[package]
+name = "udp_read"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+io-uring = "0.7"
+nix = { version = "0.27", features = ["sched"] }
+structopt = "0.3"
+libc = "0.2"

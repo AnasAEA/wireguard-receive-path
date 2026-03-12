@@ -213,7 +213,7 @@ The power of io_uring at scale: **one syscall submits N requests; zero syscalls 
 
 ## 5. Live Investigation: cat_uring on Real Hardware
 
-All tests run on: kernel `6.18.10-402.asahi.fc42.aarch64+16k` (Fedora Asahi Remix 42, M1 Pro)  
+All tests run on: kernel `6.18.10-402.asahi.fc42.aarch64+16k` (Fedora Asahi Remix 42, M1 Pro)
 File under test: `cat.c` — 11,041 bytes
 
 ---
