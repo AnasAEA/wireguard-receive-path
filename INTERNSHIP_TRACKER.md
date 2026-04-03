@@ -49,10 +49,10 @@ io_uring-based implementations in applications like **WireGuard** are slower tha
 | Phase | Deliverable | Target Date | Status |
 |-------|-------------|-------------|--------|
 | 0. Setup | Linux environment (Fedora Asahi Remix) on MacBook | **Feb 6-7** | ✅ Done |
-| 1. Understand | Reading summaries + knowledge base | Mid-February | ✅ Done — io_uring architecture fully understood, live investigation complete |
-| 2. Reproduce | Clean baseline benchmark with <10% variance | End of February | 🟡 In Progress — need WireGuard/network workload |
-| 3. Measure | Overhead attribution report (context switches, migrations, etc.) | Mid-March | ⬜ Not started |
-| 4. Mitigate | Tested improvement with one approach | April | ⬜ Not started |
+| 1. Understand | Reading summaries + knowledge base | Mid-February | ✅ Done — io_uring internals, Cloudflare worker pool, Kernel VPN paper (EoI), DBMS paper all read and noted |
+| 2. Reproduce | Clean baseline benchmark with <10% variance | End of February → **April** | 🟡 In Progress — need WireGuard test environment (contact Brice/Teo) |
+| 3. Measure | Overhead attribution report (context switches, migrations, etc.) | Mid-March → **May** | ⬜ Not started |
+| 4. Mitigate | Tested improvement with one approach | April → **June** | ⬜ Not started |
 | 5. Document | Final report + reproducibility pack | End of internship | ⬜ Not started |
 
 ---
@@ -159,7 +159,7 @@ io_uring-based implementations in applications like **WireGuard** are slower tha
 | Resource | Link | Status | Notes |
 |----------|------|--------|-------|
 | Lord of the io_uring | https://unixism.net/loti/ | ✅ Done | Fully read + notes + live investigation — see `notes/notes_Lord_of_io_uring.md` and `IO_URING_REFERENCE.md` |
-| Cloudflare: Missing Manuals - io_uring Worker Pool | https://blog.cloudflare.com/missing-manuals-io_uring-worker-pool/ | 🔴 **Priority Next** | Directly describes the worker pool behavior we are now investigating |
+| Cloudflare: Missing Manuals - io_uring Worker Pool | https://blog.cloudflare.com/missing-manuals-io_uring-worker-pool/ | ✅ Done | Full notes in `notes/notes_cloudfare_worker_pool_article.md`. Key insight: sockets take poll path by default; workers only spawn with `IOSQE_ASYNC`. Built `udp_read.rs` reproducer. |
 | LWN: io_uring Article (803070) | https://lwn.net/Articles/803070/ | ⬜ Not Started | |
 | LWN: Asynchronism in Kernel (223899) | https://lwn.net/Articles/223899/ | ⬜ Not Started | Old article on workqueues |
 | LWN: Asynchronism in Kernel (236206) | https://lwn.net/Articles/236206/ | ⬜ Not Started | Old article on workqueues |
@@ -167,12 +167,12 @@ io_uring-based implementations in applications like **WireGuard** are slower tha
 ### From Alain Tchana
 | Resource | Status | Notes |
 |----------|--------|-------|
-| Paper: "The Impact of Kernel Asynchronous APIs on the Performance of a Kernel VPN" | 🔴 **Priority Next** | Key paper - demonstrates 4.7× throughput increase, 65% tail latency reduction. Now that we understand io_uring internals, this paper will read differently. |
+| Paper: "The Impact of Kernel Asynchronous APIs on the Performance of a Kernel VPN" | ✅ Done | Full notes in `notes/notes_kernelVPN_paper.md`. Root cause: EoI — GRO (softirq, high priority) preempts Decryption (workqueue, normal priority). Fix: run GRO in kthreads (4×, 65% latency↓) or workqueues (4.7×, 46% latency↓). |
 
 ### Additional Reading (From Notes)
 | Resource | Status | Notes |
 |----------|--------|-------|
-| io_uring for High-Performance DBMSs: When and How to Use It | ⬜ Not Started | Already have notes file |
+| io_uring for High-Performance DBMSs: When and How to Use It | ✅ Done | Notes in `notes/notes_io_uring for High-Performance DBMSs...md` |
 
 ---
 
@@ -253,6 +253,41 @@ io_uring-based implementations in applications like **WireGuard** are slower tha
 
 **Blockers:**
 - None
+
+---
+
+### April 3, 2026 — Kernel VPN Paper + Cloudflare Notes Completed
+
+#### Friday, April 3
+**What I did:**
+- ✅ Finished Cloudflare worker pool article notes (sections on `io_uring_task`/`task_struct` internals, multi-threaded pitfall with `RLIMIT_NPROC`, NUMA topology effects)
+- ✅ Read Kernel VPN paper ("The Impact of Kernel Asynchronous APIs on the Performance of a Kernel VPN") cover to cover
+- ✅ Wrote full notes: background (softirqs/kthreads/workqueues), WireGuard TX/RX pipelines, EoI root cause, the patch (§4), and evaluation (§5)
+
+**What I learned:**
+1. **EoI is the root cause** — `spin_unlock_bh` in WireGuard's decryption path re-enables bottom halves, triggering NAPI/GRO softirqs before decryption finishes. GRO fires, finds nothing, wastes cycles. Batching is destroyed.
+2. **The fix is a priority alignment** — move GRO from softirq (high priority) to kthreads or workqueues (normal scheduler priority). No more preemption of decryption.
+3. **Workqueues > kthreads for throughput** (4.7× vs 4×) because fixed thread pool avoids scheduling explosion. kthreads win on latency (65% vs 46% reduction) because one dedicated thread per peer = more predictable scheduling.
+4. **The patch is small** — 136 LoC in NAPI subsystem + 55 LoC in WireGuard. The kernel already had all the infrastructure needed.
+5. **Transmission is completely unaffected** — EoI is isolated to the RX pipeline. TX scales linearly to 22 Gbps in all configurations.
+6. **Connection to Cloudflare article** — the paper's workqueue fix uses the same `work_struct` / `queue_work_on` infrastructure as io-wq. Understanding worker pool sizing from the Cloudflare article directly applies here.
+
+**What surprised me:**
+- The CPU imbalance (94% vs 20%) is self-reinforcing: `napi_schedule()` pins GRO pollers to whichever core the decryption worker ran on, with zero load awareness. The scheduler never corrects this.
+- The fix requires no changes to the Linux scheduler — just moving GRO to a different execution context is enough.
+- kthreads can be enabled with a single `echo 1 > /sys/class/net/.../threaded` — zero kernel code changes. Yet it still delivers 4× throughput improvement.
+
+**Concrete outputs:**
+- `notes/notes_cloudfare_worker_pool_article.md` — fully completed
+- `notes/notes_kernelVPN_paper.md` — fully written (new file)
+
+**Next steps:**
+- Contact Brice / Teo for WireGuard test environment
+- Contact Toulouse researcher for benchmark suite
+- Run `bpftrace` on `udp_read.rs --async` to confirm `io_uring_queue_async_work` fires on network I/O (validate H6)
+
+**Blockers:**
+- None on reading side. Need external contacts to move forward on reproduction.
 
 ---
 
@@ -451,24 +486,25 @@ io_uring-based implementations in applications like **WireGuard** are slower tha
 ```
 Internship-Io-uring/
 ├── INTERNSHIP_TRACKER.md           # This file
-├── IO_URING_REFERENCE.md           # ✅ NEW — structured reference for supervisor discussions
+├── IO_URING_REFERENCE.md           # ✅ Structured reference for supervisor discussions
 ├── notes/
-│   ├── notes_Lord_of_io_uring.md   # ✅ Full notes: async models → raw API → live investigation
-│   ├── notes_io_uring for High-Performance DBMSs...md
+│   ├── notes_Lord_of_io_uring.md              # ✅ Full notes: async models → raw API → live investigation
+│   ├── notes_cloudfare_worker_pool_article.md  # ✅ Worker pool, 3 request paths, 4 cap methods, NUMA
+│   ├── notes_kernelVPN_paper.md               # ✅ EoI root cause, kthread/workqueue patch, evaluation
+│   ├── notes_io_uring for High-Performance DBMSs...md  # ✅ DBMS paper notes
 │   └── setup_fedora_asahi_remix_dual_boot.md
 ├── io_uring_examples/
-│   └── cat_program_io_uring/
-│       ├── cat.c                   # ✅ Raw io_uring cat implementation (372 lines, no liburing)
-│       ├── cat_uring               # ✅ Compiled binary
-│       └── Makefile                # ✅ Build + run + clean
-├── readings/                       # Summaries of papers/articles (to be filled)
+│   ├── cat_program_io_uring/
+│   │   ├── cat.c                   # ✅ Raw io_uring cat implementation (372 lines, no liburing)
+│   │   ├── cat_uring               # ✅ Compiled binary
+│   │   └── Makefile                # ✅ Build + run + clean
+│   └── worker_pool_tests/
+│       └── udp_read.rs             # ✅ Cloudflare reproducer: observe io-wq worker pool (--async flag)
 ├── experiments/                    # Experiment configs and raw data (to be filled)
 │   ├── baseline/
-│   └── exp-001-network-io-wq/      # Next experiment: does io-wq fire on network path?
+│   └── exp-001-network-io-wq/      # Next: bpftrace on udp_read.rs --async, confirm worker spawn
 ├── scripts/
-│   ├── run_all.sh                  # Holy grail: reproduce everything
-│   └── collect_metrics.sh
-├── results/
+│   └── run_all.sh                  # Holy grail: reproduce everything
 └── .vscode/
     ├── settings.json               # ✅ C11, format-on-save, hide binaries
     └── extensions.json             # ✅ Recommended extensions
@@ -487,18 +523,20 @@ Internship-Io-uring/
 6. ✅ Live kernel investigation with strace, perf, bpftrace
 7. ✅ Created `IO_URING_REFERENCE.md` — structured supervisor reference
 8. ✅ Set up GitHub repo and pushed all work
+9. ✅ Read Cloudflare worker pool article — notes complete, built `udp_read.rs` reproducer
+10. ✅ Read Kernel VPN paper — fully read, notes complete with EoI analysis + patch + evaluation
+11. ✅ Read DBMS paper — notes complete
 
-### Now (March 2026)
-1. 🔴 **Read Cloudflare worker pool article** — describes io-wq network path, directly relevant
-2. 🔴 **Read Kernel VPN paper** (Alain's paper) — understand the 4.7× result before reproducing
-3. ⬜ Write minimal io_uring TCP server → attach bpftrace → verify io-wq fires on network path
-4. ⬜ Contact Toulouse researcher for existing benchmark suite
-5. ⬜ Get WireGuard setup from Brice/Teo
+### Now (April 2026)
+1. 🔴 **Contact Brice Ekane / Teo Pisenti** — get WireGuard test environment + existing benchmark setup
+2. 🔴 **Contact Toulouse researcher** (via Alain) — access existing io_uring stress test suite
+3. ⬜ Verify io-wq fires on network I/O — run bpftrace on `udp_read.rs --async`, confirm `io_uring_queue_async_work` tracepoint + count workers
+4. ⬜ Read LWN workqueue internals articles (223899, 236206) — understand workqueue scheduler to connect Cloudflare + VPN paper findings
 
-### Before End of March
-6. ⬜ Have WireGuard benchmark environment running
-7. ⬜ Reproduce the io_uring vs Go slowdown with <10% variance
-8. ⬜ Attribute overhead to at least one measurable mechanism
+### Before End of April
+5. ⬜ Have WireGuard benchmark environment running
+6. ⬜ Reproduce the 19.2% throughput result from the VPN paper with <10% variance
+7. ⬜ Attribute overhead to at least one measurable mechanism (context switches / CPU migrations)
 
 ---
 
@@ -515,4 +553,4 @@ Internship-Io-uring/
 
 ---
 
-*Last Updated: March 6, 2026*
+*Last Updated: April 3, 2026*

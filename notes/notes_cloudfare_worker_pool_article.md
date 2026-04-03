@@ -419,4 +419,83 @@ lrwx------ 1 vagrant vagrant 64 Dec 26 17:00 6 -> 'anon_inode:[io_uring]'  ← r
 
 So you might think - "It makes sense ! Each thread has their own dedicated pool of I/O workers, which service all the io_uring instances operated by that thread."
 
-And you would be right. If we follow the code - task_struct has an instance of `io_uring_task` , aka `io_uring` context for the task. Inside the context , we have a reference to the io_uring work queue
+And you would be right. If we follow the code - `task_struct` has an instance of `io_uring_task`, aka the io_uring context for the task. Inside that context, there is a reference to an io_uring work queue (`struct io_wq`), which is itself an **array** of work queue entries (`struct io_wqe`) — one entry per NUMA node. Each entry tracks worker accounting separately for bounded and unbounded work types.
+
+So the mental model is:
+
+```
+task_struct
+  └─ io_uring_task (tctx)
+       └─ io_wq
+            └─ io_wqe[0]  (NUMA node 0)  ← bounded_workers, unbounded_workers
+            └─ io_wqe[1]  (NUMA node 1)
+            └─ ...
+```
+
+Each **thread** has its own `io_wq`. All io_uring instances created by that thread share the same pool. Threads do not share pools with each other — hence the 2 workers per thread in the multithreaded experiment.
+
+### Critical consequence for multi-threaded programs
+
+When `IORING_REGISTER_IOWQ_MAX_WORKERS` is not set, the default unbounded worker limit is `RLIMIT_NPROC`. The problem: `RLIMIT_NPROC` is a **UID-level** limit shared across all threads and processes under that UID. In a multithreaded program:
+
+- Each new thread **consumes** from the UID process quota
+- io_uring tries to scale the unbounded pool up to `RLIMIT_NPROC` *per thread's io_wq*
+- As threads are spawned, the remaining quota shrinks — io_uring can't reach its target and burns CPU in retry loops (same `create_io_thread()` → `EAGAIN` spiral as with `prlimit`)
+
+Demonstration with `RLIMIT_NPROC=4` and 2 threads, 1 ring each, 2 workers max:
+```bash
+$ unshare -U prlimit --nproc=4 ./udp-read --async --threads 2 --rings 2 --workers 2 &
+
+$ sudo bpftrace --btf -e 'kr:create_io_thread { @[retval] = count(); } i:s:1 { print(@); clear(@) }' -c '/usr/bin/sleep 3'
+@[-11]: ~300000  ← kernel burning cycles trying to spawn workers, hitting RLIMIT_NPROC
+```
+
+Only 2 workers spawn per thread instead of the intended maximum. The fix: always set `IORING_REGISTER_IOWQ_MAX_WORKERS` explicitly in multithreaded programs to avoid this.
+
+---
+
+## NUMA, NUMA, yay
+
+On multi-NUMA systems, `IORING_REGISTER_IOWQ_MAX_WORKERS` sets the limit **per NUMA node** (matching the `io_wqe[]` array structure). The worker pool scales up only for the NUMA node corresponding to the CPU that calls `io_uring_enter()`.
+
+Experiment — 2 rings, 2 workers per node limit, 2 NUMA nodes, single thread:
+
+```bash
+# Bind to CPU 0 (NUMA node 0) for ring 1 submissions
+# Bind to CPU 2 (NUMA node 1) for ring 2 submissions
+$ ./udp-read --async --rings 2 --workers 2 --numa-aware &
+
+$ pstree -pt $!
+udp-read(PID)─┬─{iou-wrk-PID}  ← node 0 worker 1
+              ├─{iou-wrk-PID}  ← node 0 worker 2
+              ├─{iou-wrk-PID}  ← node 1 worker 1
+              └─{iou-wrk-PID}  ← node 1 worker 2
+# Total: 4 workers = max_workers × num_NUMA_nodes = 2 × 2
+```
+
+Without the CPU affinity pinning, both rings submit from the same NUMA node → only 2 workers spawn total. CPU locality drives worker pool scaling.
+
+---
+
+## Outro
+
+The article ends by acknowledging that io_uring contains additional underdocumented behavior around request ordering and interrupted syscall handling. Future "Missing Manuals" posts will cover those.
+
+---
+
+## Summary & Key Takeaways
+
+| Question | Answer |
+|---|---|
+| Does io_uring spawn worker threads by default for sockets? | **No** — poll path (Path 3) by default. Workers only with `IOSQE_ASYNC`. |
+| How do I force workers? | Set `IOSQE_ASYNC` flag per SQE |
+| Best way to cap worker count? | `IORING_REGISTER_IOWQ_MAX_WORKERS` (per thread, per NUMA node) |
+| Dangerous cap methods? | `RLIMIT_NPROC` and cgroup `pids.max` — both cause CPU-spinning retry loops |
+| Is the worker limit per ring or per thread? | **Per thread** (single thread → rings share one pool; each thread has its own pool) |
+| Does NUMA topology affect workers? | Yes — pool scales per NUMA node, driven by which CPU calls `io_uring_enter()` |
+
+### Relevance to WireGuard / Internship
+
+- WireGuard uses socket I/O → unbounded workers → `IORING_REGISTER_IOWQ_MAX_WORKERS` is the right knob to study
+- The CPU-burning retry loop under `RLIMIT_NPROC` is a real pathology that could show up in the WireGuard workload if worker limits aren't configured correctly
+- `udp_read.rs` is a minimal reproducer for studying this exact behavior before touching the full WireGuard stack
