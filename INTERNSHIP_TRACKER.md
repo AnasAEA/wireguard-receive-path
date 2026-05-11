@@ -16,14 +16,18 @@
 ## 🎯 Research Objectives
 
 ### Main Goal
-Study and evaluate io_uring performance for transparent file system access, specifically investigating inefficiencies in how io_uring is used in real-world applications.
+Characterize workqueue scheduling overhead in the Linux kernel and explain the performance gap between kernel WireGuard and its user-space Go equivalent (wireguard-go), using io_uring's internal worker pool (io-wq) as a controlled testbed.
 
 ### Hypothesis
-io_uring-based implementations in applications like **WireGuard** are slower than user-level library versions (e.g., Go implementation) due to:
-- Inefficient use of **workqueues**
-- **Context switches** when kernel threads fetch from workqueues
-- **Thread blocking** (not just task blocking)
-- Non-optimal queueing/scheduling policies
+
+**Established (Mounah et al., 2025):** Kernel WireGuard reception throughput collapses to 4.8 Gbps at 1,000 clients on a 25 Gbps link (19.2% of available bandwidth). Root cause: GRO runs in softirq context (high priority) and preempts WireGuard's decryption workers (workqueue, normal priority) mid-pipeline — destroying packet batching and causing a self-reinforcing CPU imbalance (94% vs 20% across cores). Moving GRO to workqueues eliminates this and yields 4.7× throughput improvement.
+
+**To establish (this internship):** wireguard-go avoids this collapse entirely because Go goroutines are scheduled in user space — no softirq preemption possible. The gap between kernel WireGuard and wireguard-go is therefore explained by workqueue scheduling overhead. This internship will:
+1. Reproduce the 4.8 Gbps baseline locally with <10% variance
+2. Attribute overhead to specific mechanisms: context switches, CPU migrations, worker scheduling latency
+3. Compare patched kernel WireGuard (workqueue fix) against wireguard-go to quantify residual overhead
+
+**Why io-wq is the study vehicle:** io_uring's internal workqueue (io-wq) uses the same `work_struct` / `queue_work_on` infrastructure as WireGuard's decryption pipeline. It provides a controllable, observable testbed for workqueue behavior before touching WireGuard directly.
 
 ### Specific Tasks
 - [x] Evaluate io_uring performance for transparent file system access in heterogeneous environments — *baseline investigation complete, see IO_URING_REFERENCE.md*
@@ -48,12 +52,16 @@ io_uring-based implementations in applications like **WireGuard** are slower tha
 ### Milestones
 | Phase | Deliverable | Target Date | Status |
 |-------|-------------|-------------|--------|
-| 0. Setup | Linux environment (Fedora Asahi Remix) on MacBook | **Feb 6-7** | ✅ Done |
+| 0. Setup | Linux environment (Fedora Asahi Remix) on MacBook | Feb 6-7 | ✅ Done |
 | 1. Understand | Reading summaries + knowledge base | Mid-February | ✅ Done — io_uring internals, Cloudflare worker pool, Kernel VPN paper (EoI), DBMS paper all read and noted |
-| 2. Reproduce | Clean baseline benchmark with <10% variance | End of February → **April** | 🟡 In Progress — need WireGuard test environment (contact Brice/Teo) |
-| 3. Measure | Overhead attribution report (context switches, migrations, etc.) | Mid-March → **May** | ⬜ Not started |
-| 4. Mitigate | Tested improvement with one approach | April → **June** | ⬜ Not started |
-| 5. Document | Final report + reproducibility pack | End of internship | ⬜ Not started |
+| — | **TWS report** (2 pages incl. refs, Moodle 348) | **April 14** | ⬜ Not started |
+| — | **Intermediate report** (2 pages + refs, Moodle 295) | **April 27** | ⬜ Not started |
+| — | Register for defenses | **May 29** | ⬜ |
+| 2. Reproduce | Clean baseline benchmark with <10% variance | May/June | 🟡 In Progress — need WireGuard test environment (contact Brice/Teo) |
+| 3. Measure | Overhead attribution report (context switches, migrations, etc.) | June | ⬜ Not started |
+| 4. Mitigate | Tested improvement with one approach | June | ⬜ Not started |
+| 5. Document | **Final report** (6 pages, Moodle) + defense slides | **June 5 (report), June 8 (slides)** | ⬜ Not started |
+| — | **Defenses** | **June 9–12** (F115 or F117, check ADE) | ⬜ |
 
 ---
 

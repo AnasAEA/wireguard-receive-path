@@ -1,0 +1,238 @@
+\typeout{TWS / Intermediate Report - M1 MoSIG 2025-2026}
+
+\documentclass{article}
+\usepackage{ijcai26}
+\usepackage{times}
+\usepackage[hidelinks]{hyperref}
+\usepackage[utf8]{inputenc}
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{booktabs}
+
+\urlstyle{same}
+
+\title{Workqueue Scheduling Overhead in WireGuard:\\
+Characterizing Execution Order Inversion through io\_uring Kernel Instrumentation}
+
+\author{
+    Anas Ait El Hadj
+    \affiliations
+    Inria, KrakOS Team (LIG), Grenoble, France
+    \emails
+    anas.ait-el-hadj@grenoble-inp.org \\
+    Supervised by: André Freyssinet (Inria, KrakOS Team)
+}
+
+\begin{document}
+
+\maketitle
+
+\fbox{\parbox{0.9\linewidth}{\small I understand what plagiarism entails and I declare
+that this report is my own, original work.\\
+Name, date and signature: AIT EL HADJ ANAS , 27/04/2026 \\[0.3cm]
+\includegraphics[width=0.2\linewidth]{signature.png}\\[0.2cm]
+}}
+
+\begin{abstract}
+WireGuard, a VPN implemented directly in the Linux kernel, achieves
+only 4.8~Gbps reception throughput with 1,000 clients on a
+25~Gbps link, which is 19.2\% of available bandwidth. The cause is Execution
+Order Inversion (EoI): a high-priority softirq handler preempts
+WireGuard's decryption workers mid-pipeline, saturating one CPU core
+at 94\% while others remain at 20\%. The specific mechanisms
+converting this priority mismatch into observable overhead (context
+switches, CPU migrations, worker wakeup latency) have not been
+characterized through direct kernel measurement. io\_uring's internal
+worker pool (io-wq) dispatches work through the same
+\texttt{work\_struct}/\texttt{queue\_work\_on} primitives as
+WireGuard's workqueue, making it a controlled proxy for this
+measurement. Kernel experiments confirm that the relevant overhead
+activates on the socket path when \texttt{IOSQE\_ASYNC} forces io-wq
+execution. This internship aims to reproduce, measure, and explain
+that overhead.
+\end{abstract}
+
+%% ============================================================
+\section{Introduction}
+%% ============================================================
+
+WireGuard~\cite{donenfeld2017} is a VPN tunnel built directly into
+the Linux kernel. On a 25~Gbps link with 1,000 concurrent clients, it
+receives only 4.8~Gbps, which is 19.2\% of available
+bandwidth~\cite{mounah2025}. This is not a hardware limitation, and
+not a misconfiguration. A scheduling priority bug causes a
+high-priority interrupt to fire mid-pipeline, overloading a single
+CPU core while the rest sit idle.
+
+The pipeline has three stages: de-encapsulation, decryption, and
+packet reassembly. Decryption runs in a \textit{workqueue} (a kernel-managed pool of
+background threads for work that must run outside interrupt context)
+at normal scheduler priority. Packet reassembly runs as a
+\textit{softirq}, a high-priority interrupt handler that can preempt
+any normal-priority code at any time. A
+single instruction in the decryption path re-enables softirq
+processing mid-pipeline, so reassembly fires before decryption
+finishes. \shortcite{mounah2025} call this Execution Order Inversion
+(EoI). Moving reassembly to a workqueue eliminates the inversion and
+recovers 4.7$\times$ throughput.
+
+This result shows the fix works. It does not explain why the overhead
+is so severe. The mechanisms behind this severity remain unmeasured.
+
+This internship uses io\_uring~\cite{axboe2019} as a measurement
+proxy. io\_uring's internal worker pool uses the same scheduling
+infrastructure as WireGuard's workqueue; Section~\ref{sec:proxy}
+explains why this makes it a valid proxy for studying the overhead in
+a controlled, single-machine setting. This internship aims to reproduce the 4.8~Gbps degradation, attribute the
+overhead to specific mechanisms, and compare kernel WireGuard against
+its Go counterpart. Even if the fix from \shortcite{mounah2025}
+reproduces the 4.7$\times$ gain, the mechanisms that produced the
+original overhead remain uncharacterized. That gap is what this
+internship addresses.
+
+%% ============================================================
+\section{Background}
+%% ============================================================
+
+\subsection{WireGuard's Reception Pipeline}
+
+WireGuard receives encrypted packets through three ordered stages.
+Stage~1 (de-encapsulation) runs in the kernel's UDP receive handler.
+Stage~2 (decryption) runs in a workqueue at normal scheduler
+priority. Stage~3 (Generic Receive Offload, GRO) reassembles
+decrypted fragments and runs as a softirq.
+
+The trigger for EoI is \texttt{spin\_unlock\_bh} in the decryption
+path. \texttt{spin\_unlock\_bh} is a compound operation: it releases
+the spinlock and explicitly re-enables bottom-half\footnote{``Bottom
+half'' is the historical kernel name for deferred interrupt work,
+including softirqs.} processing on the local CPU, so any pending
+softirq, including GRO, fires immediately at the unlock site. GRO finds no decrypted
+packets ready and aborts.
+
+A kernel scheduling function (\texttt{napi\_schedule()}) records the
+CPU last used by a decryption worker and pins GRO to that core. The
+pin is a stale pointer, not a live load query: as the pinned core
+saturates, decryption workers migrate away under scheduler pressure,
+but the next burst still targets the same recorded core. That core
+saturates at 94\%; the others remain at 20\%. The imbalance
+self-reinforces on every packet burst.
+
+\shortcite{mounah2025} show that moving GRO to a workqueue eliminates
+EoI, yielding 4.7$\times$ higher throughput and 46\% lower tail
+latency; a fix using dedicated kernel threads (kthreads) achieves
+4$\times$ throughput with 65\% tail latency reduction. Transmission
+is unaffected in both cases.
+
+\subsection{Scheduling Priority in the Linux Kernel}
+
+The root cause of EoI is a structural priority gap in the Linux
+execution model. Linux provides three mechanisms relevant to this
+pipeline. Softirqs are high-priority deferred interrupt handlers that can
+preempt any normal-priority code; under heavy load they are executed
+by dedicated kernel threads (\texttt{ksoftirqd}). Kthreads run at normal scheduler
+priority with one dedicated thread per registered entity. Workqueues
+also run at normal priority but maintain a bounded pool (one worker
+per CPU core), so the thread count does not grow with
+load~\cite{mounah2025}. Any pipeline where a downstream stage runs as
+a softirq and an upstream stage runs in a workqueue is structurally
+vulnerable to EoI.
+
+\subsection{io\_uring and io-wq as a Measurement Proxy}
+\label{sec:proxy}
+
+Direct instrumentation of WireGuard requires a live multi-machine
+network environment. io\_uring offers a way to study the same
+scheduling infrastructure in a single-machine, controlled setting.
+
+io\_uring, introduced in Linux~5.1~\cite{axboe2019}, provides a
+unified asynchronous I/O interface. Submitted requests follow three
+internal paths. Path~1 completes inline when data is immediately
+available. Path~2 offloads to io-wq, which dispatches work through
+\texttt{work\_struct} items via \texttt{queue\_work\_on}. Path~3
+registers a poll wakeup and waits for the file or socket to become
+ready, without spawning any thread.
+
+The proxy argument rests on Path~2: io-wq uses the exact same kernel
+primitives as WireGuard's workqueue (\texttt{work\_struct},
+\texttt{queue\_work\_on}), so scheduling behavior observable on
+io-wq (worker dispatch latency, CPU migrations, context
+switches) reflects the same mechanisms governing WireGuard's
+decryption workers. Since kernel~5.18
+(\texttt{IORING\_FEAT\_NO\_IOWAIT}), buffered file reads bypass io-wq
+entirely via Path~1. Socket reads default to Path~3; io-wq activates
+only when \texttt{IOSQE\_ASYNC} is set
+explicitly~\cite{cloudflare2022,jasny2025}. The WireGuard-relevant
+overhead therefore lives on the socket path, observable through io-wq
+when \texttt{IOSQE\_ASYNC} forces async execution.
+
+%% ============================================================
+\section{Current Status}
+%% ============================================================
+
+The experimental environment is Fedora Asahi Remix~42 (kernel~6.x,
+Apple M1 Pro), with bpftrace (a kernel tracing framework), perf, and
+strace all confirmed working. Two experiments establish the proxy
+baseline.
+
+\paragraph{File I/O path.}
+A raw io\_uring file reader (\texttt{cat\_uring}, 372~lines of C, no
+liburing) was built and instrumented with bpftrace. Live tracing
+showed that \texttt{io\_uring\_queue\_async\_work} never fired during
+buffered reads, even with a cold cache, confirming
+\texttt{IORING\_FEAT\_NO\_IOWAIT} on this kernel. File reads block
+inline inside \texttt{io\_uring\_enter()} and never reach io-wq. This
+rules out the file path as a source of workqueue overhead on modern
+kernels. Cold-cache reads still cost 132~$\mu$s against 3.7~$\mu$s
+warm (35.9$\times$), with 4~context switches and 1~CPU migration per
+operation. This is early evidence that scheduling cost is real even at
+small scale.
+
+\paragraph{Socket path.}
+The Cloudflare worker pool experiment~\cite{cloudflare2022} was
+reproduced in Rust (\texttt{udp\_read.rs}). Without
+\texttt{IOSQE\_ASYNC}, zero worker threads spawn across 4,096
+submitted socket reads: io\_uring takes the poll path and io-wq is
+never involved. With the flag, 4,096 workers appear immediately, one
+per in-flight request. This confirms that io-wq overhead is
+observable and controllable on the socket path, and that reproducing
+WireGuard-relevant behavior requires forcing this execution mode.
+
+%% ============================================================
+\section{Plan}
+%% ============================================================
+
+\paragraph{Phase~1: Reproduce.}
+Set up a WireGuard test environment and reproduce the 4.8~Gbps
+ceiling from \shortcite{mounah2025} with under 10\% run-to-run
+variance. A stable, reproducible baseline is a prerequisite for
+every subsequent measurement: without it, any observed overhead is
+indistinguishable from noise.
+
+\paragraph{Phase~2: Attribute.}
+A stable baseline unlocks the attribution step. bpftrace tracepoints
+(\texttt{workqueue\_queue\_work}, \texttt{workqueue\_execute\_start},
+\texttt{napi\_poll}) will measure scheduling latency between work
+dispatch and execution. The goal is to isolate which mechanisms
+dominate: how much comes from worker wakeup latency, how much from
+cross-CPU migrations, and how much from context switch overhead.
+
+\paragraph{Phase~3: Compare.}
+Kernel WireGuard will be benchmarked against wireguard-go under the
+same workload. wireguard-go schedules work through Go goroutines
+(lightweight user-space threads) which cannot be preempted by kernel
+softirqs; EoI is structurally impossible. The throughput gap between
+the two quantifies what the workqueue pipeline costs relative to a
+user-space scheduler. If EoI is the dominant cause, the workqueue fix
+from \shortcite{mounah2025} should reproduce the 4.7$\times$ gain.
+Measuring what remains after the fix is the direct contribution of
+this work: the residual kernel scheduling overhead that only direct
+instrumentation can explain. Note that wireguard-go also incurs costs
+from the user-space/kernel-space boundary (TUN device, system calls),
+so any measured gap is a lower bound on workqueue scheduling overhead.
+
+%% ============================================================
+\bibliographystyle{named}
+\bibliography{refs}
+
+\end{document}
