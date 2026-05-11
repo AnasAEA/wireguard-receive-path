@@ -54,10 +54,11 @@ Characterize workqueue scheduling overhead in the Linux kernel and explain the p
 |-------|-------------|-------------|--------|
 | 0. Setup | Linux environment (Fedora Asahi Remix) on MacBook | Feb 6-7 | ✅ Done |
 | 1. Understand | Reading summaries + knowledge base | Mid-February | ✅ Done — io_uring internals, Cloudflare worker pool, Kernel VPN paper (EoI), DBMS paper all read and noted |
-| — | **TWS report** (2 pages incl. refs, Moodle 348) | **April 14** | ⬜ Not started |
-| — | **Intermediate report** (2 pages + refs, Moodle 295) | **April 27** | ⬜ Not started |
+| — | **TWS report** (2 pages incl. refs, Moodle 348) | **April 14** | ✅ Submitted |
+| — | **Intermediate report** (2 pages + refs, Moodle 295) | **April 27** | ✅ Submitted — multiple revision rounds with André and Alain feedback |
+| — | **Alain presentation** (io_uring deep dive, ~18 min) | **May 13** | 🟡 In preparation — plan in ALAIN_PRESENTATION_PLAN.md |
 | — | Register for defenses | **May 29** | ⬜ |
-| 2. Reproduce | Clean baseline benchmark with <10% variance | May/June | 🟡 In Progress — need WireGuard test environment (contact Brice/Teo) |
+| 2. Reproduce | Clean baseline benchmark with <10% variance | May/June | ⬜ Not started — need WireGuard test environment (contact Brice/Teo) |
 | 3. Measure | Overhead attribution report (context switches, migrations, etc.) | June | ⬜ Not started |
 | 4. Mitigate | Tested improvement with one approach | June | ⬜ Not started |
 | 5. Document | **Final report** (6 pages, Moodle) + defense slides | **June 5 (report), June 8 (slides)** | ⬜ Not started |
@@ -73,8 +74,8 @@ Characterize workqueue scheduling overhead in the Linux kernel and explain the p
 | **Wednesday** | Morning | Research & Development |
 | **Friday** | Afternoon | Research & Development |
 
-### Full-Time Period (May 2026 onwards)
-*TBD*
+### Full-Time Period (May 11 – July 31, 2026)
+Monday–Friday, full days. Bureau 225, Inria.
 
 ---
 
@@ -299,6 +300,43 @@ Characterize workqueue scheduling overhead in the Linux kernel and explain the p
 
 ---
 
+### May 11, 2026 — Full-Time Start
+
+**What I did:**
+- ✅ Full-time phase started (Bureau 225, Inria)
+- ✅ Created `ALAIN_PRESENTATION_PLAN.md` — detailed plan for Wednesday presentation to Alain
+- ✅ Created `CODE_STUDY_PLAN.md` — structured source code study plan for wireguard-linux, io-wq, workqueue.c, wireguard-go
+- ✅ Pushed all part-time deliverables to GitHub (report, meeting preps, scripts, resources)
+
+**Status coming in:**
+- Intermediate report submitted April 27 after multiple revision rounds (André + Alain feedback)
+- Alain nearly withdrew as supervisor during part-time; conversation resolved it; now requires io_uring presentation as proof of understanding
+- WireGuard test environment still pending (need Brice/Teo contact)
+
+**Next steps:**
+- Clone wireguard-linux + linux-source (sparse) + wireguard-go
+- Study receive.c (WireGuard) + io-wq.c day by day per CODE_STUDY_PLAN.md
+- Deliver Alain presentation Wednesday May 13
+
+---
+
+### April 14–27, 2026 — Reports
+
+**What I did:**
+- ✅ Wrote and submitted TWS report (April 14, Moodle 348)
+- ✅ Wrote and submitted intermediate report (April 27, Moodle 295)
+- ✅ Multiple revision rounds on intermediate report based on André and Alain feedback:
+  - Structural rewrite: background reordered to WireGuard → Linux priority hierarchy → io_uring
+  - Redundancy eliminated: io-wq/work_struct argument stated once in §2.3
+  - Jargon audit: all terms glossed on first use (EoI, softirq, NAPI, bpftrace, goroutines)
+  - spin_unlock_bh explained as compound operation
+  - Self-reinforcing imbalance loop closed (stale pointer explanation)
+  - All em-dashes removed
+- ✅ Wrote 2-minute madness script + 4-slide presentation (2MIN_MADNESS_SCRIPT.md)
+- ✅ Created meeting prep documents for André and Alain
+
+---
+
 ### Week N (March 6, 2026) — Live Kernel Investigation
 
 #### Friday, March 6
@@ -495,27 +533,34 @@ Characterize workqueue scheduling overhead in the Linux kernel and explain the p
 Internship-Io-uring/
 ├── INTERNSHIP_TRACKER.md           # This file
 ├── IO_URING_REFERENCE.md           # ✅ Structured reference for supervisor discussions
+├── ALAIN_PRESENTATION_PLAN.md      # ✅ Slide-by-slide plan for May 13 presentation
+├── CODE_STUDY_PLAN.md              # ✅ Source code study plan (wireguard-linux, io-wq, wireguard-go)
+├── 2MIN_MADNESS_SCRIPT.md          # ✅ 2-minute madness presentation script
+├── MEETING_PREP_ALAIN.md           # ✅ Meeting prep for Alain
+├── MEETING_PREP_ANDRE.md           # ✅ Meeting prep for André
+├── REPLY_ANDRE.md                  # ✅ Email draft to André (report corrections)
+├── report/
+│   ├── main.tex                    # ✅ Intermediate report — final revised version
+│   ├── refs.bib                    # ✅ Bibliography
+│   ├── Makefile                    # ✅ Build target
+│   └── ijcai26.sty / named.bst     # LaTeX style files
 ├── notes/
-│   ├── notes_Lord_of_io_uring.md              # ✅ Full notes: async models → raw API → live investigation
-│   ├── notes_cloudfare_worker_pool_article.md  # ✅ Worker pool, 3 request paths, 4 cap methods, NUMA
-│   ├── notes_kernelVPN_paper.md               # ✅ EoI root cause, kthread/workqueue patch, evaluation
+│   ├── notes_Lord_of_io_uring.md              # ✅ Full notes
+│   ├── notes_cloudfare_worker_pool_article.md  # ✅ Worker pool notes
+│   ├── notes_kernelVPN_paper.md               # ✅ EoI root cause, patch, evaluation
 │   ├── notes_io_uring for High-Performance DBMSs...md  # ✅ DBMS paper notes
 │   └── setup_fedora_asahi_remix_dual_boot.md
 ├── io_uring_examples/
 │   ├── cat_program_io_uring/
-│   │   ├── cat.c                   # ✅ Raw io_uring cat implementation (372 lines, no liburing)
+│   │   ├── cat.c                   # ✅ Raw io_uring cat (372 lines, no liburing)
 │   │   ├── cat_uring               # ✅ Compiled binary
-│   │   └── Makefile                # ✅ Build + run + clean
+│   │   └── Makefile
 │   └── worker_pool_tests/
-│       └── udp_read.rs             # ✅ Cloudflare reproducer: observe io-wq worker pool (--async flag)
-├── experiments/                    # Experiment configs and raw data (to be filled)
-│   ├── baseline/
-│   └── exp-001-network-io-wq/      # Next: bpftrace on udp_read.rs --async, confirm worker spawn
-├── scripts/
-│   └── run_all.sh                  # Holy grail: reproduce everything
-└── .vscode/
-    ├── settings.json               # ✅ C11, format-on-save, hide binaries
-    └── extensions.json             # ✅ Recommended extensions
+│       └── udp_read.rs             # ✅ Cloudflare reproducer (--async flag)
+├── resources/
+│   ├── TWS_writing_guide.md        # ✅ Writing guidelines
+│   └── latex_style/                # IJCAI style files
+└── experiments/                    # To be filled during reproduction phase
 ```
 
 ---
@@ -534,17 +579,21 @@ Internship-Io-uring/
 9. ✅ Read Cloudflare worker pool article — notes complete, built `udp_read.rs` reproducer
 10. ✅ Read Kernel VPN paper — fully read, notes complete with EoI analysis + patch + evaluation
 11. ✅ Read DBMS paper — notes complete
+12. ✅ Wrote and submitted TWS report (April 14)
+13. ✅ Wrote and submitted intermediate report after revision rounds (April 27)
+14. ✅ 2-minute madness presentation delivered
+15. ✅ Created ALAIN_PRESENTATION_PLAN.md and CODE_STUDY_PLAN.md for full-time phase
 
-### Now (April 2026)
-1. 🔴 **Contact Brice Ekane / Teo Pisenti** — get WireGuard test environment + existing benchmark setup
-2. 🔴 **Contact Toulouse researcher** (via Alain) — access existing io_uring stress test suite
-3. ⬜ Verify io-wq fires on network I/O — run bpftrace on `udp_read.rs --async`, confirm `io_uring_queue_async_work` tracepoint + count workers
-4. ⬜ Read LWN workqueue internals articles (223899, 236206) — understand workqueue scheduler to connect Cloudflare + VPN paper findings
+### Now (May 2026 — full-time started May 11)
+1. 🔴 **Alain presentation** (May 13) — io_uring deep dive, ~18 min. Plan in `ALAIN_PRESENTATION_PLAN.md`.
+2. 🔴 **Clone repos and start source code study** — `wireguard-linux`, sparse-checkout `io_uring/` + `kernel/workqueue.c`, `wireguard-go`. Plan in `CODE_STUDY_PLAN.md`.
+3. 🔴 **Contact Brice Ekane / Teo Pisenti** — get WireGuard test environment + existing benchmark setup
+4. ⬜ **Contact Toulouse researcher** (via Alain) — access existing io_uring stress test suite
+5. ⬜ Read LWN workqueue internals articles (223899, 236206)
 
-### Before End of April
-5. ⬜ Have WireGuard benchmark environment running
-6. ⬜ Reproduce the 19.2% throughput result from the VPN paper with <10% variance
-7. ⬜ Attribute overhead to at least one measurable mechanism (context switches / CPU migrations)
+### Before End of May
+6. ⬜ Have WireGuard benchmark environment running
+7. ⬜ Reproduce the 19.2% throughput result from the VPN paper with <10% variance
 
 ---
 
@@ -561,4 +610,4 @@ Internship-Io-uring/
 
 ---
 
-*Last Updated: April 3, 2026*
+*Last Updated: May 11, 2026*
