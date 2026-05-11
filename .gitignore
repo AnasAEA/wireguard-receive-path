@@ -25,6 +25,15 @@ io_uring_examples/**/target/
 Thumbs.db
 .Trash-*
 
+# ── Generated PDFs (research papers in Documents Read/ are kept) ──
+report/*.pdf
+*.pdf
+!Documents Read/*.pdf
+!resources/instructions_2526.pdf
+
+# ── Archives ────────────────────────────────────────────
+*.zip
+
 # ── Benchmark outputs (raw data stays in results/) ─────
 *.log
 *.csv
