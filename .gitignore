@@ -11,6 +11,10 @@ io_uring_examples/**/build/
 # ── Rust / Cargo ─────────────────────────────────────────
 io_uring_examples/**/target/
 
+# ── External source trees (checked out locally for study, not our work) ──
+wireguard-go/
+linux-source/
+
 # ── macOS junk ──────────────────────────────────────────
 .DS_Store
 ._*
