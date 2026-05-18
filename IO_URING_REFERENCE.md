@@ -2,7 +2,7 @@
 
 > **Purpose:** Consolidated reference covering everything learned about io_uring — how it works, live measurement results, and how it connects to the Inria KrakOS internship objectives.
 > **Audience:** Self-reference + talking points for supervisor meetings.
-> **Last Updated:** March 6, 2026
+> **Last Updated:** May 18, 2026
 > **Environment:** Fedora Asahi Remix 42, kernel `6.18.10-402.asahi.fc42.aarch64+16k`, Apple M1 Pro (ARM64)
 
 ---
@@ -16,8 +16,9 @@
 5. [Live Investigation: cat_uring on Real Hardware](#5-live-investigation-cat_uring-on-real-hardware)
 6. [Key Kernel Feature Flags Explained](#6-key-kernel-feature-flags-explained)
 7. [Available Kernel Tracepoints](#7-available-kernel-tracepoints)
-8. [Connection to Internship Objectives](#8-connection-to-internship-objectives)
-9. [Open Questions and Next Steps](#9-open-questions-and-next-steps)
+8. [io-wq Internals: What the Source Code Actually Shows](#8-io-wq-internals-what-the-source-code-actually-shows)
+9. [Connection to Internship Objectives](#9-connection-to-internship-objectives)
+10. [Open Questions and Next Steps](#10-open-questions-and-next-steps)
 
 ---
 
@@ -343,7 +344,7 @@ Returned by `io_uring_setup` on this system:
 | `IORING_FEAT_NODROP` | 5.5 | Kernel never silently drops CQEs on ring overflow |
 | `IORING_FEAT_SUBMIT_STABLE` | 5.5 | SQE data is read before `io_uring_enter()` returns — buffers can be reused immediately |
 | `IORING_FEAT_FAST_POLL` | 5.7 | For poll-able fds (sockets), io_uring directly arms a poll handler instead of going through io-wq |
-| `IORING_FEAT_NATIVE_WORKERS` | 5.12 | io-wq workers are native kernel threads rather than kthreads — reduces wakeup latency |
+| `IORING_FEAT_NATIVE_WORKERS` | 5.12 | io-wq workers are created as proper `task_struct`-based kernel threads (via `create_io_thread`) rather than the older io_wq implementation — reduces wakeup latency. Note: these workers ARE kthreads; the flag means they are *native* task_struct threads, not that they switched away from kthreads |
 | `IORING_FEAT_NO_IOWAIT` | ~5.18 | **Most relevant to internship** — kernel no longer calls `io_schedule()` for blocked reads; inline wait instead of io-wq offload |
 
 ---
@@ -405,102 +406,186 @@ sudo bpftrace -e 'tracepoint:io_uring:io_uring_cqe_overflow { printf("OVERFLOW o
 
 ---
 
-## 8. Connection to Internship Objectives
+## 8. io-wq Internals: What the Source Code Actually Shows
 
-### The research hypothesis (from supervisor meeting, Jan 29)
+*Added May 2026 after reading `io_uring/io-wq.c` and `io_uring/io-wq.h` from torvalds/linux master.*
 
-> io_uring-based WireGuard is slower than the Go user-level implementation due to:
-> - Inefficient workqueue usage
-> - Context switches when kernel threads fetch from workqueues
-> - Thread blocking (not just task blocking)
-> - Non-optimal queueing/scheduling policies
+This section is the most important update to this document. The source code contradicts a claim that appeared in the internship report and presentation plan, and that André flagged as not convincing. The correction matters for the meeting with Alain.
 
-### What we now know that refines this hypothesis
+### 8.1 io-wq workers are kthreads, not workqueue workers
 
-**Finding 1: The workqueue path is kernel-version dependent.**
+The claim in the report was: *"io-wq dispatches work through `work_struct` items via `queue_work_on` — the same kernel primitives as WireGuard's workqueue."*
 
-The assumption of "buffered reads → io-wq" no longer holds on kernel 5.18+. `IORING_FEAT_NO_IOWAIT` changed the architecture. To reliably trigger io-wq today, the workload must use:
+**This is wrong.** Reading `io-wq.c` shows the actual dispatch path:
 
-| Workload type | Triggers io-wq? |
-|---|---|
-| Buffered file reads (modern kernel) | **No** — inline wait |
-| `O_DIRECT` file reads | **Yes** — when device queue is full |
-| Network sockets with io_uring | **Yes** — for some operations |
-| `IORING_OP_ACCEPT` / `IORING_OP_CONNECT` | **Yes** — when they cannot complete immediately |
-
-WireGuard is **network I/O**, not file I/O. Network sockets can be poll-armed via `IORING_FEAT_FAST_POLL` (also present on this kernel) which avoids io-wq for the fast path, but falls back to io-wq for blocking operations. The hypothesis likely still applies to WireGuard — but via the network socket path, not the file path.
-
-**Finding 2: Context switches are a real signal.**
-
-The cold cache perf stat showed **4 context switches and 1 CPU migration** even for a tiny 11KB buffered file read. At WireGuard scale (hundreds to thousands of concurrent tunnels), this multiplies to a significant scheduling overhead — exactly what the hypothesis predicts.
-
-**Finding 3: The measurable smoking guns are confirmed.**
-
-The tools work. We can measure:
-- `io_uring_queue_async_work` fires → workqueue path taken
-- `perf stat` context-switches + cpu-migrations → scheduling overhead
-- bpftrace submit→complete latency → end-to-end cost
-
-**Finding 4: `IORING_FEAT_NATIVE_WORKERS` is relevant.**
-
-This flag (present) means io-wq workers are native threads since kernel 5.12. The Inria research is likely comparing behavior across kernel versions where this transition happened — "native workers" have lower wakeup overhead, which should *reduce* the bottleneck, but the hypothesis says the bottleneck is still there at scale. Understanding *why it persists despite native workers* is probably the core research question.
-
----
-
-### Mapping to specific internship tasks
-
-| Internship task | Current status | How our findings help |
-|---|---|---|
-| Understand io_uring architecture | ✅ Done | Deep understanding of SQ/CQ, mmap, lifecycle, async vs sync |
-| Identify when io-wq is triggered | ✅ Done (for file reads) | Need to verify for network path (WireGuard-relevant) |
-| Reproduce context switch overhead | 🟡 Partially — seen at small scale | Need to scale up to reproduce WireGuard-scale overhead |
-| Measure overhead with real tools | ✅ Tools verified working | bpftrace, perf stat, strace all confirmed functional |
-| Attribute overhead to mechanisms | ⬜ Not yet | Need WireGuard workload running |
-| Propose mitigation | ⬜ Not yet | Requires baseline first |
-
----
-
-## 9. Open Questions and Next Steps
-
-### Immediate questions to investigate
-
-1. **Does `io_uring_queue_async_work` fire for WireGuard-type network I/O on this kernel?**
-   - Test: write a minimal TCP server using raw io_uring with `IORING_OP_RECV`
-   - Expected: yes, for operations that cannot be fast-polled
-
-2. **What triggers the io-wq fallback from `IORING_FEAT_FAST_POLL`?**
-   - Fast poll handles the "already readable" case for sockets
-   - What happens when the socket isn't ready and fast poll "misses"?
-
-3. **At what concurrency does the workqueue bottleneck become visible?**
-   - Our single-request test showed 4 ctx switches for one cold file read
-   - Run 100, 1000, 10000 concurrent requests and observe scaling
-
-4. **How did `IORING_FEAT_NO_IOWAIT` change file read performance?**
-   - Compare with a pre-5.18 kernel (or disable the feature if possible)
-   - This isolates the architectural change impact
-
-### Next reading to do
-
-| Article | Why it matters now |
-|---|---|
-| Cloudflare: io_uring Worker Pool | Directly describes the worker pool behavior we are investigating |
-| LWN 223899 / 236206 (workqueues) | Background on workqueue kernel internals |
-| Paper: "Kernel Asynchronous APIs + VPN performance" | The actual result we are trying to understand and reproduce |
-
-### Key command to run next (verify io-wq on network path)
-
-```bash
-# While running a loopback TCP benchmark with io_uring:
-sudo bpftrace -e '
-tracepoint:io_uring:io_uring_queue_async_work {
-    @by_opcode[args->opcode] = count();
-}
-interval:s:1 { print(@by_opcode); }
-'
+**`io-wq.c:920` — worker creation:**
+```c
+tsk = create_io_thread(io_wq_worker, worker, NUMA_NO_NODE);
 ```
 
-If this counts non-zero for network operations, the workqueue path is active and the hypothesis is on solid ground.
+`create_io_thread` creates a **kernel thread** (`task_struct` with `PF_KTHREAD | PF_IO_WORKER` flags) running the `io_wq_worker` function. This is the same mechanism as any other kthread in the kernel — not the `alloc_workqueue` / `queue_work_on` subsystem.
+
+**Dispatch path for work items:**
+```
+io_wq_enqueue(wq, work)
+  └─ io_wq_insert_work()       adds work to per-acct list (raw_spin_lock)
+  └─ io_acct_activate_free_worker()
+       └─ wake_up_process()    wakes idle kthread worker
+  └─ io_wq_create_worker()     if no idle worker, creates new kthread
+```
+
+No `queue_work_on`. No `work_struct` in the dispatch path. The kthread wakes, picks up the work item from an internal list, and runs it.
+
+### 8.2 Where `work_struct` actually appears in io-wq
+
+`work_struct` is used in exactly one place: **worker creation retry**.
+
+**`io-wq.c:924`:**
+```c
+INIT_DELAYED_WORK(&worker->work, io_workqueue_create);
+```
+
+When `create_io_thread` fails (e.g., because the calling context doesn't allow direct kthread creation), io-wq schedules `io_workqueue_create` on the system workqueue as a fallback. That function then calls `create_io_thread` again. This is an error recovery path, not the normal dispatch path.
+
+The primary worker creation path uses `task_work_add()` (`io-wq.c:411`), which attaches work to the io_uring task's task_work list — again, not `queue_work_on`.
+
+### 8.3 What io-wq and WireGuard's workqueue actually share
+
+Despite the different dispatch mechanisms, there are real similarities worth noting:
+
+| Property | WireGuard `packet_crypt_wq` | io-wq |
+|---|---|---|
+| Worker type | Workqueue kthreads (via `alloc_workqueue`) | Kthreads (via `create_io_thread`) |
+| Dispatch API | `queue_work_on()` | `wake_up_process()` on idle kthread |
+| Scheduler priority | `SCHED_NORMAL` | `SCHED_NORMAL` |
+| Preemptable by softirqs | Yes | Yes |
+| Worker pool bounded | Yes (`WQ_PERCPU` — one per CPU) | Yes (bounded/unbounded caps) |
+| `work_struct` in dispatch | Yes (core mechanism) | No (only for worker creation retry) |
+
+Both run at normal scheduler priority and are preemptable by softirqs. The scheduling *behavior* is comparable at a high level — both can suffer from priority inversion if a high-priority softirq fires while they are running. But the implementation path is different, which means:
+
+- Tracepoints for the kernel workqueue subsystem (`workqueue_queue_work`, `workqueue_execute_start`) apply to WireGuard's `packet_crypt_wq` **but not to io-wq workers**, because io-wq bypasses that subsystem entirely.
+
+### 8.4 Consequence for the proxy argument
+
+The proxy argument as stated — io-wq is a proxy for WireGuard's workqueue because they share the same kernel primitives — is not accurate at the implementation level.
+
+A weaker but defensible version: *both run bounded pools of `SCHED_NORMAL` kernel threads that can be preempted by softirqs, so io-wq can be used to study priority-inversion scheduling patterns in a controlled single-machine setting, even though the dispatch mechanisms differ.* Whether this weaker claim is sufficient for the internship objective is the question for the Alain meeting.
+
+The cleaner path, revealed by the source reading: **WireGuard's workqueue is directly instrumentable.** The tracepoints identified (`workqueue_queue_work`, `workqueue_execute_start`, `napi_poll`) apply directly to `packet_crypt_wq` and `wg_packet_decrypt_worker`. A proxy may not be needed at all.
+
+### 8.5 Confirmed io-wq behavior from udp_read.rs experiment
+
+The socket path experiment confirmed (before the source reading):
+
+- Without `IOSQE_ASYNC`: 0 io-wq workers across 4,096 submitted socket reads. io_uring takes the fast-poll path; io-wq kthreads never created.
+- With `IOSQE_ASYNC`: 4,096 io-wq kthreads created immediately. The flag forces the async path, bypassing the non-blocking attempt.
+
+This confirms that `IOSQE_ASYNC` is the switch that activates io-wq for socket I/O — consistent with the source code showing that without it, the poll arm path (`IORING_FEAT_FAST_POLL`) handles sockets without touching io-wq.
+
+---
+
+## 9. Connection to Internship Objectives
+
+*Revised May 2026 to reflect source code findings and the meeting with André.*
+
+### 9.1 Current situation (as of May 2026)
+
+The internship objective is not yet finalized. André and Alain agree that the proxy argument as written in the intermediate report is not strong enough. A three-way meeting (May 19) will set the actual objective for the full-time phase.
+
+The study of io_uring was requested by Alain specifically. The reason may be one of:
+- io_uring as a measurement proxy (original framing — now known to be inaccurate at the implementation level)
+- io_uring as an alternative design for WireGuard's receive path
+- io_uring as the subject, with WireGuard as motivation (EoI is a general pattern in any workqueue-below-softirq pipeline)
+- io_uring for load generation on the client side of the WireGuard benchmark
+
+The meeting will clarify which of these is the actual intent.
+
+### 9.2 What the experiments established (still valid)
+
+| Finding | How established | Still valid |
+|---|---|---|
+| `IORING_FEAT_NO_IOWAIT` routes file reads inline, bypassing io-wq | bpftrace on cat_uring | Yes |
+| Socket path: 0 workers without `IOSQE_ASYNC`, 4096 with it | udp_read.rs | Yes |
+| Context switches are observable at small scale (4 per cold file read) | perf stat | Yes |
+| io-wq workers are kthreads, not workqueue workers | io-wq.c source reading | Yes — new finding |
+| WireGuard EoI chain confirmed at source level | receive.c + queueing.h | Yes — new finding |
+| `packet_crypt_wq` flags: `WQ_CPU_INTENSIVE | WQ_PERCPU` | device.c source reading | Yes — new finding |
+
+### 9.3 What tracepoints work where
+
+| Tracepoint | Applies to WireGuard `packet_crypt_wq` | Applies to io-wq |
+|---|---|---|
+| `workqueue_queue_work` | **Yes** — fires when work enqueued to packet_crypt_wq | No — io-wq bypasses kernel workqueue subsystem |
+| `workqueue_execute_start` | **Yes** — fires at start of `wg_packet_decrypt_worker` | No |
+| `io_uring:io_uring_queue_async_work` | No | **Yes** — fires when request offloaded to io-wq |
+| `napi_poll` | **Yes** — fires for `wg_packet_rx_poll` (Stage 3) | No |
+
+This table matters: if the objective is direct WireGuard measurement, the first three rows are the tools. If the objective involves io-wq, the fourth row is the tool.
+
+### 9.4 Mapping to likely full-time phases
+
+These phases may be revised after the May 19 meeting, but are the current working hypothesis:
+
+| Phase | Goal | Key tool | Blocker |
+|---|---|---|---|
+| 1 — Reproduce | Reproduce 4.8 Gbps / 19.2% ceiling from Mounah et al. with <10% variance | WireGuard test environment | Need Brice Ekane / Teo Pisenti access |
+| 2 — Attribute | Measure scheduler latency between workqueue dispatch and execution; isolate context switches vs CPU migrations vs wakeup latency | `workqueue_queue_work`, `workqueue_execute_start`, `napi_poll` via bpftrace | Stable baseline from Phase 1 |
+| 3 — Compare | Kernel WireGuard vs wireguard-go under same workload; quantify workqueue cost relative to goroutine scheduler | Throughput measurement + Phase 2 tracepoints | Phase 1 + wireguard-go setup |
+
+---
+
+## 10. Open Questions and Next Steps
+
+### 10.1 Questions answered since March
+
+| Question | Answer |
+|---|---|
+| Does `io_uring_queue_async_work` fire for socket I/O? | Yes, but only with `IOSQE_ASYNC`. Default socket path uses fast-poll. |
+| Does io-wq use `queue_work_on`? | No. io-wq uses kthreads via `create_io_thread` and `wake_up_process`. |
+| What are WireGuard's workqueue flags? | `WQ_CPU_INTENSIVE | WQ_MEM_RECLAIM | WQ_PERCPU` — per-CPU, not WQ_UNBOUND. |
+| Where exactly does EoI trigger? | `queueing.h:196` — `napi_schedule(&peer->napi)` called from `wg_queue_enqueue_per_peer_rx`, inside the decryption worker loop. |
+| Is EoI possible in wireguard-go? | No. Stage 3 (`RoutineSequentialReceiver`) blocks on a mutex held by Stage 2 (`RoutineDecryption`). No softirq preemption in user space. |
+
+### 10.2 Questions to resolve at the May 19 meeting
+
+1. **What is Alain's actual intent for io_uring in this internship?** Proxy, alternative design, client-side load generator, or something else?
+2. **Is direct WireGuard instrumentation sufficient for the objective?** If so, the proxy argument can be dropped entirely.
+3. **Is the wireguard-go comparison (Phase 3) still part of the scope?**
+4. **What is the timeline pressure for the final report (June 5)?**
+
+### 10.3 Next technical steps (this week, before the meeting)
+
+- [ ] Read `kernel/workqueue.c` — understand `queue_work_on` dispatch, `WQ_PERCPU` behavior, `WQ_CPU_INTENSIVE` effect on concurrency limit
+- [ ] Read `drivers/net/wireguard/peer.c` — find `netif_napi_add` call, understand per-peer NAPI setup
+- [ ] Read `wireguard-go/tun/tun_linux.go` — confirm TUN write batch size and syscall count
+
+### 10.4 bpftrace commands ready to run on the WireGuard test environment
+
+```bash
+# Measure scheduler latency: time between work enqueue and execution start
+sudo bpftrace -e '
+tracepoint:workqueue:workqueue_queue_work /str(args->workqueue_name) == "wg-crypt-wg0"/ {
+    @enqueue[args->work] = nsecs;
+}
+tracepoint:workqueue:workqueue_execute_start /str(args->workqueue_name) == "wg-crypt-wg0"/ {
+    if (@enqueue[args->work]) {
+        @latency_ns = hist(nsecs - @enqueue[args->work]);
+        delete(@enqueue[args->work]);
+    }
+}'
+
+# Count NAPI poll invocations (Stage 3 preemptions)
+sudo bpftrace -e 'tracepoint:napi:napi_poll { @[args->dev_name] = count(); }'
+
+# Watch for EoI: napi_schedule calls from within workqueue context
+sudo bpftrace -e '
+kprobe:napi_schedule {
+    if (curtask->flags & 0x00400000) {  // PF_WQ_WORKER
+        @eoi_count = count();
+    }
+}'
+```
 
 ---
 
@@ -521,9 +606,29 @@ Key numbers from live measurement (M1 Pro, kernel 6.18, cat.c 11KB)
 Warm cache latency:   3,667 ns  (~3.7 µs)    context switches: 0
 Cold cache latency: 131,875 ns  (~132 µs)    context switches: 4
 Warm/cold ratio: 35.9×                       CPU migrations (cold): 1
-io-wq triggered: NO (IORING_FEAT_NO_IOWAIT changes path on kernel 6.x)
+io-wq triggered for files: NO  (IORING_FEAT_NO_IOWAIT, kernel 5.18+)
+io-wq triggered for sockets: YES, but only with IOSQE_ASYNC flag
 
-Tracepoint to watch for workqueue activity
-────────────────────────────────────────────
-io_uring:io_uring_queue_async_work  →  fires when io-wq is used
+io-wq architecture (from source, May 2026)
+───────────────────────────────────────────
+Workers: kthreads created via create_io_thread() — NOT queue_work_on
+Dispatch: wake_up_process() on idle kthread worker
+work_struct used only for: worker creation retry (INIT_DELAYED_WORK)
+WireGuard workqueue (packet_crypt_wq): alloc_workqueue, queue_work_on
+  → WQ_CPU_INTENSIVE | WQ_MEM_RECLAIM | WQ_PERCPU (device.c:346)
+Conclusion: io-wq and WireGuard use DIFFERENT dispatch mechanisms
+
+EoI trigger (confirmed from source)
+────────────────────────────────────
+queueing.h:196  napi_schedule(&peer->napi)
+  called from: wg_queue_enqueue_per_peer_rx()
+  called from: wg_packet_decrypt_worker()  [receive.c:503]
+  stale pointer: napi_schedule records current CPU — not a live load query
+
+Tracepoints for WireGuard measurement (no proxy needed)
+─────────────────────────────────────────────────────────
+workqueue:workqueue_queue_work    →  work enqueued to packet_crypt_wq
+workqueue:workqueue_execute_start →  wg_packet_decrypt_worker begins
+napi:napi_poll                    →  wg_packet_rx_poll (Stage 3) runs
+io_uring:io_uring_queue_async_work → io-wq activated (socket path only)
 ```
