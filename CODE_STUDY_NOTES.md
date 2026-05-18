@@ -332,6 +332,123 @@ Interval between `workqueue_queue_work` and `workqueue_execute_start` = schedule
 
 ---
 
+---
+
+## Part 5 — WireGuard work items: complete inventory and blocking analysis
+
+*Added May 18, 2026. New objective from Alain: identify which work items call blocking functions.*
+
+### 5.1 All WireGuard work items
+
+| Work item function | Workqueue | Flags | File:Line |
+|---|---|---|---|
+| `wg_packet_decrypt_worker` | `packet_crypt_wq` | `WQ_CPU_INTENSIVE\|WQ_MEM_RECLAIM\|WQ_PERCPU` | `receive.c:493` |
+| `wg_packet_encrypt_worker` | `packet_crypt_wq` | same | `send.c:287` |
+| `wg_packet_handshake_receive_worker` | `handshake_receive_wq` | `WQ_CPU_INTENSIVE\|WQ_FREEZABLE\|WQ_PERCPU` | `receive.c:206` |
+| `wg_packet_handshake_send_worker` | `handshake_send_wq` | `WQ_UNBOUND\|WQ_FREEZABLE` | `send.c:46` |
+| `wg_packet_tx_worker` | per-peer TX | n/a | `send.c:262` |
+
+How workers are registered: `wg_packet_percpu_multicore_worker_alloc()` in `queueing.c:9` calls `INIT_WORK` for each CPU, binding the worker function to a `multicore_worker` struct. On each enqueue, `queue_work_on(cpu, wq, work)` submits to the specific per-CPU worker.
+
+### 5.2 `wg_packet_decrypt_worker` — no blocking primitives
+
+**File:** `receive.c:493–507`
+
+Call chain inside the worker loop:
+```
+ptr_ring_consume_bh()           spinlock (spin_lock_bh) — cannot sleep
+  └─ decrypt_packet()           receive.c:242
+       └─ skb_cow_data()        memory allocation — may fail, does not sleep
+       └─ chacha20poly1305_decrypt_sg_inplace()   pure CPU crypto — no locks, no sleep
+  └─ wg_queue_enqueue_per_peer_rx()   atomic_set + napi_schedule — no sleep
+       └─ napi_schedule()       queueing.h:196 — schedules softirq, no sleep
+```
+
+**`decrypt_packet` (receive.c:242–290) confirmed non-blocking:**
+- `skb_cow_data` — may do memory allocation (GFP_ATOMIC context, no sleep)
+- `chacha20poly1305_decrypt_sg_inplace` — pure software ChaCha20-Poly1305 AEAD, CPU-only, no locks, no sleep
+- Replay counter check uses `spin_lock_bh` (not rwsem) — cannot sleep
+- No `down_read`, `down_write`, `mutex_lock`, `wait_event`, or `schedule()` anywhere
+
+**Conclusion: `wg_packet_decrypt_worker` does NOT call any blocking functions.** It is a pure CPU-bound worker.
+
+Note: `WQ_CPU_INTENSIVE` flag on `packet_crypt_wq` is specifically designed for this case — it tells the workqueue subsystem that workers will not block, so the per-CPU concurrency limit should not apply. The workqueue can run other work items concurrently on the same CPU.
+
+### 5.3 `wg_packet_encrypt_worker` — same conclusion
+
+**File:** `send.c:287–307`
+
+Same structure as decrypt: `ptr_ring_consume_bh` → `encrypt_packet` (ChaCha20-Poly1305 AEAD) → `wg_queue_enqueue_per_peer_tx`. No blocking primitives.
+
+### 5.4 `wg_packet_handshake_receive_worker` — **BLOCKING CONFIRMED**
+
+**File:** `receive.c:206–218`
+
+Call chain:
+```
+ptr_ring_consume_bh()                     spinlock — no sleep
+  └─ wg_receive_handshake_packet()        receive.c:92
+       └─ wg_noise_handshake_consume_initiation()   noise.c:~598
+            └─ wait_for_random_bytes()    noise.c:528  ← BLOCKS if CRNG not ready
+            └─ down_read(&static_identity->lock)    noise.c:529  ← SLEEPS if held
+            └─ down_write(&handshake->lock)         noise.c:530  ← SLEEPS if held
+       └─ wg_noise_handshake_consume_response()     noise.c:~678
+            └─ down_read(&static_identity->lock)    noise.c:678  ← SLEEPS if held
+            └─ down_write(&handshake->lock)         noise.c:679  ← SLEEPS if held
+       └─ wg_noise_handshake_begin_session()        noise.c:816
+            └─ down_write(&handshake->lock)         noise.c:822  ← SLEEPS if held
+```
+
+**`down_read` / `down_write` are rwsemaphore (sleeping lock) operations.** They put the calling thread to sleep if the semaphore is already held. This means `wg_packet_handshake_receive_worker` can block its workqueue thread.
+
+**`wait_for_random_bytes()` (noise.c:528):** blocks until the kernel CSPRNG is initialized. On a freshly booted system, this can cause significant delays for early handshake packets.
+
+**Workqueue this runs in:** `handshake_receive_wq` = `WQ_CPU_INTENSIVE | WQ_FREEZABLE | WQ_PERCPU`. Even though `WQ_CPU_INTENSIVE` is set (meaning the concurrency limit doesn't apply in the normal sense), the thread itself will block when `down_write` sleeps, removing it from active execution entirely until the lock is released.
+
+### 5.5 `wg_packet_handshake_send_worker` — **BLOCKING CONFIRMED**
+
+**File:** `send.c:46–53`
+
+```c
+void wg_packet_handshake_send_worker(struct work_struct *work)
+{
+    struct wg_peer *peer = container_of(work, struct wg_peer,
+                         transmit_handshake_work);
+    wg_packet_send_handshake_initiation(peer);   → calls into noise.c
+}
+```
+
+`wg_packet_send_handshake_initiation` calls `wg_noise_handshake_create_initiation` (noise.c:~529):
+- `wait_for_random_bytes()` — noise.c:528 — **blocks until CRNG ready**
+- `down_read(&handshake->static_identity->lock)` — noise.c:529 — **sleeping lock**
+- `down_write(&handshake->lock)` — noise.c:530 — **sleeping lock**
+
+**Workqueue:** `handshake_send_wq` = `WQ_UNBOUND | WQ_FREEZABLE`. This workqueue IS unbound (floating workers), so blocked threads don't pin to a specific CPU. But blocking still degrades throughput by stalling the worker.
+
+### 5.6 Summary: blocking behavior by work item
+
+| Work item | Blocking calls | Impact |
+|---|---|---|
+| `wg_packet_decrypt_worker` | None | Pure CPU; `WQ_CPU_INTENSIVE` appropriate |
+| `wg_packet_encrypt_worker` | None | Pure CPU; `WQ_CPU_INTENSIVE` appropriate |
+| `wg_packet_handshake_receive_worker` | `down_read/write` (rwsem), `wait_for_random_bytes` | **Sleeping locks** — thread blocks on lock contention; CRNG wait on startup |
+| `wg_packet_handshake_send_worker` | `down_read/write` (rwsem), `wait_for_random_bytes` | Same — `WQ_UNBOUND` so no CPU pinning, but still blocks |
+
+### 5.7 Interpretation: does this explain the performance problem?
+
+The blocking in handshake workers is real but likely **not the primary cause** of the 19.2% throughput ceiling in the paper's scenario (1,000 clients, sustained data transfer). Handshakes happen only at session establishment, not on every data packet. During a sustained benchmark, handshake rate is low compared to data packet rate.
+
+The primary bottleneck in the paper's scenario is EoI in `wg_packet_decrypt_worker` — not blocking, but priority inversion via `napi_schedule`. The data worker itself is non-blocking.
+
+However, the blocking in handshake workers becomes significant under:
+- High connection churn (many clients reconnecting frequently)
+- Rekeying pressure (sessions expiring every ~3 minutes with ~1000 clients = ~5 rekeying events/second)
+- Early boot (CRNG not seeded — `wait_for_random_bytes` stalls all handshakes)
+
+**This is the new research angle Alain wants explored**: characterize how often the handshake workers block, under what conditions, and whether that blocking is an independent contributor to observed latency.
+
+---
+
 ## Study log
 
 | Date | Files read | Key finding |
@@ -339,12 +456,12 @@ Interval between `workqueue_queue_work` and `workqueue_execute_start` = schedule
 | 2026-05-15 | `wireguard-go/device/receive.go`, `device.go` | 3-stage goroutine pipeline confirmed; NumCPU decryption workers; EoI impossible by construction |
 | 2026-05-15 | `drivers/net/wireguard/receive.c`, `queueing.h`, `device.c` | EoI chain confirmed at source level; napi_schedule stale pointer at queueing.h:196; packet_crypt_wq is WQ_CPU_INTENSIVE\|WQ_PERCPU not WQ_UNBOUND |
 | 2026-05-15 | `io_uring/io-wq.c`, `io-wq.h` | **Proxy argument is wrong**: io-wq uses kthreads (create_io_thread), not queue_work_on; work_struct only for worker creation retry |
+| 2026-05-18 | `receive.c`, `send.c`, `noise.c`, `queueing.c` | **New objective**: work item inventory + blocking analysis. Decrypt/encrypt workers: non-blocking (pure ChaCha20). Handshake workers: blocking — rwsem (down_read/write) and wait_for_random_bytes |
 
 ---
 
 ## Still to read
 
-- [ ] `kernel/workqueue.c` — understand `queue_work_on` dispatch path, `WQ_PERCPU` behavior, `WQ_CPU_INTENSIVE` effect
-- [ ] `drivers/net/wireguard/noise.c` — decryption implementation detail (decrypt_packet)
+- [ ] `kernel/workqueue.c` — `WQ_CPU_INTENSIVE` effect on concurrency limit; what happens to pool when a thread blocks
 - [ ] `drivers/net/wireguard/peer.c` — per-peer NAPI setup, `netif_napi_add` call
-- [ ] `wireguard-go/tun/tun_linux.go` — TUN write path, batch size, exact syscall count
+- [ ] io_uring work items — compare blocking behavior for Thursday meeting
