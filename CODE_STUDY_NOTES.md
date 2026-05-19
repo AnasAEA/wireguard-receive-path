@@ -25,6 +25,63 @@
 - `drivers/net/wireguard/device.c` (475 lines)
 - `drivers/net/wireguard/queueing.h` (key inline functions)
 
+---
+
+### Background concepts needed to understand EoI
+
+Before reading the code, three kernel mechanisms must be understood clearly.
+
+#### What is a softirq / BH (Bottom Half)?
+
+When a network packet arrives at a NIC, the NIC raises a hardware interrupt. The kernel has a rule: interrupt handlers must be as short as possible — they should not do heavy work like processing the entire packet. So the kernel splits network processing into two halves:
+
+- **Top half** (hardware interrupt): runs immediately when the NIC signals. It does the minimum — tells the kernel "a packet arrived", saves a pointer, and exits. This runs with ALL interrupts disabled on the current CPU.
+- **Bottom half** (softirq): runs shortly after. It does the real packet processing — parsing, routing, passing to TCP/IP, etc. This runs with normal interrupts re-enabled but with other softirqs disabled on the current CPU.
+
+"BH" stands for Bottom Half. It is used interchangeably with "softirq" in the kernel code and docs.
+
+The key property: **softirqs (BH) preempt normal kernel threads**. A normal process or workqueue worker runs at `SCHED_NORMAL` priority. When a softirq becomes pending and BH is re-enabled, the softirq fires immediately and takes over the CPU — the normal thread is suspended until the softirq finishes.
+
+The kernel controls when softirqs can fire with two operations:
+- `local_bh_disable()` — prevents softirqs from firing on this CPU (they are deferred)
+- `local_bh_enable()` — re-enables softirqs; if any are pending, they fire immediately
+
+Spinlocks with the `_bh` suffix (`spin_lock_bh` / `spin_unlock_bh`) call these internally:
+```c
+spin_lock_bh(lock)   =  local_bh_disable() + spin_lock(lock)
+spin_unlock_bh(lock) =  spin_unlock(lock) + local_bh_enable()
+                                            ↑ softirqs fire here if pending
+```
+
+#### What is NAPI?
+
+NAPI (New API) is the Linux mechanism for receiving network packets efficiently under high load. Instead of an interrupt per packet (which would flood the CPU), NAPI works like this:
+
+1. The first packet triggers a hardware interrupt
+2. The interrupt handler disables further NIC interrupts and schedules a **NAPI poll**
+3. The kernel later runs the poll function, which reads as many packets as possible in one go (up to a `budget`)
+4. When the poll is done, NIC interrupts are re-enabled
+
+The poll function runs as a **NET_RX_SOFTIRQ** — a specific softirq for network receive. This means it runs at BH priority, higher than normal kernel threads.
+
+In WireGuard, NAPI is used unconventionally. WireGuard is not a physical NIC — it's a virtual tunnel. It does not receive packets from hardware. Instead, it uses NAPI as a scheduling mechanism to pass decrypted packets up the network stack. Each peer has its own `napi_struct` (`peer->napi`), and WireGuard calls `napi_schedule` to trigger the poll function after decryption is done.
+
+WireGuard's NAPI poll function is `wg_packet_rx_poll` at `receive.c:438`. It does not talk to hardware — it reads from an in-memory per-peer queue of decrypted packets and passes them to the kernel networking layer via `napi_gro_receive`.
+
+**GRO** (Generic Receive Offload) is a sub-mechanism inside NAPI that coalesces multiple small TCP segments into fewer large ones before handing them to the network stack, improving efficiency. In this context, "GRO fires" means the NAPI poll function runs.
+
+#### What is EoI (Execution Order Inversion)?
+
+EoI (also called priority inversion in some contexts) is what happens when a low-priority task schedules a high-priority task, and the high-priority task then preempts the low-priority task before the low-priority task has finished setting things up.
+
+In WireGuard:
+- Stage 2 (decryption) is the low-priority task — workqueue worker at `SCHED_NORMAL`
+- Stage 3 (GRO/NAPI) is the high-priority task — softirq
+
+The inversion: Stage 2 calls `napi_schedule` (scheduling Stage 3) while Stage 2 is still running. Stage 3 then fires and preempts Stage 2. Stage 3 finds the work it expected to be done is not ready (because Stage 2 was preempted before finishing). Stage 3 aborts. Stage 2 resumes and finishes. Stage 3 fires again. This double-firing wastes CPU time and increases latency.
+
+---
+
 ### 1.1 The decryption workqueue — `packet_crypt_wq`
 
 **File:** `device.c:346–347`
@@ -35,11 +92,11 @@ wg->packet_crypt_wq = alloc_workqueue("wg-crypt-%s",
 ```
 
 **Flags:**
-- `WQ_CPU_INTENSIVE` — workers don't count toward the per-CPU concurrency limit; the scheduler can run other work items concurrently on the same CPU
-- `WQ_MEM_RECLAIM` — ensures a rescue worker is always available even under memory pressure
-- `WQ_PERCPU` — **one worker per CPU, pinned**. Not floating like `WQ_UNBOUND`.
+- `WQ_CPU_INTENSIVE` — workers from this queue are excluded from the kernel's per-CPU concurrency accounting. The kernel normally limits how many workqueue workers run simultaneously on a CPU. `WQ_CPU_INTENSIVE` says "don't count us — we intentionally hog the CPU for computation." This allows other work items to be run alongside. (It does NOT mean workers are prevented from blocking — see Part 6.)
+- `WQ_MEM_RECLAIM` — creates a dedicated rescue worker thread. If all normal workers are stuck waiting for memory allocation, the rescue worker can always run to make progress. Relevant for correctness, not throughput.
+- `WQ_PERCPU` — one worker thread per CPU, each pinned to its CPU via `queue_work_on(cpu, wq, work)`. Workers do not float between CPUs the way `WQ_UNBOUND` workers do.
 
-**Note on WQ_PERCPU:** Our earlier claim that WireGuard uses `WQ_UNBOUND` workers is wrong. It's per-CPU. This is relevant to the proxy argument.
+**Note on WQ_PERCPU:** Our earlier claim that WireGuard uses `WQ_UNBOUND` workers is wrong. It's per-CPU. This matters: each CPU has exactly one decrypt worker, pinned to it.
 
 Other workqueues in `device.c`:
 - `handshake_receive_wq` → `WQ_CPU_INTENSIVE | WQ_FREEZABLE | WQ_PERCPU` (line 335–336)
@@ -49,7 +106,7 @@ The decryption path — `packet_crypt_wq` — is the one relevant to EoI and to 
 
 ### 1.2 The decryption worker function
 
-**File:** `receive.c:492–507`
+**File:** `receive.c:493–507`
 
 ```c
 void wg_packet_decrypt_worker(struct work_struct *work)
@@ -69,13 +126,25 @@ void wg_packet_decrypt_worker(struct work_struct *work)
 }
 ```
 
-This is the Stage 2 worker. It runs inside the kernel workqueue (`packet_crypt_wq`), at `SCHED_NORMAL` priority.
+This is Stage 2. It runs inside `packet_crypt_wq` at `SCHED_NORMAL` priority — the same priority as a regular user-space process. It has no special privileges over softirqs.
 
-Key call: `ptr_ring_consume_bh()` — this internally acquires a spinlock with BH disabled (`spin_lock_bh`) and releases it (`spin_unlock_bh`). Releasing BH re-enables softirq processing on the local CPU.
+`ptr_ring_consume_bh` pulls one packet from the per-device decryption ring. Internally:
 
-### 1.3 EoI trigger chain — full call sequence
+```c
+// from include/linux/ptr_ring.h
+static inline void *ptr_ring_consume_bh(struct ptr_ring *r)
+{
+    void *ptr;
+    spin_lock_bh(&r->consumer_lock);    // ① disables BH (softirqs cannot fire)
+    ptr = __ptr_ring_consume(r);        // ② pulls one packet from the ring
+    spin_unlock_bh(&r->consumer_lock);  // ③ re-enables BH → if any softirq is pending, it fires HERE
+    return ptr;                         // ④ returns the packet
+}
+```
 
-The EoI happens inside the decryption worker loop, triggered by `wg_queue_enqueue_per_peer_rx`:
+The critical point: **BH is disabled only briefly during the ring access** (steps ①–③). After `ptr_ring_consume_bh` returns, BH is re-enabled and the worker runs `decrypt_packet` and `wg_queue_enqueue_per_peer_rx` with BH enabled.
+
+### 1.3 EoI trigger — `wg_queue_enqueue_per_peer_rx`
 
 **File:** `queueing.h:188–197`
 
@@ -84,54 +153,183 @@ static inline void wg_queue_enqueue_per_peer_rx(struct sk_buff *skb,
                                                  enum packet_state state)
 {
     struct wg_peer *peer = wg_peer_get(PACKET_PEER(skb));
-    atomic_set_release(&PACKET_CB(skb)->state, state);
-    napi_schedule(&peer->napi);   // <-- EoI trigger
+    atomic_set_release(&PACKET_CB(skb)->state, state);  // ← marks packet CRYPTED
+    napi_schedule(&peer->napi);                         // ← EoI trigger
     wg_peer_put(peer);
 }
 ```
 
-`napi_schedule(&peer->napi)`:
-- Records the **current CPU** in the `napi_struct` and marks GRO as pending (softirq)
-- This is a **stale pointer**: it stores the CPU that the decryption worker is currently running on, not a live load query
-- As the pinned core saturates, workers migrate to other CPUs — but the recorded CPU in `napi_struct` is not updated
-- Next burst still targets the same recorded core → self-reinforcing saturation
+**Step 1 — Mark the packet as decrypted:**
 
-When the spinlock's BH-disable is released (at the next `spin_unlock_bh` in the ring consume path), any pending softirq — including the just-scheduled GRO — fires immediately on the local CPU. GRO runs in interrupt context, finds no completed packets (decryption isn't done yet), and aborts. This is EoI.
+`atomic_set_release` sets `PACKET_CB(skb)->state` to `PACKET_STATE_CRYPTED`. This is an atomic store with release semantics — it is visible to all CPUs immediately. The packet IS marked as ready before `napi_schedule` is called. This is important for correcting a common misunderstanding below.
 
-**Complete chain:**
+**Step 2 — `napi_schedule(&peer->napi):`**
+
+```c
+// from net/core/dev.c
+void __napi_schedule(struct napi_struct *n)
+{
+    unsigned long flags;
+    local_irq_save(flags);                              // disable IRQs briefly
+    ____napi_schedule(this_cpu_ptr(&softnet_data), n); // bind NAPI to this CPU
+    local_irq_restore(flags);
+}
+
+static inline void ____napi_schedule(struct softnet_data *sd,
+                                     struct napi_struct *napi)
+{
+    list_add_tail(&napi->poll_list, &sd->poll_list);   // add to THIS CPU's poll list
+    __raise_softirq_irqoff(NET_RX_SOFTIRQ);            // mark NET_RX softirq as pending
+}
+```
+
+What `napi_schedule` does:
+1. **Binds the NAPI poll to the current CPU.** `this_cpu_ptr(&softnet_data)` gets the softnet_data of the CPU executing this line right now. The NAPI poll function (`wg_packet_rx_poll`) is added to that CPU's poll list. This is the "stale binding" — see below.
+2. **Raises the NET_RX_SOFTIRQ flag.** This marks a softirq as pending, but does NOT fire it immediately. The softirq fires at the next `local_bh_enable()`.
+
+**Why doesn't the softirq fire immediately?** After `napi_schedule` returns, we are in the body of the while loop with BH already enabled. `napi_schedule` internally uses `local_irq_save/restore` (disabling hardware interrupts, not BH). There is no `local_bh_enable()` call in the loop body between `napi_schedule` and the next `ptr_ring_consume_bh`. So the softirq stays pending.
+
+**When does it fire?** At the next call to `ptr_ring_consume_bh` for the next packet:
+- `spin_lock_bh` → disables BH
+- `__ptr_ring_consume` → gets next packet
+- `spin_unlock_bh` → re-enables BH → `local_bh_enable()` → **NET_RX_SOFTIRQ fires here**
+
+GRO (the NAPI poll) then runs on this CPU, interrupting the worker before it can process the next packet.
+
+### 1.4 Why GRO finds nothing — the ordering constraint
+
+**File:** `receive.c:451–453` inside `wg_packet_rx_poll`
+
+```c
+while ((skb = wg_prev_queue_peek(&peer->rx_queue)) != NULL &&
+       (state = atomic_read_acquire(&PACKET_CB(skb)->state)) !=
+               PACKET_STATE_UNCRYPTED) {   // ← stops at first UNCRYPTED head
+```
+
+`wg_packet_rx_poll` walks the per-peer RX queue **strictly from the head** and stops the moment it sees a packet that is still `PACKET_STATE_UNCRYPTED`. It cannot skip ahead to process later ready packets. This is intentional: packets must be delivered to the network stack in the order they were received (TCP relies on this).
+
+Here is the scenario under concurrent load (e.g., 8 CPUs, 8 workers, many packets):
 
 ```
-wg_packet_decrypt_worker()          receive.c:492
-  └─ ptr_ring_consume_bh()          [internal: spin_lock_bh → BH disabled]
-  └─ decrypt_packet()               receive.c:501
-  └─ wg_queue_enqueue_per_peer_rx() receive.c:503
-       └─ napi_schedule()           queueing.h:196   ← EoI trigger: records current CPU
-  └─ [BH re-enabled at ring unlock]
-       └─ GRO softirq fires         ← preempts worker, finds nothing, aborts
+Per-peer RX queue (ordered by receive time):
+  Head: [pkt 0: UNCRYPTED]  ← being decrypted by Worker 0
+        [pkt 1: CRYPTED]    ← Worker 1 just finished, called napi_schedule
+        [pkt 2: UNCRYPTED]  ← being decrypted by Worker 2
+        [pkt 3: CRYPTED]    ← done
+        ...                 (tail)
 ```
 
-### 1.4 NAPI poll handler
+Worker 1 just called `napi_schedule` and marked pkt 1 as CRYPTED. At the next `ptr_ring_consume_bh` call, GRO fires:
 
-**File:** `receive.c:438`
+1. GRO calls `wg_packet_rx_poll`
+2. Peeks at head of queue: pkt 0 → state = `UNCRYPTED` → **stops immediately**
+3. `work_done = 0` — nothing was processed
+4. GRO returns. The CPU cycle is wasted.
+
+Note the important correction from earlier documentation: **the just-decrypted packet (pkt 1) IS already marked CRYPTED** before `napi_schedule` is called. GRO doesn't fail because pkt 1 isn't ready — it fails because pkt 0 (ahead in the queue) is not ready. GRO cannot skip pkt 0 to process pkt 1.
+
+This wasted GRO firing is the EoI: a high-priority task (GRO softirq) runs but accomplishes nothing, stealing CPU time from the low-priority tasks (decrypt workers) that are doing actual useful work.
+
+### 1.5 The stale CPU binding — self-reinforcing saturation
+
+`napi_schedule` uses `this_cpu_ptr(&softnet_data)` — it binds the NAPI poll to whatever CPU is executing `napi_schedule` at that moment. This is a snapshot, not a live reference.
+
+The binding is persistent: once NAPI is added to CPU X's poll list, `NAPI_STATE_SCHED` is set on `peer->napi`. Any subsequent `napi_schedule` call from any CPU is a **no-op** — `napi_schedule_prep` checks `NAPI_STATE_SCHED` and returns false if it's already set. The NAPI stays bound to CPU X until `napi_complete_done` clears the flag after the poll finishes.
+
+Under high load, the self-reinforcing loop:
+
+```
+1. Worker on CPU X calls napi_schedule → NAPI bound to CPU X
+2. At next ptr_ring_consume_bh, GRO fires on CPU X
+3. GRO finds nothing (ordering constraint), aborts
+4. napi_complete_done clears NAPI_STATE_SCHED
+5. Worker on CPU X (or another CPU) finishes next packet, calls napi_schedule again
+   → NAPI re-bound to whichever CPU happens to call it this time
+6. GRO fires again → same outcome
+```
+
+With WQ_PERCPU (each CPU has its own decrypt worker), the worker on CPU X is pinned there. GRO also fires on CPU X. GRO (softirq) preempts the worker. The worker is suspended. GRO finds nothing. Worker resumes. Then immediately: worker calls `ptr_ring_consume_bh` for the next packet → triggers GRO again. CPU X is saturated with an alternating worker/GRO cycle that makes little forward progress.
+
+The paper measures this as 94% CPU utilization on the saturated core with only 19.2% of expected throughput.
+
+### 1.6 Complete corrected EoI chain
+
+```
+Iteration N:
+─────────────────────────────────────────────────────────────────
+ptr_ring_consume_bh()              receive.c:499
+  spin_lock_bh()                   BH disabled
+  __ptr_ring_consume()             pull packet N from ring
+  spin_unlock_bh()                 BH re-enabled
+                                   ← if any softirq was pending from
+                                      iteration N-1, it fires HERE
+
+[BH is NOW enabled for loop body]
+
+decrypt_packet(skb)                receive.c:501
+  chacha20poly1305_decrypt_...     pure CPU crypto, no BH transitions
+
+wg_queue_enqueue_per_peer_rx()     receive.c:503
+  atomic_set_release(CRYPTED)      queueing.h:195  ← packet N marked READY
+  napi_schedule(&peer->napi)       queueing.h:196
+    local_irq_save()               IRQs briefly disabled (NOT BH)
+    list_add_tail(napi, cpu_poll)  bind NAPI to this CPU's poll list
+    __raise_softirq(NET_RX)        mark softirq as pending — does NOT fire yet
+    local_irq_restore()            IRQs restored; BH still enabled
+                                   ← softirq is pending but won't fire until
+                                      next local_bh_enable()
+
+need_resched() / cond_resched()    possible yield, no BH transitions
+
+─────────────────────────────────────────────────────────────────
+Iteration N+1:
+─────────────────────────────────────────────────────────────────
+ptr_ring_consume_bh()              receive.c:499
+  spin_lock_bh()                   BH disabled (pending softirq deferred)
+  __ptr_ring_consume()             pull packet N+1 from ring
+  spin_unlock_bh()                 BH re-enabled
+    local_bh_enable()
+      do_softirq()
+        NET_RX_SOFTIRQ handler
+          wg_packet_rx_poll()      receive.c:438   ← GRO fires HERE
+            peek head of rx_queue
+            if head.state == UNCRYPTED → return 0  ← finds nothing, aborts
+            (ordering constraint: can't skip to packet N which is CRYPTED)
+  return packet N+1                ptr_ring_consume_bh returns
+[worker resumes: decrypt packet N+1, then triggers GRO again ...]
+```
+
+### 1.7 NAPI poll handler — `wg_packet_rx_poll`
+
+**File:** `receive.c:438–491`
 
 ```c
 int wg_packet_rx_poll(struct napi_struct *napi, int budget)
 {
     struct wg_peer *peer = container_of(napi, struct wg_peer, napi);
-    ...
-    // loops over per-peer RX queue
-    wg_packet_consume_data_done(peer, skb, &endpoint);  // ← calls napi_gro_receive
-    ...
-    napi_complete_done(napi, work_done);   // receive.c:488
+    // ...
+    while ((skb = wg_prev_queue_peek(&peer->rx_queue)) != NULL &&
+           (state = atomic_read_acquire(&PACKET_CB(skb)->state)) !=
+                   PACKET_STATE_UNCRYPTED) {
+        wg_prev_queue_drop_peeked(&peer->rx_queue);
+        // ...
+        wg_packet_consume_data_done(peer, skb, &endpoint);  // calls napi_gro_receive
+        // ...
+        if (++work_done >= budget) break;
+    }
+    if (work_done < budget)
+        napi_complete_done(napi, work_done);   // receive.c:488 — clears NAPI_STATE_SCHED
     return work_done;
 }
 ```
 
-`napi_gro_receive(&peer->napi, skb)` is at `receive.c:411` inside `wg_packet_consume_data_done()`.
+This is Stage 3. It runs at softirq (BH) priority — higher than the workqueue workers running at `SCHED_NORMAL`. Every time it fires during heavy decryption, it preempts Stage 2.
 
-This is Stage 3. It runs as a softirq (high priority), which is precisely what preempts Stage 2.
+The stopping condition `state != PACKET_STATE_UNCRYPTED` is what creates the ordering constraint. The poll stops at the first packet that isn't ready yet, even if later packets in the queue are already decrypted.
 
-### 1.5 How packets enter the decryption workqueue
+`napi_complete_done` at line 488 clears `NAPI_STATE_SCHED`, allowing `napi_schedule` to re-bind the NAPI on the next call.
+
+### 1.8 How packets enter the decryption workqueue
 
 **File:** `receive.c:524–529` inside `wg_packet_consume_data()`
 
@@ -141,13 +339,11 @@ ret = wg_queue_enqueue_per_device_and_peer(
         wg->packet_crypt_wq);
 ```
 
-This enqueues to the per-device decrypt queue and submits to `packet_crypt_wq`. The kernel workqueue subsystem then dispatches `wg_packet_decrypt_worker` to a per-CPU worker thread.
+This does two things simultaneously:
+1. Adds the skb to the **per-device** global decrypt queue (from which `wg_packet_encrypt_worker` pulls in parallel)
+2. Adds the skb to the **per-peer** ordered RX queue (from which `wg_packet_rx_poll` reads in order)
 
-### 1.6 The other `spin_unlock_bh` call
-
-**File:** `receive.c:329`
-
-This is inside the replay counter validation function (`wg_noise_received_with_keypair`), not in the primary decryption path. It's a separate lock release protecting the counter backtrack array. Not the EoI site — the EoI happens via `napi_schedule` in `wg_queue_enqueue_per_peer_rx`.
+The packet's initial state is `PACKET_STATE_UNCRYPTED`. The NAPI poll can see it immediately but will stop on it. Only after `decrypt_packet` runs and `atomic_set_release(CRYPTED)` is called does the NAPI poll move past it.
 
 ---
 
