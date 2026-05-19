@@ -557,111 +557,232 @@ Interval between `workqueue_queue_work` and `workqueue_execute_start` = schedule
 
 How workers are registered: `wg_packet_percpu_multicore_worker_alloc()` in `queueing.c:9` calls `INIT_WORK` for each CPU, binding the worker function to a `multicore_worker` struct. On each enqueue, `queue_work_on(cpu, wq, work)` submits to the specific per-CPU worker.
 
-### 5.2 `wg_packet_decrypt_worker` — no blocking primitives
+### 5.2 `wg_packet_decrypt_worker`
 
-**File:** `receive.c:493–507`
+**File:** `receive.c:493–507` — **Workqueue:** `packet_crypt_wq` (`WQ_CPU_INTENSIVE | WQ_MEM_RECLAIM | WQ_PERCPU`)
 
-Call chain inside the worker loop:
-```
-ptr_ring_consume_bh()           spinlock (spin_lock_bh) — cannot sleep
-  └─ decrypt_packet()           receive.c:242
-       └─ skb_cow_data()        memory allocation — may fail, does not sleep
-       └─ chacha20poly1305_decrypt_sg_inplace()   pure CPU crypto — no locks, no sleep
-  └─ wg_queue_enqueue_per_peer_rx()   atomic_set + napi_schedule — no sleep
-       └─ napi_schedule()       queueing.h:196 — schedules softirq, no sleep
-```
+#### Goal and idea
 
-**`decrypt_packet` (receive.c:242–290) confirmed non-blocking:**
-- `skb_cow_data` — may do memory allocation (GFP_ATOMIC context, no sleep)
-- `chacha20poly1305_decrypt_sg_inplace` — pure software ChaCha20-Poly1305 AEAD, CPU-only, no locks, no sleep
-- Replay counter check uses `spin_lock_bh` (not rwsem) — cannot sleep
-- No `down_read`, `down_write`, `mutex_lock`, `wait_event`, or `schedule()` anywhere
+This is the **receive data path, Stage 2**. Its job is to decrypt incoming WireGuard tunnel packets as fast as possible, in parallel across all CPUs.
 
-**Conclusion: `wg_packet_decrypt_worker` does NOT call any blocking functions.** It is a pure CPU-bound worker.
+When a remote peer sends data through the WireGuard tunnel, those packets arrive on the wire as encrypted UDP datagrams. Stage 1 (the UDP receive handler, running in softirq context) strips the outer UDP/IP headers, looks up the keypair by the packet's key index, and pushes the raw encrypted payload into the global per-device decrypt ring. This worker — Stage 2 — is what actually performs the cryptographic work.
 
-Note: `WQ_CPU_INTENSIVE` flag on `packet_crypt_wq` is specifically designed for this case — it tells the workqueue subsystem that workers will not block, so the per-CPU concurrency limit should not apply. The workqueue can run other work items concurrently on the same CPU.
+One worker is pinned per CPU (`WQ_PERCPU`). All of them consume from the same shared ring simultaneously, so decryption of many packets scales with the number of cores. Each worker independently decrypts its packet and then places it into the per-peer ordered receive queue, so that Stage 3 (NAPI/GRO) can pick them up in order and inject them into the kernel network stack.
 
-### 5.3 `wg_packet_encrypt_worker` — same conclusion
-
-**File:** `send.c:287–307`
-
-Same structure as decrypt: `ptr_ring_consume_bh` → `encrypt_packet` (ChaCha20-Poly1305 AEAD) → `wg_queue_enqueue_per_peer_tx`. No blocking primitives.
-
-### 5.4 `wg_packet_handshake_receive_worker` — **BLOCKING CONFIRMED**
-
-**File:** `receive.c:206–218`
-
-Call chain:
-```
-ptr_ring_consume_bh()                     spinlock — no sleep
-  └─ wg_receive_handshake_packet()        receive.c:92
-       └─ wg_noise_handshake_consume_initiation()   noise.c:~598
-            └─ wait_for_random_bytes()    noise.c:528  ← BLOCKS if CRNG not ready
-            └─ down_read(&static_identity->lock)    noise.c:529  ← SLEEPS if held
-            └─ down_write(&handshake->lock)         noise.c:530  ← SLEEPS if held
-       └─ wg_noise_handshake_consume_response()     noise.c:~678
-            └─ down_read(&static_identity->lock)    noise.c:678  ← SLEEPS if held
-            └─ down_write(&handshake->lock)         noise.c:679  ← SLEEPS if held
-       └─ wg_noise_handshake_begin_session()        noise.c:816
-            └─ down_write(&handshake->lock)         noise.c:822  ← SLEEPS if held
-```
-
-**`down_read` / `down_write` are rwsemaphore (sleeping lock) operations.** They put the calling thread to sleep if the semaphore is already held. This means `wg_packet_handshake_receive_worker` can block its workqueue thread.
-
-**`wait_for_random_bytes()` (noise.c:527):** blocks until the kernel CSPRNG is initialized. On a freshly booted system, this can cause significant delays for early handshake packets.
-
-**Workqueue this runs in:** `handshake_receive_wq` = `WQ_CPU_INTENSIVE | WQ_FREEZABLE | WQ_PERCPU`. Even though `WQ_CPU_INTENSIVE` is set (meaning the concurrency limit doesn't apply in the normal sense), the thread itself will block when `down_write` sleeps, removing it from active execution entirely until the lock is released.
-
-### 5.5 `wg_packet_handshake_send_worker` — **BLOCKING CONFIRMED**
-
-**File:** `send.c:46–53`
+**What it accomplishes:** transforms an encrypted network packet into a plaintext inner IP packet, validating its authenticity via ChaCha20-Poly1305 AEAD (if the auth tag doesn't match, the packet is marked DEAD and dropped).
 
 ```c
-void wg_packet_handshake_send_worker(struct work_struct *work)
-{
-    struct wg_peer *peer = container_of(work, struct wg_peer,
-                         transmit_handshake_work);
-    wg_packet_send_handshake_initiation(peer);   → calls into noise.c
+while ((skb = ptr_ring_consume_bh(&queue->ring)) != NULL) {
+    state = decrypt_packet(skb, ...) ? PACKET_STATE_CRYPTED : PACKET_STATE_DEAD;
+    wg_queue_enqueue_per_peer_rx(skb, state);
 }
 ```
 
-`wg_packet_send_handshake_initiation` calls `wg_noise_handshake_create_initiation` (noise.c:~529):
-- `wait_for_random_bytes()` — noise.c:527 — **blocks until CRNG ready**
-- `down_read(&handshake->static_identity->lock)` — noise.c:529 — **sleeping lock**
-- `down_write(&handshake->lock)` — noise.c:530 — **sleeping lock**
+#### Blocking analysis
 
-**Workqueue:** `handshake_send_wq` = `WQ_UNBOUND | WQ_FREEZABLE`. This workqueue IS unbound (floating workers), so blocked threads don't pin to a specific CPU. But blocking still degrades throughput by stalling the worker.
+```
+ptr_ring_consume_bh()                         spin_lock_bh / spin_unlock_bh — cannot sleep
+  └─ decrypt_packet()                         receive.c:501
+       └─ skb_cow_data()                      GFP_ATOMIC allocation — may fail, does not sleep
+       └─ chacha20poly1305_decrypt_sg_inplace() pure CPU crypto — no locks, no sleep
+       └─ spin_lock_bh (replay counter)       cannot sleep
+  └─ wg_queue_enqueue_per_peer_rx()
+       └─ atomic_set_release()                atomic store — no sleep
+       └─ napi_schedule()                     raises softirq flag — no sleep
+```
 
-### 5.6 `wg_packet_tx_worker` — no blocking primitives
+No `down_read`, `down_write`, `mutex_lock`, `wait_event`, or `schedule()` anywhere.
 
-**File:** `send.c:262–285`
+**Conclusion: non-blocking.** Pure CPU computation. `WQ_CPU_INTENSIVE` is appropriate — this worker deliberately hogs the CPU for crypto and should not be throttled by the concurrency manager.
 
-**Workqueue:** `packet_crypt_wq` — confirmed at `queueing.h:183–184`:
+---
 
+### 5.3 `wg_packet_encrypt_worker`
+
+**File:** `send.c:287–309` — **Workqueue:** `packet_crypt_wq` (`WQ_CPU_INTENSIVE | WQ_MEM_RECLAIM | WQ_PERCPU`)
+
+#### Goal and idea
+
+This is the **send data path, Stage 2** — the symmetric mirror of `wg_packet_decrypt_worker`, but for outgoing packets.
+
+When the local machine sends data through the WireGuard interface, the kernel's networking stack produces a plaintext inner IP packet. Stage 1 (the `dev_start_xmit` path, called when a packet is sent on the WireGuard network interface) looks up the current session keypair for the destination peer, assigns a nonce (monotonically increasing counter), and pushes the packet into the global per-device encrypt ring. This worker encrypts it.
+
+One subtle difference from the decrypt worker: a single "batch" pulled from the ring (`first`) may be a **linked list of skbs** — multiple packets for the same peer, chained together and submitted as one unit. The worker iterates over all of them with `skb_list_walk_safe`, encrypting each in sequence. If any packet in the chain fails encryption, the whole chain is marked DEAD.
+
+After encryption, the batch is handed to `wg_queue_enqueue_per_peer_tx`, which places it into the per-peer TX queue and wakes the TX worker to send it.
+
+**What it accomplishes:** transforms a plaintext inner IP packet into a WireGuard data message — adding the protocol header, padding (to obscure packet lengths), and a 16-byte Poly1305 authentication tag — ready to be sent as a UDP datagram to the peer's endpoint.
+
+```c
+while ((first = ptr_ring_consume_bh(&queue->ring)) != NULL) {
+    enum packet_state state = PACKET_STATE_CRYPTED;
+    skb_list_walk_safe(first, skb, next) {
+        if (likely(encrypt_packet(skb, PACKET_CB(first)->keypair)))
+            wg_reset_packet(skb, true);
+        else { state = PACKET_STATE_DEAD; break; }
+    }
+    wg_queue_enqueue_per_peer_tx(first, state);
+}
+```
+
+#### Blocking analysis
+
+Identical structure to the decrypt worker. `encrypt_packet` is pure ChaCha20-Poly1305 AEAD with no sleeping primitives. `wg_queue_enqueue_per_peer_tx` is an atomic store plus `queue_work_on`.
+
+**Conclusion: non-blocking.** Same reasoning as decrypt.
+
+---
+
+### 5.4 `wg_packet_tx_worker`
+
+**File:** `send.c:262–285` — **Workqueue:** `packet_crypt_wq` (`WQ_CPU_INTENSIVE | WQ_MEM_RECLAIM | WQ_PERCPU`)
+
+Confirmed at `queueing.h:183–184`:
 ```c
 queue_work_on(wg_cpumask_choose_online(&peer->serial_work_cpu, peer->internal_id),
               peer->device->packet_crypt_wq, &peer->transmit_packet_work);
 ```
 
-Same queue as encrypt/decrypt workers: `WQ_CPU_INTENSIVE | WQ_MEM_RECLAIM | WQ_PERCPU`.
+#### Goal and idea
 
-This is the per-peer TX serializer. After encryption workers finish a batch of packets, the TX worker sends them out in order. Call chain:
+This is the **send data path, Stage 3** — the per-peer TX serializer.
+
+The problem it solves: after encryption, multiple packets for the same peer may have been processed by different CPU workers in parallel, finishing in arbitrary order. If we sent them the moment each worker finished, packets would arrive at the remote peer out of order, which confuses TCP. The TX worker enforces in-order delivery before transmission.
+
+Each peer has its own per-peer TX queue (`peer->tx_queue`). Encrypt workers place packets into this queue in their original send order, initially with state UNCRYPTED. When an encrypt worker finishes a packet, it sets the state to CRYPTED atomically. The TX worker then walks this queue from the head — exactly like the RX poll does on the receive side — processing CRYPTED packets in order and stopping at the first UNCRYPTED one. This guarantees that even if packet N+1 was encrypted before packet N, packet N is always sent first.
+
+There is exactly **one TX worker per peer** (dispatched via `peer->transmit_packet_work`). This single-consumer design avoids the need for any per-peer locking on the TX side — only one goroutine ever reads from the head of the per-peer TX queue at a time.
+
+**What it accomplishes:** picks up encrypted packets from the per-peer TX queue in the correct order and calls `wg_socket_send_skb_to_peer` to transmit each one as a UDP datagram to the peer's last-known endpoint address.
+
+```c
+while ((first = wg_prev_queue_peek(&peer->tx_queue)) != NULL &&
+       (state = atomic_read_acquire(&PACKET_CB(first)->state)) != PACKET_STATE_UNCRYPTED) {
+    wg_prev_queue_drop_peeked(&peer->tx_queue);
+    if (likely(state == PACKET_STATE_CRYPTED))
+        wg_packet_create_data_done(peer, first);  // → wg_socket_send_skb_to_peer
+    else
+        kfree_skb_list(first);
+}
+```
+
+#### Blocking analysis
 
 ```
-wg_prev_queue_peek(&peer->tx_queue)     read per-peer TX queue — no sleep
-atomic_read_acquire(&PACKET_CB->state)  atomic read — no sleep
-wg_packet_create_data_done()            send.c:242
-  └─ wg_timers_any_authenticated_*()   timer updates — spinlock only
-  └─ wg_socket_send_skb_to_peer()      UDP send — see note below
-  └─ keep_key_fresh()                  checks key age, may call napi_schedule — no sleep
-wg_noise_keypair_put()                  reference count decrement — no sleep
-wg_peer_put()                           reference count decrement — no sleep
-cond_resched()                          voluntary yield — not a block
+wg_prev_queue_peek()              reads prev_queue — no sleep
+atomic_read_acquire()             atomic read — no sleep
+wg_packet_create_data_done()      send.c:242
+  └─ wg_timers_*()                spinlock-based timer updates — no sleep
+  └─ wg_socket_send_skb_to_peer() UDP send — non-blocking in normal path
+  └─ keep_key_fresh()             checks if rekeying needed — no sleep
+wg_noise_keypair_put()            reference count decrement — no sleep
+wg_peer_put()                     reference count decrement — no sleep
+cond_resched()                    voluntary yield — not a sleep
 ```
 
-**Note on `wg_socket_send_skb_to_peer`:** this calls into the UDP send path. UDP sends in kernel space can acquire socket locks, but WireGuard's socket is used with `sock_sendmsg` in a non-blocking manner — the socket is pre-configured and the send either completes or fails immediately. No `wait_event`, no `down_write`, no sleeping lock in the normal path.
+`wg_socket_send_skb_to_peer` calls into the UDP send path. UDP sends in kernel space can transiently acquire socket locks, but WireGuard's socket is pre-configured and sends are non-blocking — no `wait_event`, no `down_write`, no sleeping lock in the normal path.
 
-**Conclusion: `wg_packet_tx_worker` does NOT call any blocking functions.** Like the encrypt/decrypt workers, it is CPU-bound and I/O-bound in a non-sleeping sense. Its placement in `packet_crypt_wq` (`WQ_CPU_INTENSIVE`) is appropriate.
+**Conclusion: non-blocking.** `WQ_CPU_INTENSIVE` appropriate.
+
+---
+
+### 5.5 `wg_packet_handshake_receive_worker` — **BLOCKING CONFIRMED**
+
+**File:** `receive.c:206–218` — **Workqueue:** `handshake_receive_wq` (`WQ_CPU_INTENSIVE | WQ_FREEZABLE | WQ_PERCPU`)
+
+#### Goal and idea
+
+This is the **control path, receive side**. It handles incoming WireGuard handshake messages — not data packets, but the session establishment messages of the Noise Protocol.
+
+Before any data can flow between two WireGuard peers, they must complete a Noise Protocol handshake: the initiator sends a handshake initiation, the responder replies with a handshake response, and both sides derive a shared symmetric session keypair from the exchange. WireGuard also rekeyes automatically every 3 minutes (`REKEY_AFTER_TIME`) or after 2^60 packets, so this worker runs throughout the lifetime of the tunnel — not just at startup.
+
+Handshake packets arrive on the same UDP socket as data packets. The UDP receive handler distinguishes them by the message type field and pushes them into a separate `handshake_queue`. This worker drains that queue by calling `wg_receive_handshake_packet`, which does the following:
+
+1. **Cookie handling:** if the packet is a cookie reply (type `MESSAGE_HANDSHAKE_COOKIE`), pass it to the cookie consumer and return — no crypto needed.
+2. **DDoS load detection:** if the handshake queue is more than 1/8 full, the system considers itself under load. Under load, it requires the second "cookie" MAC before processing the handshake — this makes spoofed flood attacks more expensive for attackers.
+3. **MAC validation:** two MACs per handshake packet are verified. Invalid MACs are dropped immediately, before any expensive crypto.
+4. **Noise cryptography (`noise.c`):** the actual Diffie-Hellman and key derivation:
+   - For a **handshake initiation**: decrypt the initiator's ephemeral public key, verify the initiator's static identity, derive intermediate keys, store the partial handshake state, prepare and send the response.
+   - For a **handshake response**: complete the key derivation using the responder's ephemeral key, call `wg_noise_handshake_begin_session` to derive the final symmetric session keypair.
+
+**What it accomplishes:** on a complete two-message exchange, a new `noise_keypair` (holding the symmetric ChaCha20-Poly1305 keys) is installed into the peer's keypair set. From that point on, data packets can be encrypted and decrypted using that session key.
+
+```c
+while ((skb = ptr_ring_consume_bh(&queue->ring)) != NULL) {
+    wg_receive_handshake_packet(wg, skb);  // full Noise protocol processing
+    dev_kfree_skb(skb);
+    atomic_dec(&wg->handshake_queue_len);
+}
+```
+
+#### Blocking analysis
+
+```
+ptr_ring_consume_bh()                              spinlock — no sleep
+  └─ wg_receive_handshake_packet()                 receive.c:92
+       └─ wg_cookie_validate_packet()              MAC validation — spinlock only
+       └─ wg_noise_handshake_consume_initiation()  noise.c:~520
+            └─ wait_for_random_bytes()             noise.c:527  ← SLEEPS until CRNG ready
+            └─ down_read(&static_identity->lock)   noise.c:529  ← SLEEPS if write-locked
+            └─ down_write(&handshake->lock)        noise.c:530  ← SLEEPS if held by anyone
+       └─ wg_noise_handshake_consume_response()    noise.c:~670
+            └─ down_read(&static_identity->lock)   noise.c:678  ← SLEEPS if write-locked
+            └─ down_write(&handshake->lock)        noise.c:679  ← SLEEPS if held
+       └─ wg_noise_handshake_begin_session()       noise.c:816
+            └─ down_write(&handshake->lock)        noise.c:822  ← SLEEPS if held
+```
+
+**`down_read` / `down_write`** are rwsemaphore operations — sleeping locks. `down_write` puts the calling thread to sleep if any reader or writer holds the lock. `down_read` sleeps only if a writer holds it. Since `handshake->lock` serializes all handshake operations for a given peer, concurrent handshake packets for the same peer will contend on this lock and block.
+
+**`wait_for_random_bytes()` (noise.c:527):** blocks until the kernel CSPRNG is fully seeded. Relevant at early boot — after boot, this is effectively a no-op since the CRNG is already ready.
+
+**Conclusion: BLOCKING.** Every handshake processing call acquires sleeping locks. Under high connection churn, workers block on lock contention. With `WQ_PERCPU`, a blocked worker on CPU N stalls all handshake processing for packets arriving on CPU N.
+
+---
+
+### 5.6 `wg_packet_handshake_send_worker` — **BLOCKING CONFIRMED**
+
+**File:** `send.c:46–53` — **Workqueue:** `handshake_send_wq` (`WQ_UNBOUND | WQ_FREEZABLE`)
+
+#### Goal and idea
+
+This is the **control path, send side**. It initiates a WireGuard Noise handshake toward a remote peer.
+
+This worker is triggered in three situations:
+- **Session establishment:** when there is no valid current session keypair for a peer and data needs to be sent. The data packets are held in `staged_packet_queue` until a session is established.
+- **Proactive rekeying:** `keep_key_fresh` (called at the end of `wg_packet_create_data_done`, i.e., after every data send) checks whether the current session is approaching its expiry. If so, it queues this worker to initiate a new handshake while the old key is still valid, avoiding any disruption to data flow.
+- **Retry after timeout:** if the remote peer does not respond to a handshake initiation within `REKEY_TIMEOUT` (5 seconds), the timer system re-queues this worker. Up to `MAX_TIMER_HANDSHAKES` (90 / 5 = 18) retries before giving up.
+
+The work itself implements the Noise Protocol initiator role: generate a fresh ephemeral Diffie-Hellman keypair, compute the handshake message (mixing in the initiator's static identity, the peer's static public key, and the ephemeral key), encrypt the initiator's identity, build the `message_handshake_initiation` struct, add both MACs, and send it over UDP to the peer's last known endpoint.
+
+Unlike the receive worker (which processes a queue of many packets), this worker handles exactly **one peer per dispatch**. It is stored in `peer->transmit_handshake_work` and uses `wg_peer_get` to hold a reference to the peer until the worker completes (`wg_peer_put` at the end).
+
+**What it accomplishes:** sends a Noise handshake initiation message to a peer, starting or continuing the session establishment process. Without this worker, no data can ever be sent to a peer — all data path workers depend on a valid session keypair being present.
+
+```c
+void wg_packet_handshake_send_worker(struct work_struct *work)
+{
+    struct wg_peer *peer = container_of(work, struct wg_peer, transmit_handshake_work);
+    wg_packet_send_handshake_initiation(peer);   // full Noise initiator crypto
+    wg_peer_put(peer);                           // release the reference taken at queue time
+}
+```
+
+#### Blocking analysis
+
+`wg_packet_send_handshake_initiation` → `wg_noise_handshake_create_initiation` (`noise.c:~520`):
+
+```
+wait_for_random_bytes()              noise.c:527  ← SLEEPS until CRNG ready
+down_read(&static_identity->lock)    noise.c:529  ← SLEEPS if write-locked
+down_write(&handshake->lock)         noise.c:530  ← SLEEPS if held by anyone
+```
+
+Same blocking primitives as the receive worker. `handshake->lock` serializes all handshake operations for a given peer — only one CPU can hold it for writing at a time, so simultaneous send and receive handshake processing for the same peer will contend.
+
+**Key difference from receive worker:** `handshake_send_wq` is `WQ_UNBOUND`. Workers are not pinned to a specific CPU — the unbound pool can wake a worker on any available CPU. A blocked send worker does not permanently occupy a per-CPU slot, making it more resilient to lock contention than the receive worker.
+
+**Conclusion: BLOCKING.** Same sleeping locks as the receive worker, but lower structural impact due to `WQ_UNBOUND`.
 
 ### 5.7 Summary: blocking behavior by work item
 
