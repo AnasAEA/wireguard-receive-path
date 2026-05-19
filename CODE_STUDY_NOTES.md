@@ -553,7 +553,7 @@ Interval between `workqueue_queue_work` and `workqueue_execute_start` = schedule
 | `wg_packet_encrypt_worker` | `packet_crypt_wq` | same | `send.c:287` |
 | `wg_packet_handshake_receive_worker` | `handshake_receive_wq` | `WQ_CPU_INTENSIVE\|WQ_FREEZABLE\|WQ_PERCPU` | `receive.c:206` |
 | `wg_packet_handshake_send_worker` | `handshake_send_wq` | `WQ_UNBOUND\|WQ_FREEZABLE` | `send.c:46` |
-| `wg_packet_tx_worker` | per-peer TX | n/a | `send.c:262` |
+| `wg_packet_tx_worker` | `packet_crypt_wq` | `WQ_CPU_INTENSIVE\|WQ_MEM_RECLAIM\|WQ_PERCPU` | `send.c:262` |
 
 How workers are registered: `wg_packet_percpu_multicore_worker_alloc()` in `queueing.c:9` calls `INIT_WORK` for each CPU, binding the worker function to a `multicore_worker` struct. On each enqueue, `queue_work_on(cpu, wq, work)` submits to the specific per-CPU worker.
 
@@ -608,7 +608,7 @@ ptr_ring_consume_bh()                     spinlock — no sleep
 
 **`down_read` / `down_write` are rwsemaphore (sleeping lock) operations.** They put the calling thread to sleep if the semaphore is already held. This means `wg_packet_handshake_receive_worker` can block its workqueue thread.
 
-**`wait_for_random_bytes()` (noise.c:528):** blocks until the kernel CSPRNG is initialized. On a freshly booted system, this can cause significant delays for early handshake packets.
+**`wait_for_random_bytes()` (noise.c:527):** blocks until the kernel CSPRNG is initialized. On a freshly booted system, this can cause significant delays for early handshake packets.
 
 **Workqueue this runs in:** `handshake_receive_wq` = `WQ_CPU_INTENSIVE | WQ_FREEZABLE | WQ_PERCPU`. Even though `WQ_CPU_INTENSIVE` is set (meaning the concurrency limit doesn't apply in the normal sense), the thread itself will block when `down_write` sleeps, removing it from active execution entirely until the lock is released.
 
@@ -626,18 +626,50 @@ void wg_packet_handshake_send_worker(struct work_struct *work)
 ```
 
 `wg_packet_send_handshake_initiation` calls `wg_noise_handshake_create_initiation` (noise.c:~529):
-- `wait_for_random_bytes()` — noise.c:528 — **blocks until CRNG ready**
+- `wait_for_random_bytes()` — noise.c:527 — **blocks until CRNG ready**
 - `down_read(&handshake->static_identity->lock)` — noise.c:529 — **sleeping lock**
 - `down_write(&handshake->lock)` — noise.c:530 — **sleeping lock**
 
 **Workqueue:** `handshake_send_wq` = `WQ_UNBOUND | WQ_FREEZABLE`. This workqueue IS unbound (floating workers), so blocked threads don't pin to a specific CPU. But blocking still degrades throughput by stalling the worker.
 
-### 5.6 Summary: blocking behavior by work item
+### 5.6 `wg_packet_tx_worker` — no blocking primitives
+
+**File:** `send.c:262–285`
+
+**Workqueue:** `packet_crypt_wq` — confirmed at `queueing.h:183–184`:
+
+```c
+queue_work_on(wg_cpumask_choose_online(&peer->serial_work_cpu, peer->internal_id),
+              peer->device->packet_crypt_wq, &peer->transmit_packet_work);
+```
+
+Same queue as encrypt/decrypt workers: `WQ_CPU_INTENSIVE | WQ_MEM_RECLAIM | WQ_PERCPU`.
+
+This is the per-peer TX serializer. After encryption workers finish a batch of packets, the TX worker sends them out in order. Call chain:
+
+```
+wg_prev_queue_peek(&peer->tx_queue)     read per-peer TX queue — no sleep
+atomic_read_acquire(&PACKET_CB->state)  atomic read — no sleep
+wg_packet_create_data_done()            send.c:242
+  └─ wg_timers_any_authenticated_*()   timer updates — spinlock only
+  └─ wg_socket_send_skb_to_peer()      UDP send — see note below
+  └─ keep_key_fresh()                  checks key age, may call napi_schedule — no sleep
+wg_noise_keypair_put()                  reference count decrement — no sleep
+wg_peer_put()                           reference count decrement — no sleep
+cond_resched()                          voluntary yield — not a block
+```
+
+**Note on `wg_socket_send_skb_to_peer`:** this calls into the UDP send path. UDP sends in kernel space can acquire socket locks, but WireGuard's socket is used with `sock_sendmsg` in a non-blocking manner — the socket is pre-configured and the send either completes or fails immediately. No `wait_event`, no `down_write`, no sleeping lock in the normal path.
+
+**Conclusion: `wg_packet_tx_worker` does NOT call any blocking functions.** Like the encrypt/decrypt workers, it is CPU-bound and I/O-bound in a non-sleeping sense. Its placement in `packet_crypt_wq` (`WQ_CPU_INTENSIVE`) is appropriate.
+
+### 5.7 Summary: blocking behavior by work item
 
 | Work item | Blocking calls | Impact |
 |---|---|---|
 | `wg_packet_decrypt_worker` | None | Pure CPU; `WQ_CPU_INTENSIVE` appropriate |
 | `wg_packet_encrypt_worker` | None | Pure CPU; `WQ_CPU_INTENSIVE` appropriate |
+| `wg_packet_tx_worker` | None | Per-peer TX serializer; UDP send non-blocking in normal path |
 | `wg_packet_handshake_receive_worker` | `down_read/write` (rwsem), `wait_for_random_bytes` | **Sleeping locks** — thread blocks on lock contention; CRNG wait on startup |
 | `wg_packet_handshake_send_worker` | `down_read/write` (rwsem), `wait_for_random_bytes` | Same — `WQ_UNBOUND` so no CPU pinning, but still blocks |
 
