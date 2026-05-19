@@ -230,6 +230,17 @@ Note the important correction from earlier documentation: **the just-decrypted p
 
 This wasted GRO firing is the EoI: a high-priority task (GRO softirq) runs but accomplishes nothing, stealing CPU time from the low-priority tasks (decrypt workers) that are doing actual useful work.
 
+**Remark — DEAD packets are not a blocking condition.**
+
+`PACKET_STATE_DEAD` (set when `decrypt_packet` returns false — e.g., authentication tag mismatch) does NOT stop the loop. The while condition only exits on `PACKET_STATE_UNCRYPTED`. A DEAD packet satisfies `DEAD != UNCRYPTED`, so it enters the loop body, hits `receive.c:458`:
+
+```c
+if (unlikely(state != PACKET_STATE_CRYPTED))
+    goto next;   // skips processing, frees the skb
+```
+
+and is freed. The loop then advances to the next packet. A DEAD packet at the head does not create the EoI blockage — only an UNCRYPTED one does. This is consistent with the EoI being a normal-path problem (every burst of packets triggers it), not an error-path problem.
+
 ### 1.5 The stale CPU binding — self-reinforcing saturation
 
 `napi_schedule` uses `this_cpu_ptr(&softnet_data)` — it binds the NAPI poll to whatever CPU is executing `napi_schedule` at that moment. This is a snapshot, not a live reference.
