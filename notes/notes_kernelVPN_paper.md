@@ -385,3 +385,7 @@ All four configurations scale **linearly and identically** up to 1,000 clients (
 | Workqueues = fixed thread pool → no scheduling explosion | Connects to io-wq worker pool behavior from Cloudflare article |
 
 **The connection to io-wq / Cloudflare article:** The paper's workqueue fix uses the *same* Linux workqueue infrastructure (`work_struct`, `queue_work_on`, worker pool) that io_uring's io-wq is built on. Understanding worker pool sizing (`IORING_REGISTER_IOWQ_MAX_WORKERS`) from the Cloudflare article is directly relevant to understanding why workqueues scale better than kthreads here — fixed thread count, no `RLIMIT_NPROC` explosion.
+
+
+
+Jeudi 9h - Presentation de EOI ,  avec Code et arguments - salle 471
