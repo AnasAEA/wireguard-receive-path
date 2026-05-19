@@ -449,6 +449,137 @@ However, the blocking in handshake workers becomes significant under:
 
 ---
 
+## Part 6 — kernel/workqueue.c: concurrency management and blocking behavior
+
+*Added May 19, 2026. Key question: what happens to a `WQ_CPU_INTENSIVE` pool when a thread blocks?*
+
+### 6.1 The `nr_running` counter and concurrency management
+
+The workqueue subsystem tracks a per-pool counter `nr_running` (defined at `workqueue.c:211`). This counter controls whether new workers need to be woken up:
+
+```c
+/* workqueue.c:950–964 */
+static bool need_more_worker(struct worker_pool *pool)
+{
+    return !list_empty(&pool->worklist) && !pool->nr_running;
+}
+
+static bool keep_working(struct worker_pool *pool)
+{
+    return !list_empty(&pool->worklist) && (pool->nr_running <= 1);
+}
+```
+
+The concurrency management goal: keep exactly one runnable worker per pool per CPU. If a worker sleeps, `nr_running` drops, and `kick_pool` wakes another idle worker to compensate.
+
+### 6.2 `WORKER_CPU_INTENSIVE` removes workers from `nr_running`
+
+The flag `WORKER_CPU_INTENSIVE` is part of the `WORKER_NOT_RUNNING` mask (`workqueue.c:97`):
+
+```c
+WORKER_NOT_RUNNING = WORKER_PREP | WORKER_CPU_INTENSIVE | WORKER_UNBOUND | WORKER_REBOUND;
+```
+
+When a work item starts running on a `WQ_CPU_INTENSIVE` workqueue, the worker is immediately flagged:
+
+```c
+/* workqueue.c:3263–3264 */
+if (unlikely(pwq->wq->flags & WQ_CPU_INTENSIVE))
+    worker_set_flags(worker, WORKER_CPU_INTENSIVE);
+```
+
+`worker_set_flags` with a `WORKER_NOT_RUNNING` flag decrements `pool->nr_running` (`workqueue.c:999`).
+
+**Effect:** The `WQ_CPU_INTENSIVE` worker is excluded from concurrency accounting from the moment it starts executing. The pool's `nr_running` is decremented. If there are pending work items and no other running workers, `kick_pool` will wake an idle worker.
+
+**In plain terms:** setting `WQ_CPU_INTENSIVE` does not prevent a worker from blocking — it just tells the concurrency manager not to count this worker as "running" for throttling purposes. Another idle worker can be woken up immediately to handle pending items.
+
+### 6.3 What happens when a worker sleeps (`wq_worker_sleeping`)
+
+When any worker goes to sleep (enters `schedule()`), the scheduler calls `wq_worker_sleeping`:
+
+```c
+/* workqueue.c:1453–1490 */
+void wq_worker_sleeping(struct task_struct *task)
+{
+    /* ... */
+    pool->nr_running--;
+    if (kick_pool(pool))    // wakes an idle worker if needed
+        worker->current_pwq->stats[PWQ_STAT_CM_WAKEUP]++;
+}
+```
+
+And when it wakes up, `wq_worker_running` is called:
+
+```c
+/* workqueue.c:1419–1444 */
+void wq_worker_running(struct task_struct *task)
+{
+    if (!(worker->flags & WORKER_NOT_RUNNING))
+        worker->pool->nr_running++;
+    /* ... */
+}
+```
+
+**Critical observation:** For a `WQ_CPU_INTENSIVE` worker, `WORKER_CPU_INTENSIVE` is already set (part of `WORKER_NOT_RUNNING`), so when it sleeps, `wq_worker_sleeping` returns early at line 1463 (`if (worker->flags & WORKER_NOT_RUNNING) return;`). The `nr_running` was already decremented when the work started. **No double decrement.**
+
+Similarly, when the `WQ_CPU_INTENSIVE` worker wakes from a sleeping lock, `wq_worker_running` checks `!(worker->flags & WORKER_NOT_RUNNING)` → condition is false → **no increment**. The worker stays excluded from `nr_running` until the work item completes, at which point `WORKER_CPU_INTENSIVE` is cleared (`workqueue.c:3358`).
+
+### 6.4 `kick_pool`: waking idle workers
+
+```c
+/* workqueue.c:1267–1315 */
+static bool kick_pool(struct worker_pool *pool)
+{
+    struct worker *worker = first_idle_worker(pool);
+    /* ... */
+    if (!need_more_worker(pool) || !worker)
+        return false;
+    /* ... */
+    wake_up_process(p);
+    return true;
+}
+```
+
+`kick_pool` wakes the most-recently-idle worker if `need_more_worker` is true (worklist not empty AND `nr_running == 0`). This is the mechanism that spawns additional workers when existing ones are blocked.
+
+### 6.5 `WQ_MEM_RECLAIM` and the rescuer thread
+
+`WQ_MEM_RECLAIM` (`packet_crypt_wq` has this) guarantees that even under memory pressure, at least one worker will always be available to make progress. It does this by creating a dedicated "rescuer" thread (`workqueue.c:5705–5735`). This is relevant for correctness under memory pressure, not for normal throughput analysis.
+
+### 6.6 `WQ_PERCPU` — what it means for blocked workers
+
+`WQ_PERCPU` (not a standard kernel flag — WireGuard defines its own via `alloc_workqueue`) means workers are pinned to specific CPUs via `queue_work_on(cpu, wq, work)`. When a per-CPU `WQ_CPU_INTENSIVE` worker blocks (e.g., on an rwsem in handshake processing):
+
+1. Worker is already excluded from `nr_running` (set at work start — step 6.2)
+2. `wq_worker_sleeping` returns early (step 6.3) — no redundant decrement
+3. `kick_pool` was already called when work started (step 6.4) — an idle worker on the same CPU should have been woken
+4. But with `WQ_PERCPU`, the replacement worker is bound to the **same CPU**. If there are no idle workers on that CPU, the queue stalls until the sleeping worker wakes.
+
+**This is the key constraint for handshake workers:** `handshake_receive_wq` is `WQ_CPU_INTENSIVE | WQ_PERCPU`. If the per-CPU worker pool has no idle worker ready (e.g., all pre-spawned workers are busy), incoming handshakes on that CPU can queue up while the active worker sleeps on `down_write(&handshake->lock)`.
+
+**`handshake_send_wq` is different:** it's `WQ_UNBOUND | WQ_FREEZABLE`. Unbound workers float across CPUs and are managed by a global unbound pool. When the handshake send worker sleeps, the pool can wake a worker on any CPU — better resilience, but no NUMA/cache locality guarantees.
+
+### 6.7 Auto-detection: dynamic `WQ_CPU_INTENSIVE` promotion
+
+Beyond the static `WQ_CPU_INTENSIVE` flag, the kernel also auto-promotes concurrency-managed workers dynamically via `wq_worker_tick` (`workqueue.c:1499–1538`): if a concurrency-managed worker hogs the CPU for longer than `wq_cpu_intensive_thresh_us` (default: configured at boot via `/sys/module/workqueue/parameters/cpu_intensive_thresh_us`), it is automatically flagged `WORKER_CPU_INTENSIVE` and kicked out of `nr_running`. This prevents long-running work items from blocking shorter ones on the same CPU.
+
+WireGuard's decrypt/encrypt workers use static `WQ_CPU_INTENSIVE`, not the dynamic mechanism — they declare up front that they won't participate in concurrency management.
+
+### 6.8 Summary: implications for WireGuard handshake blocking
+
+| Scenario | What kernel does | Impact |
+|---|---|---|
+| Handshake receive worker starts | `WORKER_CPU_INTENSIVE` set → `nr_running--` → `kick_pool` wakes idle worker | Another worker can run on same CPU while handshake executes |
+| Handshake receive worker hits `down_write` | Thread sleeps; `wq_worker_sleeping` returns early (already NOT_RUNNING) | No additional kick; sleeping worker is simply off-CPU |
+| No idle worker available on this CPU | `kick_pool` has no one to wake | Pending handshakes on this CPU queue up; stall until sleeping worker returns |
+| Handshake send worker hits `down_write` | Thread sleeps; unbound pool finds any-CPU idle worker | Lower stall risk, but still blocks |
+| `wait_for_random_bytes` at boot | All handshake workers on all CPUs block until CRNG ready | Complete handshake stall at boot — no crypto possible |
+
+**Bottom line for Alain:** The handshake workers do call sleeping locks (`down_write`/`down_read`). The `WQ_CPU_INTENSIVE` flag does NOT prevent them from blocking; it only tells the concurrency manager not to count them as "running" so other work items can proceed. Under high rekeying pressure (e.g., ~5 sessions/second with 1,000 clients every 3 minutes), each per-CPU handshake pool has a fixed number of workers. If those workers pile up sleeping on `down_write(&handshake->lock)` (which serializes per-peer handshake state), incoming handshake packets queue up and overall latency grows.
+
+---
+
 ## Study log
 
 | Date | Files read | Key finding |
@@ -457,11 +588,12 @@ However, the blocking in handshake workers becomes significant under:
 | 2026-05-15 | `drivers/net/wireguard/receive.c`, `queueing.h`, `device.c` | EoI chain confirmed at source level; napi_schedule stale pointer at queueing.h:196; packet_crypt_wq is WQ_CPU_INTENSIVE\|WQ_PERCPU not WQ_UNBOUND |
 | 2026-05-15 | `io_uring/io-wq.c`, `io-wq.h` | **Proxy argument is wrong**: io-wq uses kthreads (create_io_thread), not queue_work_on; work_struct only for worker creation retry |
 | 2026-05-18 | `receive.c`, `send.c`, `noise.c`, `queueing.c` | **New objective**: work item inventory + blocking analysis. Decrypt/encrypt workers: non-blocking (pure ChaCha20). Handshake workers: blocking — rwsem (down_read/write) and wait_for_random_bytes |
+| 2026-05-19 | `kernel/workqueue.c` | `WQ_CPU_INTENSIVE` removes worker from `nr_running` at work start (not at sleep). Sleeping `WQ_CPU_INTENSIVE` workers do NOT trigger extra `kick_pool` (already NOT_RUNNING). Per-CPU pool + blocked worker = queue stall on that CPU if no idle worker available. `handshake_receive_wq` (PERCPU) more vulnerable than `handshake_send_wq` (UNBOUND). |
 
 ---
 
 ## Still to read
 
-- [ ] `kernel/workqueue.c` — `WQ_CPU_INTENSIVE` effect on concurrency limit; what happens to pool when a thread blocks
+- [x] `kernel/workqueue.c` — `WQ_CPU_INTENSIVE` effect on concurrency limit; what happens to pool when a thread blocks — **Part 6**
 - [ ] `drivers/net/wireguard/peer.c` — per-peer NAPI setup, `netif_napi_add` call
 - [ ] io_uring work items — compare blocking behavior for Thursday meeting
