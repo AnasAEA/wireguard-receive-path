@@ -1,4 +1,4 @@
-# Code Study Notes — WireGuard + io-wq Source Analysis
+# Code Study Notes — WireGuard kernel receive pipeline
 # Anas Ait El Hadj · May 2026
 
 > Running notes from reading the actual kernel source.
@@ -12,9 +12,7 @@
 | Repo / file | How obtained | Version |
 |---|---|---|
 | `linux-source/drivers/net/wireguard/` | curl from `WireGuard/wireguard-linux` `devel` branch | current devel |
-| `linux-source/io_uring/io-wq.c` + `io-wq.h` | curl from `torvalds/linux` master | current master |
 | `linux-source/kernel/workqueue.c` | curl from `torvalds/linux` master | current master |
-| `wireguard-go/device/` | git clone `WireGuard/wireguard-go` | current master |
 
 ---
 
@@ -438,23 +436,27 @@ After `netif_napi_add`, the NAPI exists in the system and has its poll function 
 
 **Line 58 — `napi_enable`:**
 
-This is what actually activates the NAPI. Internally (`net/core/dev.c:7653`):
+`napi_enable` is a simple activation gate. Before it is called, the NAPI instance exists in memory but is deliberately locked out from being scheduled. After it is called, the NAPI is live and `napi_schedule` can add it to a CPU's poll list.
 
 ```c
-void napi_enable_locked(struct napi_struct *n)
+void napi_enable(struct napi_struct *n)
 {
-    // ...
-    do {
-        new = val & ~(NAPIF_STATE_SCHED | NAPIF_STATE_NPSVC);  // clear both bits
-    } while (!try_cmpxchg(&n->state, &val, new));
+    BUG_ON(!test_bit(NAPI_STATE_SCHED, &n->state));
+    clear_bit(NAPI_STATE_SCHED, &n->state);
+    clear_bit(NAPI_STATE_NPSVC, &n->state);
 }
 ```
 
-`napi_enable` atomically clears `NAPI_STATE_SCHED` and `NAPI_STATE_NPSVC`. After this:
-- `NAPI_STATE_SCHED` is clear → `napi_schedule_prep` can now set it atomically and return true
-- `NAPI_STATE_NPSVC` is clear → the NAPI is fully serviceable
+- `NAPI_STATE_SCHED` — set artificially at init to mean "disabled"; clearing it makes the NAPI schedulable
+- `NAPI_STATE_NPSVC` — marks the disabled/in-service state; clearing it signals the NAPI is operational
 
-From this point on, calling `napi_schedule(&peer->napi)` will actually schedule the GRO poll for this peer.
+**Why the gate exists:** the peer struct might not be fully initialized when `netif_napi_add` registers the NAPI with the device. `napi_enable` at `peer.c:58` says "setup is complete, safe to schedule."
+
+**`napi_disable` — the symmetric counterpart:** sets `NAPI_STATE_SCHED` back and busy-waits until any currently running poll (`wg_packet_rx_poll`) finishes. Unlike `napi_enable`, it can sleep. Used during peer teardown (`peer.c:120`) to guarantee no poll is in flight before freeing the peer's memory.
+
+**WireGuard sequence at peer creation (`wg_peer_create`):**
+1. `netif_napi_add` — registers `wg_packet_rx_poll`, initializes GRO state, sets SCHED+NPSVC (disabled)
+2. `napi_enable` — clears SCHED+NPSVC; from this point any decrypt worker can call `napi_schedule` and schedule a real poll
 
 #### How `napi_schedule` prevents double-scheduling — `napi_schedule_prep`
 
@@ -520,133 +522,9 @@ The comment at peer.c:108–118 explains: each packet reference has exactly two 
 
 ---
 
-## Part 2 — io-wq internals
+## Part 2 — Key findings for the May 19 meeting
 
-### Files read
-- `io_uring/io-wq.c` (1523 lines)
-- `io_uring/io-wq.h`
-
-### 2.1 io-wq worker architecture — NOT the kernel workqueue subsystem
-
-**This is the critical finding for the proxy argument.**
-
-io-wq workers are **kthreads** (kernel threads created via `create_io_thread`), not workqueue workers dispatched via `queue_work_on`.
-
-**File:** `io-wq.c:892–926` — `create_io_worker()`
-
-```c
-tsk = create_io_thread(io_wq_worker, worker, NUMA_NO_NODE);
-```
-
-`create_io_thread` spawns a kernel thread running `io_wq_worker`. This is the same mechanism as kthreads — not the `alloc_workqueue` / `queue_work_on` path.
-
-The actual worker function is `io_wq_worker` (a kthread function). It pulls work from an internal queue using raw spinlocks (`raw_spin_lock`), not via the kernel workqueue dispatcher.
-
-### 2.2 What `work_struct` is used for in io-wq
-
-`work_struct` appears in io-wq only for **worker creation retry**, not for dispatching I/O work:
-
-**File:** `io-wq.c:924`
-```c
-INIT_DELAYED_WORK(&worker->work, io_workqueue_create);
-```
-
-This is a fallback: when a new kthread cannot be created immediately (e.g., in a context where `create_io_thread` can't be called), io-wq schedules `io_workqueue_create` on the system workqueue. That function then calls `create_io_thread` again.
-
-The primary path for worker creation is `task_work_add()` (`io-wq.c:411`), which attaches work to the io_uring task's task_work list — again, not `queue_work_on`.
-
-**Summary: `queue_work_on` does not appear in io-wq.c at all.** The `work_struct` / `queue_work_on` kernel workqueue API is not part of io-wq's I/O dispatch path.
-
-### 2.3 How io-wq dispatches work — the actual path
-
-```
-io_wq_enqueue(wq, work)          io-wq.c (public API)
-  └─ io_wq_insert_work()         adds work to per-acct list (raw_spin_lock)
-  └─ io_wq_activate_free_worker() wakes an idle kthread worker
-       └─ wake_up_process()      standard kthread wake
-  └─ io_wq_create_worker()       if no free worker, creates a new kthread
-```
-
-Workers are plain kthreads in a pool, woken via `wake_up_process()`. No `queue_work_on` involved.
-
-### 2.4 Bounded vs unbounded workers in io-wq
-
-**File:** `io-wq.h`
-
-```c
-IO_WQ_WORK_UNBOUND = 4,   // flag on a work item
-```
-
-io-wq has two accounting slots per pool: bounded (for block/file I/O) and unbounded (for socket I/O and char devices). The distinction controls the max worker count cap, not the dispatch mechanism — both types are kthreads.
-
-Socket reads with `IOSQE_ASYNC` → unbounded kthread pool.
-
----
-
-## Part 3 — wireguard-go pipeline
-
-### Files read
-- `wireguard-go/device/receive.go` (536 lines)
-- `wireguard-go/device/device.go` (worker pool setup)
-- `wireguard-go/device/queueconstants_default.go`
-
-### 3.1 Three-stage goroutine pipeline
-
-| Stage | Goroutine | File:Line | Equivalent to kernel stage |
-|---|---|---|---|
-| 1 — receive | `RoutineReceiveIncoming` | `receive.go:72` | Stage 1 (de-encapsulation) |
-| 2 — decrypt | `RoutineDecryption` | `receive.go:238` | Stage 2 (decryption workqueue) |
-| 3 — inject | `RoutineSequentialReceiver` | `receive.go:429` | Stage 3 (GRO/NAPI) |
-
-### 3.2 Decryption pool size
-
-**File:** `device.go:311–316`
-
-```go
-cpus := runtime.NumCPU()
-for i := 0; i < cpus; i++ {
-    go device.RoutineEncryption(i + 1)
-    go device.RoutineDecryption(i + 1)
-    go device.RoutineHandshake(i + 1)
-}
-```
-
-`NumCPU()` decryption goroutines, fixed at startup. Comparable to WireGuard's `WQ_PERCPU` (one worker per CPU).
-
-### 3.3 Coordination between Stage 2 and Stage 3
-
-**File:** `receive.go:179` and `receive.go:265`
-
-```go
-// RoutineReceiveIncoming — Stage 1
-elemsForPeer.Lock()      // locks the container before sending to both channels
-peer.queue.inbound.c <- elemsContainer   // → Stage 3
-device.queue.decryption.c <- elemsContainer  // → Stage 2
-
-// RoutineDecryption — Stage 2
-elemsContainer.Unlock()  // receive.go:265 — signals Stage 3
-
-// RoutineSequentialReceiver — Stage 3
-elemsContainer.Lock()    // receive.go:443 — blocks until Stage 2 unlocks
-```
-
-Stage 3 blocks on the container mutex until Stage 2 (decryption) finishes. **EoI is structurally impossible**: there is no mechanism by which Stage 3 can preempt Stage 2 mid-execution the way a softirq preempts a workqueue worker.
-
-### 3.4 TUN boundary
-
-**File:** `receive.go:524`
-
-```go
-_, err := device.tun.device.Write(bufs, MessageTransportOffsetContent)
-```
-
-One `Write()` syscall per batch (not per packet) crossing back into the kernel. This is the user/kernel boundary cost. Any throughput gap vs kernel WireGuard includes this overhead — so the gap is a **lower bound** on workqueue scheduling cost, not an exact measure.
-
----
-
-## Part 4 — Key findings for the May 19 meeting
-
-### 4.2 The EoI mechanism is confirmed at source level
+### 2.2 The EoI mechanism is confirmed at source level
 
 The complete EoI chain is traceable:
 1. `wg_packet_decrypt_worker` runs in `packet_crypt_wq` (SCHED_NORMAL)
@@ -656,13 +534,7 @@ The complete EoI chain is traceable:
 5. GRO runs at high priority, finds nothing ready, aborts
 6. Pinned core saturates; workers migrate; GRO still targets the old recorded core
 
-### 4.3 wireguard-go confirms EoI is design-level, not just implementation
 
-Go goroutines are user-space scheduled. There is no softirq that can preempt a goroutine mid-execution. The mutex coordination between Stage 2 and Stage 3 ensures ordering without any priority inversion. This is the structural difference.
-
----
-
-## Tracepoints confirmed applicable to WireGuard
 
 | Tracepoint | What it measures | Confirmed applicable |
 |---|---|---|
@@ -676,11 +548,14 @@ Interval between `workqueue_queue_work` and `workqueue_execute_start` = schedule
 
 ---
 
-## Part 5 — WireGuard work items: complete inventory and blocking analysis
+---
+
 
 *Added May 18, 2026. New objective from Alain: identify which work items call blocking functions.*
 
-### 5.1 All WireGuard work items
+## Part 3 — WireGuard work item blocking analysis
+
+### 3.1 All WireGuard work items
 
 | Work item function | Workqueue | Flags | File:Line |
 |---|---|---|---|
@@ -692,7 +567,7 @@ Interval between `workqueue_queue_work` and `workqueue_execute_start` = schedule
 
 How workers are registered: `wg_packet_percpu_multicore_worker_alloc()` in `queueing.c:9` calls `INIT_WORK` for each CPU, binding the worker function to a `multicore_worker` struct. On each enqueue, `queue_work_on(cpu, wq, work)` submits to the specific per-CPU worker.
 
-### 5.2 `wg_packet_decrypt_worker`
+### 3.2 `wg_packet_decrypt_worker`
 
 **File:** `receive.c:493–507` — **Workqueue:** `packet_crypt_wq` (`WQ_CPU_INTENSIVE | WQ_MEM_RECLAIM | WQ_PERCPU`)
 
@@ -732,7 +607,7 @@ No `down_read`, `down_write`, `mutex_lock`, `wait_event`, or `schedule()` anywhe
 
 ---
 
-### 5.3 `wg_packet_encrypt_worker`
+### 3.3 `wg_packet_encrypt_worker`
 
 **File:** `send.c:287–309` — **Workqueue:** `packet_crypt_wq` (`WQ_CPU_INTENSIVE | WQ_MEM_RECLAIM | WQ_PERCPU`)
 
@@ -768,7 +643,7 @@ Identical structure to the decrypt worker. `encrypt_packet` is pure ChaCha20-Pol
 
 ---
 
-### 5.4 `wg_packet_tx_worker`
+### 3.4 `wg_packet_tx_worker`
 
 **File:** `send.c:262–285` — **Workqueue:** `packet_crypt_wq` (`WQ_CPU_INTENSIVE | WQ_MEM_RECLAIM | WQ_PERCPU`)
 
@@ -821,7 +696,7 @@ cond_resched()                    voluntary yield — not a sleep
 
 ---
 
-### 5.5 `wg_packet_handshake_receive_worker` — **BLOCKING CONFIRMED**
+### 3.5 `wg_packet_handshake_receive_worker` — **BLOCKING CONFIRMED**
 
 **File:** `receive.c:206–218` — **Workqueue:** `handshake_receive_wq` (`WQ_CPU_INTENSIVE | WQ_FREEZABLE | WQ_PERCPU`)
 
@@ -875,7 +750,7 @@ ptr_ring_consume_bh()                              spinlock — no sleep
 
 ---
 
-### 5.6 `wg_packet_handshake_send_worker` — **BLOCKING CONFIRMED**
+### 3.6 `wg_packet_handshake_send_worker` — **BLOCKING CONFIRMED**
 
 **File:** `send.c:46–53` — **Workqueue:** `handshake_send_wq` (`WQ_UNBOUND | WQ_FREEZABLE`)
 
@@ -919,7 +794,7 @@ Same blocking primitives as the receive worker. `handshake->lock` serializes all
 
 **Conclusion: BLOCKING.** Same sleeping locks as the receive worker, but lower structural impact due to `WQ_UNBOUND`.
 
-### 5.7 Summary: blocking behavior by work item
+### 3.7 Summary: blocking behavior by work item
 
 | Work item | Blocking calls | Impact |
 |---|---|---|
@@ -929,7 +804,7 @@ Same blocking primitives as the receive worker. `handshake->lock` serializes all
 | `wg_packet_handshake_receive_worker` | `down_read/write` (rwsem), `wait_for_random_bytes` | **Sleeping locks** — thread blocks on lock contention; CRNG wait on startup |
 | `wg_packet_handshake_send_worker` | `down_read/write` (rwsem), `wait_for_random_bytes` | Same — `WQ_UNBOUND` so no CPU pinning, but still blocks |
 
-### 5.7 Interpretation: does this explain the performance problem?
+### 3.7 Interpretation: does this explain the performance problem?
 
 The blocking in handshake workers is real but likely **not the primary cause** of the 19.2% throughput ceiling in the paper's scenario (1,000 clients, sustained data transfer). Handshakes happen only at session establishment, not on every data packet. During a sustained benchmark, handshake rate is low compared to data packet rate.
 
@@ -944,11 +819,11 @@ However, the blocking in handshake workers becomes significant under:
 
 ---
 
-## Part 6 — kernel/workqueue.c: concurrency management and blocking behavior
+## Part 4 — kernel/workqueue.c: concurrency management and blocking behavior
 
 *Added May 19, 2026. Key question: what happens to a `WQ_CPU_INTENSIVE` pool when a thread blocks?*
 
-### 6.1 The `nr_running` counter and concurrency management
+### 4.1 The `nr_running` counter and concurrency management
 
 The workqueue subsystem tracks a per-pool counter `nr_running` (defined at `workqueue.c:211`). This counter controls whether new workers need to be woken up:
 
@@ -967,7 +842,7 @@ static bool keep_working(struct worker_pool *pool)
 
 The concurrency management goal: keep exactly one runnable worker per pool per CPU. If a worker sleeps, `nr_running` drops, and `kick_pool` wakes another idle worker to compensate.
 
-### 6.2 `WORKER_CPU_INTENSIVE` removes workers from `nr_running`
+### 4.2 `WORKER_CPU_INTENSIVE` removes workers from `nr_running`
 
 The flag `WORKER_CPU_INTENSIVE` is part of the `WORKER_NOT_RUNNING` mask (`workqueue.c:97`):
 
@@ -989,7 +864,7 @@ if (unlikely(pwq->wq->flags & WQ_CPU_INTENSIVE))
 
 **In plain terms:** setting `WQ_CPU_INTENSIVE` does not prevent a worker from blocking — it just tells the concurrency manager not to count this worker as "running" for throttling purposes. Another idle worker can be woken up immediately to handle pending items.
 
-### 6.3 What happens when a worker sleeps (`wq_worker_sleeping`)
+### 4.3 What happens when a worker sleeps (`wq_worker_sleeping`)
 
 When any worker goes to sleep (enters `schedule()`), the scheduler calls `wq_worker_sleeping`:
 
@@ -1020,7 +895,7 @@ void wq_worker_running(struct task_struct *task)
 
 Similarly, when the `WQ_CPU_INTENSIVE` worker wakes from a sleeping lock, `wq_worker_running` checks `!(worker->flags & WORKER_NOT_RUNNING)` → condition is false → **no increment**. The worker stays excluded from `nr_running` until the work item completes, at which point `WORKER_CPU_INTENSIVE` is cleared (`workqueue.c:3358`).
 
-### 6.4 `kick_pool`: waking idle workers
+### 4.4 `kick_pool`: waking idle workers
 
 ```c
 /* workqueue.c:1267–1315 */
@@ -1038,11 +913,11 @@ static bool kick_pool(struct worker_pool *pool)
 
 `kick_pool` wakes the most-recently-idle worker if `need_more_worker` is true (worklist not empty AND `nr_running == 0`). This is the mechanism that spawns additional workers when existing ones are blocked.
 
-### 6.5 `WQ_MEM_RECLAIM` and the rescuer thread
+### 4.5 `WQ_MEM_RECLAIM` and the rescuer thread
 
 `WQ_MEM_RECLAIM` (`packet_crypt_wq` has this) guarantees that even under memory pressure, at least one worker will always be available to make progress. It does this by creating a dedicated "rescuer" thread (`workqueue.c:5705–5735`). This is relevant for correctness under memory pressure, not for normal throughput analysis.
 
-### 6.6 `WQ_PERCPU` — what it means for blocked workers
+### 4.6 `WQ_PERCPU` — what it means for blocked workers
 
 `WQ_PERCPU` (not a standard kernel flag — WireGuard defines its own via `alloc_workqueue`) means workers are pinned to specific CPUs via `queue_work_on(cpu, wq, work)`. When a per-CPU `WQ_CPU_INTENSIVE` worker blocks (e.g., on an rwsem in handshake processing):
 
@@ -1055,13 +930,13 @@ static bool kick_pool(struct worker_pool *pool)
 
 **`handshake_send_wq` is different:** it's `WQ_UNBOUND | WQ_FREEZABLE`. Unbound workers float across CPUs and are managed by a global unbound pool. When the handshake send worker sleeps, the pool can wake a worker on any CPU — better resilience, but no NUMA/cache locality guarantees.
 
-### 6.7 Auto-detection: dynamic `WQ_CPU_INTENSIVE` promotion
+### 4.7 Auto-detection: dynamic `WQ_CPU_INTENSIVE` promotion
 
 Beyond the static `WQ_CPU_INTENSIVE` flag, the kernel also auto-promotes concurrency-managed workers dynamically via `wq_worker_tick` (`workqueue.c:1499–1538`): if a concurrency-managed worker hogs the CPU for longer than `wq_cpu_intensive_thresh_us` (default: configured at boot via `/sys/module/workqueue/parameters/cpu_intensive_thresh_us`), it is automatically flagged `WORKER_CPU_INTENSIVE` and kicked out of `nr_running`. This prevents long-running work items from blocking shorter ones on the same CPU.
 
 WireGuard's decrypt/encrypt workers use static `WQ_CPU_INTENSIVE`, not the dynamic mechanism — they declare up front that they won't participate in concurrency management.
 
-### 6.8 Summary: implications for WireGuard handshake blocking
+### 4.8 Summary: implications for WireGuard handshake blocking
 
 | Scenario | What kernel does | Impact |
 |---|---|---|
@@ -1079,9 +954,7 @@ WireGuard's decrypt/encrypt workers use static `WQ_CPU_INTENSIVE`, not the dynam
 
 | Date | Files read | Key finding |
 |---|---|---|
-| 2026-05-15 | `wireguard-go/device/receive.go`, `device.go` | 3-stage goroutine pipeline confirmed; NumCPU decryption workers; EoI impossible by construction |
 | 2026-05-15 | `drivers/net/wireguard/receive.c`, `queueing.h`, `device.c` | EoI chain confirmed at source level; napi_schedule stale pointer at queueing.h:196; packet_crypt_wq is WQ_CPU_INTENSIVE\|WQ_PERCPU not WQ_UNBOUND |
-| 2026-05-15 | `io_uring/io-wq.c`, `io-wq.h` | **Proxy argument is wrong**: io-wq uses kthreads (create_io_thread), not queue_work_on; work_struct only for worker creation retry |
 | 2026-05-18 | `receive.c`, `send.c`, `noise.c`, `queueing.c` | **New objective**: work item inventory + blocking analysis. Decrypt/encrypt workers: non-blocking (pure ChaCha20). Handshake workers: blocking — rwsem (down_read/write) and wait_for_random_bytes |
 | 2026-05-19 | `kernel/workqueue.c` | `WQ_CPU_INTENSIVE` removes worker from `nr_running` at work start (not at sleep). Sleeping `WQ_CPU_INTENSIVE` workers do NOT trigger extra `kick_pool` (already NOT_RUNNING). Per-CPU pool + blocked worker = queue stall on that CPU if no idle worker available. `handshake_receive_wq` (PERCPU) more vulnerable than `handshake_send_wq` (UNBOUND). |
 
