@@ -360,7 +360,36 @@ The packet's initial state is `PACKET_STATE_UNCRYPTED`. The NAPI poll can see it
 
 **File:** `peer.c:21–69`
 
-Every peer gets its own dedicated `napi_struct` at creation time. The three relevant lines in `wg_peer_create`:
+#### When is this called?
+
+`wg_peer_create` is called at **configuration time** — when an administrator adds a peer via `wg set` or `wg-quick up`. This is not in the data path. Each WireGuard peer (each remote endpoint the tunnel communicates with) gets its own `wg_peer` struct, and inside that struct, its own `napi_struct`.
+
+#### What is `napi_struct`?
+
+`napi_struct` is the kernel's representation of one NAPI polling context. From `include/linux/netdevice.h:381`:
+
+```c
+struct napi_struct {
+    unsigned long       state;       // bitfield: SCHED, DISABLE, MISSED, NO_BUSY_POLL, ...
+    struct list_head    poll_list;   // node in a CPU's softnet_data.poll_list
+    int                 weight;      // max packets to process per poll (budget)
+    int                 (*poll)(struct napi_struct *, int);  // the poll function
+    int                 list_owner;  // which CPU currently owns this NAPI (-1 = none)
+    struct net_device  *dev;         // associated network device
+    struct gro_node     gro;         // GRO coalescing state
+    u32                 napi_id;     // unique identifier
+    // ...
+};
+```
+
+The key fields for the EoI analysis:
+- **`poll`** — function pointer set to `wg_packet_rx_poll` at registration. This is what runs when the NAPI fires.
+- **`poll_list`** — the node used to insert this NAPI into a CPU's `softnet_data.poll_list`. When `napi_schedule` is called, it inserts this node into the current CPU's list.
+- **`state`** — a bitfield controlling whether the NAPI can be scheduled, is currently scheduled, is disabled, etc.
+- **`weight`** — the maximum number of packets to process per invocation (`NAPI_POLL_WEIGHT`, typically 64). This is the `budget` parameter passed to `wg_packet_rx_poll`.
+- **`list_owner`** — initialized to -1. Records which CPU currently has this NAPI in its poll list. Important: this is distinct from `this_cpu_ptr` used in `napi_schedule` — the ownership tracking is separate from the binding mechanism.
+
+#### The three setup lines
 
 ```c
 set_bit(NAPI_STATE_NO_BUSY_POLL, &peer->napi.state);      // peer.c:56
@@ -368,22 +397,126 @@ netif_napi_add(wg->dev, &peer->napi, wg_packet_rx_poll);  // peer.c:57
 napi_enable(&peer->napi);                                  // peer.c:58
 ```
 
-**Line 56 — `NAPI_STATE_NO_BUSY_POLL`:** disables busy polling on this NAPI instance. Busy polling is an optimization for hardware NICs where user-space spins on the socket waiting for packets. WireGuard is a virtual tunnel — there is no hardware to poll — so this flag turns off that mechanism.
+**Line 56 — `NAPI_STATE_NO_BUSY_POLL`:**
 
-**Line 57 — `netif_napi_add`:** this is the registration call that connects `peer->napi` to the poll function `wg_packet_rx_poll`. From this moment on, whenever `napi_schedule(&peer->napi)` is called anywhere in the code, the kernel knows to run `wg_packet_rx_poll` for this peer. Each peer has its own independent NAPI instance — there is no sharing between peers.
+This flag is set **before** `netif_napi_add` so that when `netif_napi_add` internally calls `napi_hash_add`, this NAPI is excluded from the busy-poll hash table.
 
-**Line 58 — `napi_enable`:** activates the NAPI instance. Until this is called, `napi_schedule` would be a no-op. After this call, the NAPI is live and can be scheduled.
+Busy polling (`SO_BUSY_POLL` socket option) is an optimization for hardware NICs: instead of waiting for an interrupt, user-space spins on the socket, and the kernel polls the NIC directly in a tight loop. This reduces latency but burns CPU. It only makes sense for real hardware NICs.
 
-**Why this matters for EoI:** the per-peer NAPI design means GRO contention is isolated to individual peers. When a decrypt worker calls `napi_schedule(&peer->napi)`, it only triggers GRO for packets belonging to that one peer. Under the paper's 1,000-client scenario, this means 1,000 independent NAPI instances, each capable of triggering a wasted GRO fire on whichever CPU happens to be running the decrypt worker for that peer at that moment.
+WireGuard is a virtual tunnel — there is no hardware to poll. Setting `NAPI_STATE_NO_BUSY_POLL` tells the kernel: "do not register this NAPI in the busy-poll hash; do not attempt to busy-poll it." Without this flag, a user-space process using `SO_BUSY_POLL` might try to poll WireGuard's NAPI directly, which would be meaningless and wasteful.
 
-**Teardown sequence** (in `peer_remove_after_dead`, peer.c:94):
+**Line 57 — `netif_napi_add`:**
+
+This is the full NAPI registration call. Internally (`net/core/dev.c:7558`):
 
 ```c
-napi_disable(&peer->napi);   // peer.c:120 — prevents any further scheduling
-netif_napi_del(&peer->napi); // peer.c:124 — removes from system, frees resources
+void netif_napi_add_weight_locked(struct net_device *dev,
+                                   struct napi_struct *napi,
+                                   int (*poll)(struct napi_struct *, int),
+                                   int weight)
+{
+    // Guard: set NAPI_STATE_LISTED atomically — prevents double registration
+    if (WARN_ON(test_and_set_bit(NAPI_STATE_LISTED, &napi->state)))
+        return;
+
+    INIT_LIST_HEAD(&napi->poll_list);          // initialize the list node
+    gro_init(&napi->gro);                      // initialize GRO state
+    napi->poll = poll;                         // store wg_packet_rx_poll here
+    napi->weight = weight;                     // NAPI_POLL_WEIGHT (64)
+    napi->dev = dev;                           // link to WireGuard's net_device
+    napi->list_owner = -1;                     // not owned by any CPU yet
+
+    set_bit(NAPI_STATE_SCHED, &napi->state);   // mark as "scheduled" — not yet runnable
+    set_bit(NAPI_STATE_NPSVC, &napi->state);   // mark as "not in service" — blocks scheduling
+
+    netif_napi_dev_list_add(dev, napi);        // add to device's NAPI list
+    // ...
+}
 ```
 
-Also worth noting: `flush_workqueue(peer->device->packet_crypt_wq)` is called **twice** (peer.c:116 and 118). The comment explains this is intentional — each packet reference lives through two workqueue stages (crypto + serial ingestion), so two flushes are needed to guarantee all in-flight references are gone before the peer struct is freed.
+After `netif_napi_add`, the NAPI exists in the system and has its poll function set, but it is **not yet schedulable** — both `NAPI_STATE_SCHED` and `NAPI_STATE_NPSVC` are set, which means `napi_schedule_prep` would return false. The `NAPI_STATE_SCHED` bit being set here is a "pre-armed disabled" state, not an actual schedule.
+
+**Line 58 — `napi_enable`:**
+
+This is what actually activates the NAPI. Internally (`net/core/dev.c:7653`):
+
+```c
+void napi_enable_locked(struct napi_struct *n)
+{
+    // ...
+    do {
+        new = val & ~(NAPIF_STATE_SCHED | NAPIF_STATE_NPSVC);  // clear both bits
+    } while (!try_cmpxchg(&n->state, &val, new));
+}
+```
+
+`napi_enable` atomically clears `NAPI_STATE_SCHED` and `NAPI_STATE_NPSVC`. After this:
+- `NAPI_STATE_SCHED` is clear → `napi_schedule_prep` can now set it atomically and return true
+- `NAPI_STATE_NPSVC` is clear → the NAPI is fully serviceable
+
+From this point on, calling `napi_schedule(&peer->napi)` will actually schedule the GRO poll for this peer.
+
+#### How `napi_schedule` prevents double-scheduling — `napi_schedule_prep`
+
+**File:** `net/core/dev.c:6729`
+
+```c
+bool napi_schedule_prep(struct napi_struct *n)
+{
+    unsigned long new, val = READ_ONCE(n->state);
+    do {
+        if (unlikely(val & NAPIF_STATE_DISABLE))
+            return false;                               // disabled → no-op
+        new = val | NAPIF_STATE_SCHED;
+        // if SCHED was already set, also set MISSED:
+        new |= (val & NAPIF_STATE_SCHED) / NAPIF_STATE_SCHED * NAPIF_STATE_MISSED;
+    } while (!try_cmpxchg(&n->state, &val, new));
+
+    return !(val & NAPIF_STATE_SCHED);  // true only if SCHED was NOT already set
+}
+```
+
+This is an atomic compare-exchange loop. The outcome:
+- If `NAPI_STATE_SCHED` was **not** set → set it atomically, return true → caller proceeds to `__napi_schedule` → NAPI added to CPU's poll_list
+- If `NAPI_STATE_SCHED` was **already** set → set `NAPI_STATE_MISSED` atomically, return false → no-op
+
+`NAPI_STATE_MISSED` means: "another `napi_schedule` arrived while the NAPI was already scheduled." When the current poll completes and `napi_complete_done` runs, it checks `NAPI_STATE_MISSED` — if set, it immediately re-schedules the NAPI for another poll. This ensures no wakeup is lost even when `napi_schedule` is called concurrently from multiple CPUs.
+
+**For the EoI:** once a decrypt worker calls `napi_schedule` and SCHED is set, all subsequent `napi_schedule` calls from any CPU (for the same peer) are no-ops. The NAPI remains bound to the CPU that first called `napi_schedule` until `napi_complete_done` clears SCHED. Under high load, multiple decrypt workers calling `napi_schedule` for the same peer will all see SCHED already set and return false — only one GRO fire happens, but it may be on a different CPU from where most decryption is happening.
+
+#### Why per-peer, not per-device?
+
+WireGuard could have used a single shared NAPI for all peers. It uses per-peer instead for two reasons:
+
+1. **Ordering isolation:** each peer's packet stream must be delivered in order independently. A shared NAPI would need per-peer ordering logic anyway. Per-peer NAPI makes each peer's ordered queue the natural unit of GRO work.
+
+2. **Parallelism:** with per-peer NAPI, different peers' GRO polls can run on different CPUs simultaneously. With a single shared NAPI, all peers would serialize through one poll function.
+
+The cost: with 1,000 peers, there are 1,000 `napi_struct` instances, each capable of independently binding to and saturating a CPU's softnet poll list.
+
+#### Teardown sequence — `peer_remove_after_dead` (peer.c:94)
+
+When a peer is removed, the NAPI must be shut down before the `wg_peer` struct is freed:
+
+```c
+// peer.c:116
+flush_workqueue(peer->device->packet_crypt_wq);   // wait for all encrypt/decrypt workers
+// peer.c:118
+flush_workqueue(peer->device->packet_crypt_wq);   // second flush — see note below
+// peer.c:120
+napi_disable(&peer->napi);    // sets NAPI_STATE_DISABLE; waits for any in-flight poll to finish
+// peer.c:124
+netif_napi_del(&peer->napi);  // removes from device list, clears NAPI_STATE_LISTED
+// peer.c:129
+flush_workqueue(peer->device->handshake_send_wq); // wait for handshake send worker
+```
+
+**Why `flush_workqueue` is called twice:**
+The comment at peer.c:108–118 explains: each packet reference has exactly two workqueue lifetimes — once through the encrypt/decrypt stage (`packet_crypt_wq`), and once through the serial ingestion stage (also `packet_crypt_wq` for the TX worker). One flush drains the first stage; a second flush is needed because items queued by the first stage into the second stage (e.g., the TX worker being woken by the encrypt worker) may not yet have run. Two flushes guarantee both generations are drained.
+
+**`napi_disable`:** sets `NAPI_STATE_DISABLE` so that `napi_schedule_prep` returns false immediately — no new polls can be scheduled. Then it busy-waits until any currently-running poll function (`wg_packet_rx_poll`) finishes. After `napi_disable` returns, it is safe to free `peer->rx_queue` and the `napi_struct` itself.
+
+**`netif_napi_del`:** removes the NAPI from the device's NAPI list and clears `NAPI_STATE_LISTED`, making the registration reversible. After this, the memory for `peer->napi` can be freed along with the rest of the `wg_peer` struct.
 
 ---
 
