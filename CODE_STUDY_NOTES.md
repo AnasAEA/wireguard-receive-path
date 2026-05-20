@@ -356,6 +356,35 @@ This does two things simultaneously:
 
 The packet's initial state is `PACKET_STATE_UNCRYPTED`. The NAPI poll can see it immediately but will stop on it. Only after `decrypt_packet` runs and `atomic_set_release(CRYPTED)` is called does the NAPI poll move past it.
 
+### 1.9 Where `peer->napi` comes from — `wg_peer_create`
+
+**File:** `peer.c:21–69`
+
+Every peer gets its own dedicated `napi_struct` at creation time. The three relevant lines in `wg_peer_create`:
+
+```c
+set_bit(NAPI_STATE_NO_BUSY_POLL, &peer->napi.state);      // peer.c:56
+netif_napi_add(wg->dev, &peer->napi, wg_packet_rx_poll);  // peer.c:57
+napi_enable(&peer->napi);                                  // peer.c:58
+```
+
+**Line 56 — `NAPI_STATE_NO_BUSY_POLL`:** disables busy polling on this NAPI instance. Busy polling is an optimization for hardware NICs where user-space spins on the socket waiting for packets. WireGuard is a virtual tunnel — there is no hardware to poll — so this flag turns off that mechanism.
+
+**Line 57 — `netif_napi_add`:** this is the registration call that connects `peer->napi` to the poll function `wg_packet_rx_poll`. From this moment on, whenever `napi_schedule(&peer->napi)` is called anywhere in the code, the kernel knows to run `wg_packet_rx_poll` for this peer. Each peer has its own independent NAPI instance — there is no sharing between peers.
+
+**Line 58 — `napi_enable`:** activates the NAPI instance. Until this is called, `napi_schedule` would be a no-op. After this call, the NAPI is live and can be scheduled.
+
+**Why this matters for EoI:** the per-peer NAPI design means GRO contention is isolated to individual peers. When a decrypt worker calls `napi_schedule(&peer->napi)`, it only triggers GRO for packets belonging to that one peer. Under the paper's 1,000-client scenario, this means 1,000 independent NAPI instances, each capable of triggering a wasted GRO fire on whichever CPU happens to be running the decrypt worker for that peer at that moment.
+
+**Teardown sequence** (in `peer_remove_after_dead`, peer.c:94):
+
+```c
+napi_disable(&peer->napi);   // peer.c:120 — prevents any further scheduling
+netif_napi_del(&peer->napi); // peer.c:124 — removes from system, frees resources
+```
+
+Also worth noting: `flush_workqueue(peer->device->packet_crypt_wq)` is called **twice** (peer.c:116 and 118). The comment explains this is intentional — each packet reference lives through two workqueue stages (crypto + serial ingestion), so two flushes are needed to guarantee all in-flight references are gone before the peer struct is freed.
+
 ---
 
 ## Part 2 — io-wq internals
@@ -484,22 +513,6 @@ One `Write()` syscall per batch (not per packet) crossing back into the kernel. 
 
 ## Part 4 — Key findings for the May 19 meeting
 
-### 4.1 The proxy argument is inaccurate as stated
-
-The report and presentation claim: *"io-wq uses work_struct/queue_work_on, same as WireGuard's workqueue."*
-
-**This is wrong.** Source-level evidence:
-
-| | WireGuard `packet_crypt_wq` | io-wq |
-|---|---|---|
-| Worker type | Kernel workqueue workers (`alloc_workqueue`) | kthreads (`create_io_thread`) |
-| Dispatch API | `queue_work_on()` | `wake_up_process()` on kthread |
-| Work item type | `work_struct` | `io_wq_work` (internal struct) |
-| CPU affinity | `WQ_PERCPU` (pinned per CPU) | Floating (NUMA-aware) |
-| `work_struct` usage | Core dispatch mechanism | Only for worker *creation* retry |
-
-André was right to flag this.
-
 ### 4.2 The EoI mechanism is confirmed at source level
 
 The complete EoI chain is traceable:
@@ -513,17 +526,6 @@ The complete EoI chain is traceable:
 ### 4.3 wireguard-go confirms EoI is design-level, not just implementation
 
 Go goroutines are user-space scheduled. There is no softirq that can preempt a goroutine mid-execution. The mutex coordination between Stage 2 and Stage 3 ensures ordering without any priority inversion. This is the structural difference.
-
-### 4.4 Open question for the meeting
-
-If io-wq is not the right proxy, what is the plan?
-
-Options:
-1. **Direct WireGuard measurement only** — drop io-wq as proxy, focus on tracing `wg_packet_decrypt_worker` directly with bpftrace tracepoints (`workqueue_execute_start`, `workqueue_queue_work`)
-2. **Rebuild the proxy argument** — io-wq and WireGuard both use bounded kernel thread pools running at SCHED_NORMAL, preemptable by softirqs. The scheduling *behavior* is comparable even if the dispatch mechanism differs. This is a weaker but defensible claim.
-3. **Pivot the objective** — broader study of kernel scheduling priority inversion (EoI is one instance of a general pattern). io-wq could illustrate the pattern without claiming it's identical.
-
-The tracepoints identified (`workqueue_queue_work`, `workqueue_execute_start`, `napi_poll`) apply directly to WireGuard's workqueue and don't require io-wq as an intermediary.
 
 ---
 
@@ -955,5 +957,4 @@ WireGuard's decrypt/encrypt workers use static `WQ_CPU_INTENSIVE`, not the dynam
 ## Still to read
 
 - [x] `kernel/workqueue.c` — `WQ_CPU_INTENSIVE` effect on concurrency limit; what happens to pool when a thread blocks — **Part 6**
-- [ ] `drivers/net/wireguard/peer.c` — per-peer NAPI setup, `netif_napi_add` call
-- [ ] io_uring work items — compare blocking behavior for Thursday meeting
+- [x] `drivers/net/wireguard/peer.c` — per-peer NAPI setup, `netif_napi_add` call — **Part 1.9**
