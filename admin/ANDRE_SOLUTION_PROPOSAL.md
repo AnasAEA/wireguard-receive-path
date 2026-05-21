@@ -79,6 +79,39 @@ diff --git a/drivers/net/wireguard/queueing.h b/drivers/net/wireguard/queueing.h
 
 ---
 
+## Residual limitation — mid-queue gap latency spike
+
+The fix correctly handles the case where GRO partially advances the queue and stops at a gap. Example:
+
+```
+Head: [pkt 0: CRYPTED]   ← GRO delivers
+      [pkt 1: CRYPTED]   ← GRO delivers
+      [pkt 2: UNCRYPTED] ← GRO stops here, work_done = 2
+      [pkt 3: CRYPTED]   ← waiting
+```
+
+GRO delivers packets 0 and 1, stops at packet 2, calls `napi_complete_done` which clears `NAPI_STATE_SCHED`. The new head is packet 2, UNCRYPTED. When CPU 3 finishes packet 3, it checks the head — UNCRYPTED — and correctly skips `napi_schedule`. When CPU 2 finishes packet 2, it checks the head — now CRYPTED — and calls `napi_schedule`. GRO delivers packets 2 and 3. This works correctly.
+
+**However, there is a narrow timing window that introduces a latency spike.**
+
+After GRO delivers packets 0 and 1 and stops at packet 2, there is a small window between:
+- GRO stopping at the UNCRYPTED head (work_done = 2)
+- `napi_complete_done` clearing `NAPI_STATE_SCHED`
+
+If CPU 2 marks packet 2 CRYPTED inside this window:
+1. CPU 2 checks head → CRYPTED → calls `napi_schedule`
+2. `NAPI_STATE_SCHED` is still set — `napi_schedule` is a no-op (returns immediately)
+3. GRO calls `napi_complete_done`, clears the flag
+4. **No one reschedules.** Packets 2 and 3 sit in the queue until the next packet arrives and triggers the condition again.
+
+This is not a correctness problem — packets are eventually delivered. Under 25 Gbps sustained traffic the next packet arrives in nanoseconds, so the gap is practically invisible. But under bursty traffic or at the tail of a burst, it could manifest as a latency spike.
+
+**This is a second-order problem.** The diff eliminates the primary overhead: the wasted GRO storm when the head is blocked. The residual gap case is rare, timing-dependent, and requires a more involved solution — for example, a dedicated GRO work item that re-checks the head after `napi_complete_done` clears the flag. That is out of scope for the current implementation target.
+
+**Honest framing for André:** the diff eliminates the dominant source of wasted GRO invocations. It introduces a narrow residual latency risk at mid-queue gaps. Under sustained high-throughput traffic this risk is negligible. It is a significant improvement, not a complete solution.
+
+---
+
 ## The four cases
 
 | Case | Situation | Decision | Reason |
