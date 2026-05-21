@@ -11,6 +11,26 @@
 
 ---
 
+## Why the problem is worse than it appears — a probabilistic argument
+
+Consider N CPUs decrypting N packets from the same peer in parallel. For GRO to make progress, packet 0 — the specific one assigned to CPU 0 — must finish decryption first, before any other CPU calls `napi_schedule`.
+
+The probability that packet 0 finishes first among N concurrent decryptions is 1/N. With 8 CPUs that is 12.5%. With 16 CPUs it is 6.25%. So on an 8-core machine, **87.5% of `napi_schedule` calls happen when the head is still UNCRYPTED** — each one fires a wasted GRO poll.
+
+Two structural reasons make it even worse than this baseline:
+
+**Reason 1 — the head packet has a systematic disadvantage.**
+
+Packet 0 entered the global `decrypt_queue.ring` first. The ring is FIFO, so CPU 0 pulls it first. But CPU 0 may already be finishing a previous packet from a different peer when packet 0 arrives. CPUs 1, 2, 3 may be idle and grab packets 1, 2, 3 immediately. CPU 0 therefore starts decrypting packet 0 *later* than the others start their packets, even though packet 0 arrived first. The head packet is systematically the last to begin decryption — which makes it the most likely to still be UNCRYPTED when the others finish and call `napi_schedule`.
+
+**Reason 2 — `napi_schedule` fires after every packet, not once per batch.**
+
+Under sustained 25 Gbps traffic with 1,000 clients, there are thousands of decrypt completions per millisecond across all peers. The vast majority of those completions are not at the head of their respective peer queue. Each one fires a `napi_schedule`, raises `NET_RX_SOFTIRQ`, and triggers a poll that finds UNCRYPTED at the head and exits immediately.
+
+The cumulative effect is the 94% CPU saturation the paper measures. The core is not doing useful work — it is alternating between decrypt computation and wasted GRO polls in a tight per-packet cycle.
+
+---
+
 ## What the diff does
 
 After `atomic_set_release` marks the current packet `CRYPTED`, the worker reads `peer->rx_queue.tail` with `READ_ONCE`. This is a single pointer read of a field that is only written by the single consumer (`wg_packet_rx_poll` via `wg_prev_queue_dequeue`). It is safe from worker context as a read-only hint.
