@@ -150,3 +150,120 @@ Deux conséquences immédiates. Première : le GRO ne peut plus préempter le wo
 Le couplage tight entre Stage 2 et Stage 3 est brisé. Le cycle de préemption disparaît. Et le résultat mesuré : 4,7× d'augmentation du débit et 46 % de réduction de la latence de queue. La topologie du pipeline n'a pas changé — les mêmes trois étapes, les mêmes données, le même matériel. Seule la priorité d'exécution du GRO a changé.
 
 ---
+
+## Annexe — Définitions pouvant être demandées
+
+---
+
+### Qu'est-ce que les Bottom Halves (BH) ?
+
+Dans le noyau Linux, le traitement d'une interruption matérielle est divisé en deux parties. La première partie — la "top half" — s'exécute immédiatement lors de l'interruption, avec toutes les interruptions désactivées. Elle doit être aussi courte que possible : elle se contente d'acquitter le matériel et de noter qu'il y a du travail à faire. La seconde partie — la "bottom half" — est le traitement différé : elle s'exécute un peu plus tard, dans un contexte où les interruptions sont ré-activées, ce qui permet au système de rester réactif.
+
+Les softirqs sont l'implémentation la plus basse et la plus rapide des bottom halves. Ils s'exécutent dès que le noyau les autorise — typiquement à la sortie d'une section critique, quand `local_bh_enable()` est appelé, ou au retour d'une interruption matérielle. Ils tournent en dehors du scheduler de processus classique : il n'y a pas de context switch, pas de `task_struct` associé, pas de time slice. Un softirq qui tourne empêche tout autre softirq de s'exécuter sur le même CPU (sauf si le thread ksoftirqd prend le relais), et surtout il préempte n'importe quel thread `SCHED_NORMAL` ou `SCHED_IDLE` sans que ce thread ait son mot à dire.
+
+`spin_lock_bh` et `spin_unlock_bh` sont des spinlocks qui désactivent/réactivent les bottom halves en plus d'acquérir/relâcher le verrou. C'est un pattern très courant pour protéger des structures de données partagées entre un thread normal et un softirq sur le même CPU.
+
+**Ce qui est important pour cette présentation :** `NET_RX_SOFTIRQ` est le softirq dédié à la réception réseau. Quand il est levé via `__raise_softirq_irqoff`, il ne s'exécute pas immédiatement — il attend le prochain `local_bh_enable()`. C'est ce délai d'une itération qui définit le timing précis de l'EoI.
+
+---
+
+### Qu'est-ce que NAPI et comment est-il utilisé ?
+
+NAPI — New API — est le mécanisme de polling réseau du noyau Linux, introduit pour remplacer le modèle purement interruptif qui saturait les CPUs sous forte charge réseau.
+
+**Le problème que NAPI résout :** dans le modèle original, chaque paquet réseau qui arrive déclenche une interruption matérielle. Sous forte charge — par exemple 10 Gbps de trafic réseau entrant — le CPU peut recevoir des millions d'interruptions par seconde, et le traitement des interruptions lui-même devient le goulot d'étranglement. Le CPU passe plus de temps à gérer les interruptions qu'à traiter les paquets.
+
+**La solution NAPI :** au lieu d'interrompre le CPU pour chaque paquet, la carte réseau déclenche une seule interruption pour signaler qu'il y a des paquets à traiter. Le noyau désactive alors les interruptions pour cette carte et passe en mode polling : il interroge activement la carte pour vider la file de paquets reçus, en traitant autant de paquets que possible en un seul appel (`weight` paquets maximum, typiquement 64). Une fois la file vidée ou le budget épuisé, les interruptions sont ré-activées.
+
+**La structure `napi_struct` :** chaque source de paquets qui utilise NAPI possède une instance `napi_struct`. Elle contient principalement : `state` (les bits d'état atomiques — SCHED, NPSVC, MISSED, etc.), `poll` (le pointeur vers la fonction de poll à appeler), `weight` (le budget en nombre de paquets), `poll_list` (le chaînage dans la liste de poll du CPU), et `gro` (l'état du Generic Receive Offload).
+
+**Dans WireGuard :** WireGuard n'utilise pas NAPI pour la raison originelle — il n'y a pas de file DMA à drainer. Il l'utilise comme mécanisme de scheduling pour déclencher `wg_packet_rx_poll`, la fonction qui prend les paquets déchiffrés dans la file ordonnée du pair et les injecte dans la pile réseau. `napi_schedule` est détourné de son usage habituel : au lieu de signaler "la carte réseau a des paquets", il signale "ce pair a des paquets prêts à être injectés dans le stack".
+
+---
+
+### Qu'est-ce que GRO (Generic Receive Offload) ?
+
+GRO est une optimisation du noyau Linux qui fusionne plusieurs paquets TCP/IP de petite taille en un seul paquet plus grand avant de les passer à la couche réseau supérieure. L'idée est de réduire le nombre d'appels aux couches réseau en regroupant les paquets qui appartiennent au même flux.
+
+Sans GRO, chaque paquet de 1500 octets remonte toute la pile TCP/IP individuellement. Avec GRO, le noyau peut fusionner 10 paquets de 1500 octets en un seul paquet virtuel de 15 000 octets avant de le passer à TCP — réduisant le nombre d'appels de 10× et donc le coût CPU par octet transféré.
+
+Dans le contexte WireGuard, GRO s'exécute dans `wg_packet_rx_poll`. Cette fonction prend les paquets déchiffrés depuis la file ordonnée du pair et appelle `napi_gro_receive` pour chacun. C'est `napi_gro_receive` qui tente la fusion avant de livrer à la couche IP.
+
+**Ce qui est important pour cette présentation :** GRO a besoin de paquets dans l'ordre pour fonctionner correctement. Si un paquet manque ou n'est pas encore disponible, GRO ne peut pas fusionner les suivants avec le précédent — il doit attendre. C'est la raison directe pour laquelle `wg_packet_rx_poll` s'arrête à la première tête UNCRYPTED.
+
+---
+
+### Qu'est-ce qu'une Workqueue dans le noyau Linux ?
+
+Une workqueue est un mécanisme du noyau Linux pour exécuter du travail différé dans le contexte d'un thread kernel dédié — appelé "worker thread". Contrairement aux softirqs qui s'exécutent en dehors du scheduler, les workers de workqueue sont des threads normaux avec une `task_struct`, un contexte de scheduling, et la capacité de se bloquer (dormir en attendant un verrou, une ressource, etc.).
+
+**L'API de base :**
+- `INIT_WORK(&work, func)` — associe une fonction à un `work_struct`
+- `queue_work(wq, &work)` — soumet le work item à la workqueue
+- `queue_work_on(cpu, wq, &work)` — soumet sur un CPU spécifique
+- `flush_workqueue(wq)` — attend que tous les work items en cours soient terminés
+
+**Les flags importants dans ce contexte :**
+- `WQ_PERCPU` — un worker thread par CPU, épinglé. Pas de migration, pas de remplacement si bloqué.
+- `WQ_UNBOUND` — workers non épinglés, le scheduler les place sur n'importe quel CPU disponible. Résilient aux blocages car un worker bloqué libère son slot.
+- `WQ_CPU_INTENSIVE` — retire le worker du compteur de concurrence `nr_running` dès le début de l'exécution. Le kernel ne crée pas de workers supplémentaires pour compenser. Approprié pour du calcul CPU pur.
+- `WQ_FREEZABLE` — le worker est gelé lors d'une suspension système (hibernation, suspend-to-RAM).
+- `WQ_MEM_RECLAIM` — garantit qu'un worker peut toujours s'exécuter même sous pression mémoire, via un thread "rescuer" dédié.
+
+**Différence clé avec les softirqs :** un worker de workqueue peut dormir, acquérir des mutex, appeler `kmalloc(GFP_KERNEL)`. Un softirq ne peut rien faire de tout cela — il doit être non-bloquant. C'est pourquoi le déchiffrement ChaCha20-Poly1305 tourne dans une workqueue (il pourrait théoriquement bloquer sur des allocations mémoire) tandis que le dispatch initial des paquets tourne en softirq.
+
+---
+
+### Qu'est-ce que SCHED_NORMAL et la préemption par les softirqs ?
+
+Linux a plusieurs classes de scheduling pour les threads. `SCHED_NORMAL` (aussi appelé `SCHED_OTHER`) est la classe par défaut pour les processus et threads utilisateur, et pour les worker threads des workqueues. Elle utilise le Completely Fair Scheduler (CFS) et donne à chaque thread un quantum de temps proportionnel à sa priorité nice.
+
+Les softirqs ne font pas partie de ce système. Ils s'exécutent dans un contexte qui est en dehors du scheduler CFS — ils ne sont pas des tâches schedulées, ils sont exécutés directement par le CPU quand les conditions le permettent (BH activés, pas de section critique noyau). Ils ont toujours la priorité sur n'importe quel thread `SCHED_NORMAL`, `SCHED_BATCH` ou `SCHED_IDLE`. Seul `SCHED_FIFO` ou `SCHED_RR` avec une priorité temps-réel peut techniquement prendre le dessus, mais WireGuard ne l'utilise pas.
+
+Concrètement : quand `local_bh_enable()` est appelé dans `spin_unlock_bh`, si un softirq est en attente, le CPU l'exécute immédiatement — le thread `SCHED_NORMAL` qui venait d'appeler `spin_unlock_bh` ne reprend la main qu'après que le softirq ait terminé. C'est de la préemption non-coopérative, déclenchée par le mécanisme BH lui-même.
+
+---
+
+### Qu'est-ce que ChaCha20-Poly1305 et pourquoi est-il utilisé dans WireGuard ?
+
+ChaCha20-Poly1305 est un schéma de chiffrement authentifié (AEAD — Authenticated Encryption with Associated Data). Il combine deux primitives cryptographiques : ChaCha20, un chiffrement de flot rapide conçu par Daniel Bernstein, et Poly1305, un code d'authentification de message (MAC) universel.
+
+WireGuard l'utilise à la place d'AES-GCM pour plusieurs raisons. ChaCha20-Poly1305 est rapide sur des processeurs qui n'ont pas d'instructions AES matérielles — comme les anciens processeurs ARM ou les microcontrôleurs embarqués. Il est également résistant aux attaques par canal auxiliaire de timing (timing side-channels) sur ces architectures. Sur les processeurs modernes avec AES-NI (comme les Intel/AMD récents), AES-GCM est plus rapide ; sur ARM sans cryptographic extensions, ChaCha20-Poly1305 est compétitif ou supérieur.
+
+**Ce qui est important pour cette présentation :** ChaCha20-Poly1305 est un calcul CPU pur — pas d'accès disque, pas de réseau, pas de verrous dormants. C'est pourquoi `WQ_CPU_INTENSIVE` est approprié pour les workers de déchiffrement : ils monopolisent volontairement le CPU pour la durée du calcul cryptographique, sans jamais se bloquer. Si l'authentification Poly1305 échoue (tag invalide), le paquet est marqué `PACKET_STATE_DEAD` et silencieusement abandonné — c'est la protection contre les paquets forgés ou corrompus.
+
+---
+
+### Qu'est-ce qu'un spinlock et comment diffère-t-il d'un mutex ?
+
+Un spinlock est un mécanisme de synchronisation qui protège une section critique en faisant attendre le CPU en boucle active ("spinning") jusqu'à ce que le verrou soit disponible. Contrairement à un mutex, le thread qui attend ne se met pas en sommeil — il tourne en boucle, consommant du CPU, jusqu'à ce qu'il obtienne le verrou.
+
+**Quand utiliser un spinlock :** les spinlocks sont utilisés quand la section critique est très courte (quelques instructions) et quand le code ne peut pas dormir — notamment dans les contextes softirq, les handlers d'interruptions, et tout code qui tourne avec les interruptions désactivées. Dans ces contextes, un mutex est interdit parce qu'un mutex peut mettre le thread en sommeil, ce qui est impossible en contexte d'interruption.
+
+**Quand utiliser un mutex :** les mutexes sont utilisés quand la section critique peut être longue ou quand le code peut raisonnablement attendre. Un thread qui attend un mutex est mis en sommeil par le scheduler et ne consomme pas de CPU en attendant. C'est ce qu'on appelle un "sleeping lock".
+
+**Dans WireGuard :** `ptr_ring_consume_bh` utilise un spinlock (`consumer_lock`) parce qu'il tourne dans une workqueue qui partage des données avec le contexte softirq. `handshake->lock` dans `noise.c` est un rwsemaphore — un sleeping lock — parce que les opérations de handshake Noise peuvent être longues (calculs Diffie-Hellman) et ne s'exécutent jamais en contexte interruptif.
+
+---
+
+### Qu'est-ce que le Noise Protocol et pourquoi WireGuard l'utilise-t-il ?
+
+Le Noise Protocol Framework est un framework de protocoles cryptographiques conçu par Trevor Perrin. Il définit une famille de protocoles d'établissement de clés basés sur l'échange Diffie-Hellman, avec différents patterns selon les besoins d'authentification mutuelle.
+
+WireGuard utilise le pattern `Noise_IKpsk2` : un échange en deux messages (initiation + réponse) avec authentification mutuelle par clés statiques et un pre-shared key optionnel. À l'issue de cet échange, les deux parties dérivent un keypair symétrique ChaCha20-Poly1305 partagé sans jamais avoir transmis les clés secrètes sur le réseau.
+
+**Pourquoi Noise plutôt que TLS :** Noise est minimaliste — le handshake WireGuard complet tient en deux messages UDP. TLS 1.3 nécessite plusieurs aller-retours et transporte des certificats X.509. Noise offre des propriétés de sécurité formellement prouvées (forward secrecy, identity hiding, resistance to replay), avec une implémentation beaucoup plus petite et auditables.
+
+**Ce qui est important pour cette présentation :** le handshake Noise dans `noise.c` contient des `down_write(&handshake->lock)` — des rwsemaphores dormants. Ce sont des sleeping locks : si un autre CPU tient le verrou, le thread se met en sommeil et attend. C'est la raison pour laquelle les workers de handshake (`wg_packet_handshake_receive_worker` et `wg_packet_handshake_send_worker`) sont classifiés comme BLOQUANTS dans notre analyse.
+
+---
+
+### Qu'est-ce que le GFP_ATOMIC et pourquoi est-il utilisé dans les contextes non-bloquants ?
+
+`GFP_ATOMIC` est un flag d'allocation mémoire dans le noyau Linux qui indique au système d'allocation qu'il ne peut pas dormir pour attendre que de la mémoire soit disponible. Si la mémoire n'est pas immédiatement disponible, l'allocation échoue et retourne `NULL` — plutôt que de bloquer jusqu'à ce que de la mémoire soit libérée.
+
+Dans les contextes softirq, les handlers d'interruptions, et tout code qui tourne avec les interruptions ou les BH désactivés, `GFP_KERNEL` (l'allocation standard qui peut dormir) est strictement interdit. `GFP_ATOMIC` est obligatoire dans ces contextes.
+
+Dans `decrypt_packet`, `skb_cow_data` utilise `GFP_ATOMIC` parce que le worker de déchiffrement partage son contexte avec des sections où les BH sont désactivées. Si l'allocation `GFP_ATOMIC` échoue — ce qui est rare mais possible sous pression mémoire extrême — le paquet est marqué DEAD et silencieusement abandonné. C'est un comportement correct : il vaut mieux perdre un paquet que de bloquer ou crasher le système.
+
+---
