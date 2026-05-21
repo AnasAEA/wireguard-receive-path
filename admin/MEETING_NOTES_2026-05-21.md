@@ -95,11 +95,11 @@ Replace `napi_schedule(&peer->napi)` with `queue_work_on(cpu, gro_wq, &peer->rx_
 
 The ordering constraint in `wg_packet_rx_poll` (`receive.c:451`) is unchanged: GRO still walks from the queue head and stops at the first UNCRYPTED packet. Moving GRO to a workqueue changes *when* and *at what priority* GRO runs — but it does not change *what GRO finds when it runs*.
 
-Under concurrent decryption, the head is still frequently UNCRYPTED when GRO executes. The difference is:
-- **Before the fix:** GRO preempts the decrypt worker at high priority (softirq), wasting CPU immediately
-- **After the fix:** GRO runs at `SCHED_NORMAL`, so the decrypt worker can finish its packet before GRO gets a time slice — reducing the *frequency* of wasted GRO calls, but not eliminating them
+**Important correction on the preemption framing:** it is not accurate to say GRO preempts decryption mid-work. Decryption of a packet always completes fully before GRO can run. The real problem is different: WireGuard schedules GRO after *every single packet decryption*, regardless of whether the packets needed for in-order assembly are actually ready. This is the fundamental design question — why trigger GRO after every packet? Why not wait until all packets from that peer's current batch are decrypted, or at minimum check that the head is ready before triggering at all?
 
-The throughput gain (4.7×) is real but comes from removing the high-priority preemption overhead, not from fixing the logical ordering problem. This also explains why the paper does not analyze latency results from their fix — likely because latency did not improve as expected (GRO still fires without guaranteeing readiness, but now at lower frequency).
+Under concurrent decryption, the per-peer RX queue frequently has a gap — the head is UNCRYPTED while packets further back are CRYPTED. GRO is invoked by the worker that just finished packet N, but packet N may not be at the head. GRO walks from the head, hits the UNCRYPTED gap, and exits with nothing done. The CPU cycle is wasted — not because decryption was interrupted, but because GRO was invoked unconditionally when it had no chance of making progress.
+
+The paper's fix changes the scheduling mechanism but not the trigger logic: GRO is still scheduled after every packet, it just runs at `SCHED_NORMAL` instead of as a high-priority softirq. This reduces *overhead per wasted call* but does not reduce the *number of wasted calls*. The throughput gain (4.7×) likely comes from eliminating the softirq preemption cost, not from fixing the logical ordering problem. This also explains why the paper does not analyze latency impact from their fix — it is possible latency did not improve meaningfully.
 
 **We do not know which workqueue the paper used for GRO** — the paper does not provide implementation code. The three existing workqueues in `device.c` are `packet_crypt_wq`, `handshake_receive_wq`, and `handshake_send_wq`. The paper likely added a fourth dedicated one. This needs to be reproduced experimentally.
 
@@ -107,27 +107,37 @@ The throughput gain (4.7×) is real but comes from removing the high-priority pr
 
 ## André's proposed solution (preliminary implementation target)
 
-**Idea:** add a conditional check inside the GRO trigger — before calling `napi_schedule`, verify that the head of the peer's RX queue is CRYPTED (i.e., assembly is possible). If the head is still UNCRYPTED, do not schedule GRO at all.
-
-**In the decrypt worker loop, the logic would be:**
-
-```
-After decrypting packet N and marking it CRYPTED:
-  → peek at the head of peer->rx_queue
-  → if head is CRYPTED: schedule GRO (it will find work to do)
-  → if head is UNCRYPTED: do NOT schedule GRO (it would waste a cycle)
-```
-
-**Why this makes sense:** the only case where GRO can make progress is when the head of the ordered queue is CRYPTED. Calling GRO in any other state is guaranteed to be a wasted cycle. This check costs almost nothing (an atomic read of the head's state) and eliminates all structurally wasted GRO invocations.
+**High-level idea:** instead of triggering GRO unconditionally after every decrypted packet, add a conditional check — only schedule GRO when it has a real chance of making progress. This eliminates structurally wasted GRO invocations.
 
 **From the meeting transcript (André):**
 > "Dans le work de décrypt, avant de déclencher le processus, il faut vérifier si le paquet a déjà été décrypté. Si ce n'est pas le cas, on lance le traitement. Ainsi, le dernier paquet décrypté de la série déclenche l'action suivante."
 
-Translation: in the decrypt work item, before triggering GRO, check whether the preceding packet has already been decrypted. If not, skip GRO. The last packet decrypted in a series (the one that makes the head ready) is the one that triggers GRO.
+Translation: in the decrypt work item, before triggering GRO, check whether the preceding packet has already been decrypted. If not, skip. The last packet decrypted in a sequence (the one that completes a contiguous run from the head) is the one that should trigger GRO.
 
-**Also mentioned:** it may be possible to assign a higher priority to the GRO work item than the decrypt worker, which combined with the conditional check could further improve scheduling behavior.
+**Open questions about the exact condition — not yet resolved:**
 
-**Implementation location:** `queueing.h` — `wg_queue_enqueue_per_peer_rx`, specifically between `atomic_set_release` (line 195) and `napi_schedule` (line 196). Or alternatively inside `wg_packet_rx_poll` if the check needs access to the full queue state.
+1. **Checking just the head is not sufficient.** If the head of the per-peer RX queue is CRYPTED, that means GRO can process it. But what about the packet that just got decrypted (packet N) — it may not be at the head. There could be a gap of UNCRYPTED packets between the head and packet N, meaning GRO would process some packets from the head and then stop at the gap, not reaching packet N anyway. Checking only the head tells us GRO can start but not how far it can go.
+
+2. **What does GRO actually do when it runs?** This is still not fully understood at source level. The question is: when `wg_packet_rx_poll` is called, does it walk the entire queue from the head until it hits an UNCRYPTED packet, delivering all CRYPTED packets it encounters along the way? Or does it deliver only specific packets? If it walks and delivers everything up to the first gap, then the correct trigger condition is: "the packet I just decrypted is adjacent to the head, or the head is now CRYPTED and I am the one who made it reachable." This needs to be confirmed in `receive.c:438–490`.
+
+3. **What is the right check exactly?** André's intent from the transcript is: check whether the packet *preceding* packet N in the queue has already been decrypted. If the predecessor is CRYPTED (or N itself is the head), then decrypting N creates a new contiguous run from the head — GRO can now make progress. If the predecessor is still UNCRYPTED, GRO cannot reach packet N anyway, so skip the trigger.
+
+**Rough sketch of the condition (pending source verification):**
+
+```
+After marking packet N as CRYPTED:
+  → check the state of the packet just before N in peer->rx_queue
+  → if that predecessor is CRYPTED (or N is the head): schedule GRO
+  → if that predecessor is UNCRYPTED: skip napi_schedule entirely
+```
+
+This is closer to André's intent than a simple head check — it captures the idea that the *last packet in a contiguous run* is the one that should trigger GRO.
+
+**Also mentioned:** it may be possible to give the GRO work item a higher scheduling priority than the decrypt worker. This is a separate orthogonal improvement — once the conditional check avoids unnecessary triggers, priority tuning could further reduce latency for the cases where GRO does run.
+
+**Implementation location:** `queueing.h` — `wg_queue_enqueue_per_peer_rx`, between `atomic_set_release` (line 195) and `napi_schedule` (line 196). Access to the per-peer queue and the predecessor packet's state is available through `peer->rx_queue` and `wg_prev_queue_peek`.
+
+**Prerequisite:** fully understand what `wg_packet_rx_poll` does at source level before finalizing the condition. The trigger logic must match exactly what GRO needs to make progress.
 
 ---
 
