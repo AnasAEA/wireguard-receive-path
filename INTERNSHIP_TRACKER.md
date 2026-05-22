@@ -64,10 +64,10 @@ Agreed with Alain and André in the May 18 meeting. Concrete steps:
 | — | **TWS report** (2 pages incl. refs, Moodle 348) | **April 14** | ✅ Submitted |
 | — | **Intermediate report** (2 pages + refs, Moodle 295) | **April 27** | ✅ Submitted — corrected after André + Alain feedback |
 | — | Source code study (WireGuard + io-wq + wireguard-go) | May 15–18 | ✅ Done — EoI chain confirmed, io-wq architecture, blocking analysis complete |
-| — | **Thursday meeting** — EoI proof + blocking analysis | **May 21, 9h** | 🔴 Immediate — prepare code walk-through |
+| — | **Thursday meeting** — EoI proof + blocking analysis | **May 21, 9h** | ✅ Done — Alain + André convinced, new direction agreed |
 | — | Register for defenses | **May 29** | ⬜ |
-| 2. Measure | Work item call chain analysis; identify blocking; measure impact with bpftrace | May–June | 🟡 In progress — blocking confirmed in handshake workers; data path non-blocking |
-| 3. Compare | io_uring work item analysis (comparison with WireGuard) | June | ⬜ Not started |
+| 2. Measure | Pipeline internals verified; solution designed + diff ready; compile + measure | May–June | 🟡 In progress — diff ready, compile + baseline pending |
+| 3. Solution | Apply André's conditional napi_schedule patch; measure vs baseline + paper fix | June | 🟡 In progress — diff verified, not yet applied to kernel |
 | 4. Document | **Final report** (6 pages, Moodle 295) + defense slides | **June 5 (report), June 8 (slides)** | ⬜ Not started |
 | — | **Defenses** | **June 9–12** (F115 or F117, check ADE) | ⬜ |
 
@@ -635,19 +635,26 @@ Internship-Io-uring/
 14. ✅ 2-minute madness presentation delivered
 15. ✅ Created ALAIN_PRESENTATION_PLAN.md and CODE_STUDY_PLAN.md for full-time phase
 
-### Immediate — before Thursday May 21, 9h
-1. 🔴 **Prepare EoI source walk-through for Alain** — line-by-line chain: `receive.c:493` → `queueing.h:196` → stale CPU pointer → self-reinforcing saturation. Already traced, needs to be presentation-ready.
-2. 🔴 **Read `kernel/workqueue.c`** — understand what happens to a `WQ_CPU_INTENSIVE` pool when a thread blocks (does it spawn a replacement worker?). Key for explaining handshake blocking impact.
-3. 🔴 **Survey io_uring work items** — Alain wants comparison. Check what functions io-wq work items call and whether they block.
+### Completed since May 21
+1. ✅ EoI presentation delivered — Alain + André convinced
+2. ✅ Pipeline internals fully traced: queue structure, CPU distribution, GRO poll behavior (`CODE_STUDY_PART2.md`)
+3. ✅ André's solution designed + diff written + verified (`admin/ANDRE_SOLUTION_PROPOSAL.md`)
+4. ✅ Probabilistic argument added: 87.5% wasted calls on 8 cores
+5. ✅ Residual limitation documented (mid-queue gap timing window)
+6. ✅ Pipeline sketch guide written — 7 diagrams with scenarios (`admin/PIPELINE_SKETCH_GUIDE.md`)
+
+### Today — May 22
+1. 🟡 **Finish pipeline diagrams** — generating from `PIPELINE_SKETCH_GUIDE.md` (in progress)
+2. ⬜ **Apply diff to kernel source** — 6-line change to `queueing.h:188–198`, confirm it compiles
+3. ⬜ **Set up measurement baseline** — iperf3 through WireGuard tunnel, record throughput + latency before patch
 
 ### This week
-4. ⬜ **Contact Brice Ekane / Teo Pisenti** — get WireGuard test environment. Needed for any measurement.
-5. ⬜ Register for defenses (deadline May 29)
+4. ⬜ Register for defenses (deadline May 29)
+5. ⬜ Measure patched vs baseline throughput and latency
+6. ⬜ Attempt to reproduce paper's fix (move napi_schedule → queue_work_on) and measure
 
-### Once test environment is available
-6. ⬜ Run bpftrace on WireGuard: `workqueue_queue_work`, `workqueue_execute_start`, `napi_poll` on `packet_crypt_wq`
-7. ⬜ Measure handshake worker blocking frequency under load (rwsem contention under 1000-client scenario)
-8. ⬜ Write final report (June 5)
+### Report (due June 5, noon)
+7. ⬜ Write final report — problem, source evidence, paper fix analysis, André's fix, measurements
 
 ---
 
@@ -664,4 +671,4 @@ Internship-Io-uring/
 
 ---
 
-*Last Updated: May 11, 2026*
+*Last Updated: May 22, 2026*
