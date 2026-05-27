@@ -1,4 +1,4 @@
-\typeout{TWS / Intermediate Report - M1 MoSIG 2025-2026}
+\typeout{Final Internship Report - M1 MoSIG 2025-2026}
 
 \documentclass{article}
 \usepackage{ijcai26}
@@ -8,11 +8,23 @@
 \usepackage{graphicx}
 \usepackage{amsmath}
 \usepackage{booktabs}
+\usepackage{listings}
+\usepackage{xcolor}
 
+\graphicspath{{../diagrams/}}
 \urlstyle{same}
 
+\lstset{
+  basicstyle=\ttfamily\small,
+  columns=fullflexible,
+  keepspaces=true,
+  frame=single,
+  xleftmargin=1em,
+  xrightmargin=1em,
+}
+
 \title{Workqueue Scheduling Overhead in WireGuard:\\
-Characterizing Execution Order Inversion through io\_uring Kernel Instrumentation}
+Source-Level Analysis and a Targeted Fix for Execution Order Inversion}
 
 \author{
     Anas Ait El Hadj
@@ -29,207 +41,373 @@ Characterizing Execution Order Inversion through io\_uring Kernel Instrumentatio
 
 \fbox{\parbox{0.9\linewidth}{\small I understand what plagiarism entails and I declare
 that this report is my own, original work.\\
-Name, date and signature: AIT EL HADJ ANAS , 27/04/2026 \\[0.3cm]
-\includegraphics[width=0.2\linewidth]{signature.png}\\[0.2cm]
+Name, date and signature: AIT EL HADJ ANAS, 05/06/2026
+% TODO: add \includegraphics[width=0.2\linewidth]{signature.png} once file is placed in report/
 }}
 
+%% ============================================================
 \begin{abstract}
-WireGuard, a VPN implemented directly in the Linux kernel, achieves
-only 4.8~Gbps reception throughput with 1,000 clients on a
-25~Gbps link, which is 19.2\% of available bandwidth. The cause is Execution
-Order Inversion (EoI): a high-priority softirq handler preempts
-WireGuard's decryption workers mid-pipeline, saturating one CPU core
-at 94\% while others remain at 20\%. The specific mechanisms
-converting this priority mismatch into observable overhead (context
-switches, CPU migrations, worker wakeup latency) have not been
-characterized through direct kernel measurement. io\_uring's internal
-worker pool (io-wq) dispatches work through the same
-\texttt{work\_struct}/\texttt{queue\_work\_on} primitives as
-WireGuard's workqueue, making it a controlled proxy for this
-measurement. Kernel experiments confirm that the relevant overhead
-activates on the socket path when \texttt{IOSQE\_ASYNC} forces io-wq
-execution. This internship aims to reproduce, measure, and explain
-that overhead.
+%% ============================================================
+
+WireGuard, a modern VPN integrated into the Linux kernel, achieves only
+19.2\% of available bandwidth under sustained multi-gigabit traffic with
+1,000 concurrent clients. Prior work identified an Execution Order Inversion
+(EoI)---a structural conflict between WireGuard's packet decryption pipeline
+and its packet reassembly scheduling mechanism---and proposed moving packet
+reassembly to a dedicated background thread as a fix, recovering 4.7$\times$
+throughput. Through source-level analysis, we show that this fix reduces the
+cost of each wasted reassembly invocation but does not reduce their number.
+Under concurrent decryption across $N$ CPU cores, the probability that a
+reassembly invocation finds useful work is at most $1/N$: on an 8-core
+machine, 87.5\% of invocations are structurally wasted. We propose a
+six-line conditional check at the scheduling site that eliminates the dominant
+source of wasted invocations, prove its correctness under concurrent access,
+and evaluate it on an ARM platform (Apple M1~Pro).
+
 \end{abstract}
 
 %% ============================================================
 \section{Introduction}
 %% ============================================================
 
-WireGuard~\cite{donenfeld2017} is a VPN tunnel built directly into
-the Linux kernel. On a 25~Gbps link with 1,000 concurrent clients, it
-receives only 4.8~Gbps, which is 19.2\% of available
-bandwidth~\cite{mounah2025}. This is not a hardware limitation, and
-not a misconfiguration. A scheduling priority bug causes a
-high-priority interrupt to fire mid-pipeline, overloading a single
-CPU core while the rest sit idle.
+Virtual Private Networks (VPNs) are essential infrastructure for secure
+communication in enterprise and cloud environments. WireGuard~\cite{donenfeld2017}
+is a modern VPN implementation integrated into the Linux kernel since
+version~5.6 (2020). It is built around simplicity and correctness: a minimal
+codebase, the ChaCha20-Poly1305 authenticated encryption
+algorithm~\cite{rfc8439}, and a cryptographic handshake based on the Noise
+protocol framework~\cite{noise}. Its straightforward design and competitive
+performance have made it the preferred replacement for older VPN solutions
+such as IPsec and OpenVPN.
 
-The pipeline has three stages: de-encapsulation, decryption, and
-packet reassembly. Decryption runs in a \textit{workqueue} (a kernel-managed pool of
-background threads for work that must run outside interrupt context)
-at normal scheduler priority. Packet reassembly runs as a
-\textit{softirq}, a high-priority interrupt handler that can preempt
-any normal-priority code at any time. A
-single instruction in the decryption path re-enables softirq
-processing mid-pipeline, so reassembly fires before decryption
-finishes. \shortcite{mounah2025} call this Execution Order Inversion
-(EoI). Moving reassembly to a workqueue eliminates the inversion and
-recovers 4.7$\times$ throughput.
+At multi-gigabit throughput, however, WireGuard exhibits unexpected
+performance degradation on multi-core systems.
+\citeauthor{mounah2025}~\cite{mounah2025} measured a throughput collapse to
+approximately 19.2\% of line rate and 94\% CPU utilization under sustained
+25~Gbps traffic with 1,000 concurrent clients. The authors identified the
+source of this degradation as an interaction between WireGuard's concurrent
+packet decryption pipeline and the Linux kernel's Generic Receive Offload
+(GRO) scheduling mechanism---a phenomenon they term an Execution Order
+Inversion (EoI). Their proposed fix, which moves GRO execution from a
+high-priority software interrupt context to a dedicated background thread
+running at normal scheduling priority, yields a 4.7$\times$ throughput
+improvement~\cite{mounah2025}.
 
-This result shows the fix works. It does not explain why the overhead
-is so severe. The mechanisms behind this severity remain unmeasured.
+Despite this result, the fix is incomplete. Moving GRO to a background thread
+reduces the cost of each scheduling event but does not reduce the number of
+such events. The root cause---WireGuard unconditionally schedules GRO after
+every decrypted packet, regardless of whether the packet queue is in a state
+where GRO can make any progress---is left unaddressed. Under concurrent
+decryption across $N$ CPU cores, the probability that GRO finds useful work
+on any given invocation is at most $1/N$. On an 8-core machine, at least
+87.5\% of GRO invocations are structurally wasted. This is not a scheduling
+priority problem; it is a trigger logic problem.
 
-This internship uses io\_uring~\cite{axboe2019} as a measurement
-proxy. io\_uring's internal worker pool uses the same scheduling
-infrastructure as WireGuard's workqueue; Section~\ref{sec:proxy}
-explains why this makes it a valid proxy for studying the overhead in
-a controlled, single-machine setting. This internship aims to reproduce the 4.8~Gbps degradation, attribute the
-overhead to specific mechanisms, and compare kernel WireGuard against
-its Go counterpart. Even if the fix from \shortcite{mounah2025}
-reproduces the 4.7$\times$ gain, the mechanisms that produced the
-original overhead remain uncharacterized. That gap is what this
-internship addresses.
+This work presents a source-level analysis of WireGuard's receive pipeline
+and a targeted fix for the root cause. The analysis traces the exact sequence
+of events that leads to wasted GRO invocations, identifies the structural
+conditions under which they occur, and provides a probabilistic model
+predicting their frequency as a function of CPU count. The proposed fix adds
+a six-line conditional check at the GRO scheduling site: GRO is invoked only
+when the head of the per-peer receive queue is ready for processing. We prove
+this check correct under concurrent access and evaluate it experimentally.
+
+\smallskip\noindent This paper addresses the following research questions:
+\begin{description}
+  \item[RQ1.] What is the exact mechanism that causes GRO to be invoked
+    wastefully in WireGuard's receive path?
+  \item[RQ2.] Does the fix by \citeauthor{mounah2025} eliminate the root
+    cause of the overhead, or only reduce its per-invocation cost?
+  \item[RQ3.] Can a conditional check at the scheduling site eliminate the
+    dominant source of wasted invocations without breaking correctness or
+    packet ordering?
+  \item[RQ4.] Does the problem manifest with the same intensity on ARM as
+    on x86-64?
+\end{description}
+
+\smallskip\noindent\textbf{Scope and limitations.} We focus on WireGuard's
+data receive path. The handshake path uses a separate, blocking workqueue and
+is not addressed here. Measurements are conducted on ARM (Apple M1~Pro,
+Fedora Asahi Remix); a cross-architecture comparison on x86-64 or RISC-V via
+QEMU is left as future work.
+
+\smallskip\noindent\textbf{Outline.} Section~\ref{sec:background} provides
+background on WireGuard's pipeline and the relevant kernel mechanisms.
+Section~\ref{sec:sota} reviews prior work.
+Section~\ref{sec:rootcause} presents the root cause analysis.
+Section~\ref{sec:fix} describes the proposed fix and its correctness argument.
+Section~\ref{sec:eval} presents the experimental evaluation.
+Section~\ref{sec:conclusion} concludes.
 
 %% ============================================================
 \section{Background}
+\label{sec:background}
 %% ============================================================
 
-\subsection{WireGuard's Reception Pipeline}
+\subsection{WireGuard's Receive Pipeline}
 
-WireGuard receives encrypted packets through three ordered stages.
-Stage~1 (de-encapsulation) runs in the kernel's UDP receive handler.
-Stage~2 (decryption) runs in a workqueue at normal scheduler
-priority. Stage~3 (Generic Receive Offload, GRO) reassembles
-decrypted fragments and runs as a softirq.
+WireGuard's receive path consists of three ordered stages. Stage~1 runs
+inside the kernel's UDP receive handler, which executes in \emph{bottom-half}
+(BH) context---a deferred, high-priority execution mode triggered by hardware
+interrupts. It de-encapsulates incoming UDP datagrams and dispatches them for
+decryption. Stage~2 performs ChaCha20-Poly1305 decryption inside a
+\emph{workqueue}: a kernel-managed pool of background threads that run at
+normal scheduler priority. Stage~3 reassembles decrypted packets and hands
+them to the network stack via the Generic Receive Offload (GRO) mechanism,
+which executes as a \emph{softirq} (a high-priority deferred interrupt
+handler).
 
-The trigger for EoI is \texttt{spin\_unlock\_bh} in the decryption
-path. \texttt{spin\_unlock\_bh} is a compound operation: it releases
-the spinlock and explicitly re-enables bottom-half\footnote{``Bottom
-half'' is the historical kernel name for deferred interrupt work,
-including softirqs.} processing on the local CPU, so any pending
-softirq, including GRO, fires immediately at the unlock site. GRO finds no decrypted
-packets ready and aborts.
+Packets flow through two structurally independent queues. The \emph{global
+device ring} (\texttt{ptr\_ring}) holds packets from all peers mixed together;
+it determines which CPU core decrypts each packet, assigned by approximate
+round-robin across online cores. The \emph{per-peer RX queue}
+(\texttt{prev\_queue}) holds packets from a single peer in strict arrival
+order; it determines the order in which packets are delivered to the network
+stack. These two roles are separated by design: delivery order is established
+when a packet is inserted into the per-peer queue (Phase~1, state set to
+\textsc{uncrypted}), before it is dispatched to any CPU (Phase~2). A worker
+atomically upgrades the state to \textsc{crypted} or \textsc{dead} upon
+completing decryption.
 
-A kernel scheduling function (\texttt{napi\_schedule()}) records the
-CPU last used by a decryption worker and pins GRO to that core. The
-pin is a stale pointer, not a live load query: as the pinned core
-saturates, decryption workers migrate away under scheduler pressure,
-but the next burst still targets the same recorded core. That core
-saturates at 94\%; the others remain at 20\%. The imbalance
-self-reinforces on every packet burst.
+\subsection{NAPI, GRO, and Softirqs}
 
-\shortcite{mounah2025} show that moving GRO to a workqueue eliminates
-EoI, yielding 4.7$\times$ higher throughput and 46\% lower tail
-latency; a fix using dedicated kernel threads (kthreads) achieves
-4$\times$ throughput with 65\% tail latency reduction. Transmission
-is unaffected in both cases.
+The Linux NAPI interface is a polling mechanism for network receive
+processing. Each WireGuard peer has one \texttt{napi\_struct} instance.
+Calling \texttt{napi\_schedule} raises the \texttt{NET\_RX\_SOFTIRQ} software
+interrupt and sets an internal scheduling flag; a second call while the flag
+is set is a no-op. When the softirq fires, WireGuard's poll function
+\texttt{wg\_packet\_rx\_poll} walks the per-peer RX queue from its head,
+delivers all contiguous non-\textsc{uncrypted} packets to the network stack
+via GRO, and stops at the first \textsc{uncrypted} entry. The poll budget is
+64~packets (the kernel default). When the poll completes without exhausting
+the budget, \texttt{napi\_complete\_done} clears the scheduling flag,
+re-arming the NAPI instance for future invocations.
 
-\subsection{Scheduling Priority in the Linux Kernel}
+The softirq fires at the earliest \texttt{spin\_unlock\_bh} call following
+\texttt{napi\_schedule}---in WireGuard's case, at the next iteration of the
+decrypt worker's packet consumption loop.
 
-The root cause of EoI is a structural priority gap in the Linux
-execution model. Linux provides three mechanisms relevant to this
-pipeline. Softirqs are high-priority deferred interrupt handlers that can
-preempt any normal-priority code; under heavy load they are executed
-by dedicated kernel threads (\texttt{ksoftirqd}). Kthreads run at normal scheduler
-priority with one dedicated thread per registered entity. Workqueues
-also run at normal priority but maintain a bounded pool (one worker
-per CPU core), so the thread count does not grow with
-load~\cite{mounah2025}. Any pipeline where a downstream stage runs as
-a softirq and an upstream stage runs in a workqueue is structurally
-vulnerable to EoI.
+\subsection{Linux Workqueues}
 
-\subsection{io\_uring and io-wq as a Measurement Proxy}
-\label{sec:proxy}
-
-Direct instrumentation of WireGuard requires a live multi-machine
-network environment. io\_uring offers a way to study the same
-scheduling infrastructure in a single-machine, controlled setting.
-
-io\_uring, introduced in Linux~5.1~\cite{axboe2019}, provides a
-unified asynchronous I/O interface. Submitted requests follow three
-internal paths. Path~1 completes inline when data is immediately
-available. Path~2 offloads to io-wq, which dispatches work through
-\texttt{work\_struct} items via \texttt{queue\_work\_on}. Path~3
-registers a poll wakeup and waits for the file or socket to become
-ready, without spawning any thread.
-
-The proxy argument rests on Path~2: io-wq uses the exact same kernel
-primitives as WireGuard's workqueue (\texttt{work\_struct},
-\texttt{queue\_work\_on}), so scheduling behavior observable on
-io-wq (worker dispatch latency, CPU migrations, context
-switches) reflects the same mechanisms governing WireGuard's
-decryption workers. Since kernel~5.18
-(\texttt{IORING\_FEAT\_NO\_IOWAIT}), buffered file reads bypass io-wq
-entirely via Path~1. Socket reads default to Path~3; io-wq activates
-only when \texttt{IOSQE\_ASYNC} is set
-explicitly~\cite{cloudflare2022,jasny2025}. The WireGuard-relevant
-overhead therefore lives on the socket path, observable through io-wq
-when \texttt{IOSQE\_ASYNC} forces async execution.
+Workqueues are the kernel's standard mechanism for deferring work to
+normal-priority background threads. WireGuard's decrypt workqueue
+(\texttt{packet\_crypt\_wq}) is created with the \texttt{WQ\_PERCPU} flag,
+which provisions one worker thread per online CPU core. Work items are
+dispatched to a specific core via \texttt{queue\_work\_on(cpu, wq, work)}.
+Workers run at \texttt{SCHED\_NORMAL} (standard Linux scheduling priority)
+and can be preempted by softirqs at any BH re-enable point.
 
 %% ============================================================
-\section{Current Status}
+\section{Related Work}
+\label{sec:sota}
 %% ============================================================
 
-The experimental environment is Fedora Asahi Remix~42 (kernel~6.x,
-Apple M1 Pro), with bpftrace (a kernel tracing framework), perf, and
-strace all confirmed working. Two experiments establish the proxy
-baseline.
+% TODO: write this section
 
-\paragraph{File I/O path.}
-A raw io\_uring file reader (\texttt{cat\_uring}, 372~lines of C, no
-liburing) was built and instrumented with bpftrace. Live tracing
-showed that \texttt{io\_uring\_queue\_async\_work} never fired during
-buffered reads, even with a cold cache, confirming
-\texttt{IORING\_FEAT\_NO\_IOWAIT} on this kernel. File reads block
-inline inside \texttt{io\_uring\_enter()} and never reach io-wq. This
-rules out the file path as a source of workqueue overhead on modern
-kernels. Cold-cache reads still cost 132~$\mu$s against 3.7~$\mu$s
-warm (35.9$\times$), with 4~context switches and 1~CPU migration per
-operation. This is early evidence that scheduling cost is real even at
-small scale.
-
-\paragraph{Socket path.}
-The Cloudflare worker pool experiment~\cite{cloudflare2022} was
-reproduced in Rust (\texttt{udp\_read.rs}). Without
-\texttt{IOSQE\_ASYNC}, zero worker threads spawn across 4,096
-submitted socket reads: io\_uring takes the poll path and io-wq is
-never involved. With the flag, 4,096 workers appear immediately, one
-per in-flight request. This confirms that io-wq overhead is
-observable and controllable on the socket path, and that reproducing
-WireGuard-relevant behavior requires forcing this execution mode.
+% Mounah et al. [2025]: SYSTOR '25
+%   - Diagnosis: EoI between decrypt workqueue and GRO softirq
+%   - Fix 1: move napi_schedule → queue_work_on on dedicated gro_wq (SCHED_NORMAL)
+%   - Fix 2: dedicated kthreads for GRO
+%   - Results: 4.7x throughput (workqueue fix), 4x throughput (kthread fix)
+%             46% tail latency reduction (workqueue), 65% (kthread)
+%   - Limitation: ordering constraint in wg_packet_rx_poll unchanged;
+%     wasted invocation count unchanged; only per-call cost reduced
+%
+% Position of our work:
+%   - Mounah et al. identify the symptom (softirq preemption cost) and fix the scheduling context
+%   - We identify the trigger logic as the root cause and fix it directly
+%   - The two fixes are orthogonal: combining them should yield additional benefit
 
 %% ============================================================
-\section{Plan}
+\section{Root Cause Analysis}
+\label{sec:rootcause}
 %% ============================================================
 
-\paragraph{Phase~1: Reproduce.}
-Set up a WireGuard test environment and reproduce the 4.8~Gbps
-ceiling from \shortcite{mounah2025} with under 10\% run-to-run
-variance. A stable, reproducible baseline is a prerequisite for
-every subsequent measurement: without it, any observed overhead is
-indistinguishable from noise.
+% TODO: write this section using CODE_STUDY_PART2.md as source
 
-\paragraph{Phase~2: Attribute.}
-A stable baseline unlocks the attribution step. bpftrace tracepoints
-(\texttt{workqueue\_queue\_work}, \texttt{workqueue\_execute\_start},
-\texttt{napi\_poll}) will measure scheduling latency between work
-dispatch and execution. The goal is to isolate which mechanisms
-dominate: how much comes from worker wakeup latency, how much from
-cross-CPU migrations, and how much from context switch overhead.
+\subsection{Two Independent Queues}
 
-\paragraph{Phase~3: Compare.}
-Kernel WireGuard will be benchmarked against wireguard-go under the
-same workload. wireguard-go schedules work through Go goroutines
-(lightweight user-space threads) which cannot be preempted by kernel
-softirqs; EoI is structurally impossible. The throughput gap between
-the two quantifies what the workqueue pipeline costs relative to a
-user-space scheduler. If EoI is the dominant cause, the workqueue fix
-from \shortcite{mounah2025} should reproduce the 4.7$\times$ gain.
-Measuring what remains after the fix is the direct contribution of
-this work: the residual kernel scheduling overhead that only direct
-instrumentation can explain. Note that wireguard-go also incurs costs
-from the user-space/kernel-space boundary (TUN device, system calls),
-so any measured gap is a lower bound on workqueue scheduling overhead.
+% Global device ring mixes packets from ALL peers; determines which CPU decrypts each packet
+% Per-peer RX queue maintains strict arrival order; determines delivery order to the network stack
+% The ordering guarantee: packets inserted in arrival order (Phase 1 before Phase 2),
+%   state starts UNCRYPTED, upgraded to CRYPTED or DEAD atomically by the worker
+% wg_packet_rx_poll can only deliver packets in order: it walks from tail (oldest) forward
+%
+% Figure: \ref{fig:queues}
+
+\subsection{Concurrent Decryption}
+
+% wg_cpumask_next_online: approximate round-robin across online CPUs (queueing.h:115-119)
+% Same-peer packets dispatched to different CPUs concurrently -- confirmed at source
+% Example: 4 packets from Peer A → CPU 0, CPU 1, CPU 2, CPU 3 in parallel
+% CPU 2 finishes first → pkt 2 is CRYPTED, pkts 0,1 still UNCRYPTED
+% GRO looks at pkt 0 (head) → UNCRYPTED → returns work_done=0. Pkt 2 is unreachable.
+%
+% Head packet has systematic disadvantage: CPU 0 may be finishing a previous peer's packet
+%   when pkt 0 arrives, so it starts later than CPUs 1,2,3 start their packets.
+%
+% Figure: \ref{fig:concurrent}
+
+\subsection{The Unconditional Trigger}
+
+% wg_queue_enqueue_per_peer_rx (queueing.h:188-198):
+%   atomic_set_release(&PACKET_CB(skb)->state, state);  // mark CRYPTED
+%   napi_schedule(&peer->napi);                         // unconditional
+%
+% napi_schedule raises NET_RX_SOFTIRQ at next spin_unlock_bh in decrypt worker's loop
+% wg_packet_rx_poll (receive.c:451): while loop stops at first UNCRYPTED
+% If head is UNCRYPTED: work_done=0, napi_complete_done clears SCHED flag
+% Worker resumes, processes next packet, calls napi_schedule again -- cycle repeats
+%
+% Figure: \ref{fig:loop}
+
+\subsection{Probabilistic Model}
+
+% For GRO to deliver packet N (at position N in peer->rx_queue):
+%   All packets at positions 0..N must be CRYPTED before GRO runs.
+%   The packet at position 0 must finish first.
+%
+% Assuming uniform decryption times: P(pkt 0 finishes first among N concurrent) = 1/N
+%   N=2: 50% wasted   N=4: 75% wasted   N=8: 87.5% wasted   N=16: 93.75% wasted
+%
+% Two structural amplifiers:
+%   1. Head packet starts later (CPU 0 may be busy) -- makes 1/N an upper bound, not average
+%   2. Trigger fires per-packet, not per-batch -- every completion fires a separate napi_schedule
+%
+% Cumulative effect: the 94% CPU saturation measured by Mounah et al.
+
+%% ============================================================
+\section{Proposed Fix}
+\label{sec:fix}
+%% ============================================================
+
+% TODO: write this section using admin/ANDRE_SOLUTION_PROPOSAL.md as source
+
+\subsection{Condition Design}
+
+% GRO makes progress if and only if: head of peer->rx_queue is NOT UNCRYPTED
+% Simplified trigger condition: skip napi_schedule when head is UNCRYPTED
+%
+% Implementation constraint: cannot call wg_prev_queue_peek from worker context
+%   (single-consumer guarantee -- would corrupt peeked cache)
+% Safe alternative: READ_ONCE(peer->rx_queue.tail)
+%   - tail written only by consumer (wg_prev_queue_dequeue, queueing.c:87,92,101)
+%   - reading from worker context is safe as a hint (no write, no cache corruption)
+%   - STUB sentinel: tail == &peer->rx_queue.empty → schedule conservatively
+
+\subsection{The Diff}
+
+% 6-line change to drivers/net/wireguard/queueing.h:
+%
+% \begin{lstlisting}[language=C, caption={Conditional napi\_schedule (queueing.h)}]
+%  static inline void
+%  wg_queue_enqueue_per_peer_rx(struct sk_buff *skb,
+%                                enum packet_state state)
+%  {
+%      struct wg_peer *peer = wg_peer_get(PACKET_PEER(skb));
+% +    struct sk_buff *tail;
+%
+%      atomic_set_release(&PACKET_CB(skb)->state, state);
+% -    napi_schedule(&peer->napi);
+% +
+% +    tail = READ_ONCE(peer->rx_queue.tail);
+% +    if (tail == (struct sk_buff *)&peer->rx_queue.empty ||
+% +        atomic_read(&PACKET_CB(tail)->state) != PACKET_STATE_UNCRYPTED)
+% +            napi_schedule(&peer->napi);
+% +
+%      wg_peer_put(peer);
+%  }
+% \end{lstlisting}
+
+\subsection{Correctness}
+
+% Four cases after packet N is marked CRYPTED:
+%   Case A: N is head, now CRYPTED → tail state non-UNCRYPTED → schedule. GRO finds work.
+%   Case B: N not head, head already CRYPTED/DEAD → schedule. GRO finds work.
+%   Case C: N not head, head UNCRYPTED → skip. GRO would find nothing.
+%   Case D: N not head, gap before N → skip (subcase of C, head is UNCRYPTED).
+%   STUB:   Queue on sentinel boundary → schedule conservatively.
+%
+% Stale read safety: if worker reads UNCRYPTED when head just became CRYPTED,
+%   it skips napi_schedule. The CPU that flipped the head reads CRYPTED and schedules.
+%   No packet is stranded. Liveness preserved.
+%
+% atomic_read (not atomic_read_acquire): relaxed read correct -- this is a hint, not
+%   a synchronization point. Avoids unnecessary memory barrier.
+%
+% Figure: \ref{fig:fix}
+
+\subsection{Residual Limitation}
+
+% Narrow timing window: GRO delivers pkts 0..1, stops at pkt 2 (UNCRYPTED), work_done=2.
+%   Between GRO stopping and napi_complete_done clearing NAPI_STATE_SCHED:
+%   CPU 2 marks pkt 2 CRYPTED, checks tail → CRYPTED → calls napi_schedule.
+%   NAPI_STATE_SCHED still set → napi_schedule is a no-op.
+%   napi_complete_done clears the flag. No one reschedules.
+%   Pkts 2..N wait until next packet arrives and re-triggers the condition.
+%
+% Not a correctness issue. Under sustained high-throughput traffic, the next packet
+%   arrives in nanoseconds. Under bursty traffic, this may manifest as a rare tail
+%   latency spike.
+
+%% ============================================================
+\section{Evaluation}
+\label{sec:eval}
+%% ============================================================
+
+% TODO: fill with actual results after measurement at bureau
+
+\subsection{Experimental Setup}
+
+% Platform: Apple M1 Pro (ARM), Fedora Asahi Remix 42, kernel X.Y
+% WireGuard: unmodified kernel source (linux-source/), patch applied to queueing.h
+% Measurement tools:
+%   - iperf3: throughput (Gbps), latency histogram
+%   - bpftrace: wasted GRO poll count (work_done=0 on wg_packet_rx_poll return),
+%               napi_schedule call frequency
+%   - mpstat: per-core CPU utilization
+%   - perf stat: context switches, CPU migrations
+%
+% Three configurations:
+%   1. Baseline: unmodified WireGuard (unconditional napi_schedule)
+%   2. André's fix: conditional napi_schedule (this work)
+%   3. Paper's fix: napi_schedule → queue_work_on on dedicated gro_wq (if reproduced)
+
+\subsection{Results}
+
+% TODO: replace with actual table once measurements are done
+%
+% Expected metrics:
+%   - Throughput (Gbps)
+%   - Latency p50 / p99 / p99.9 (ms)
+%   - CPU utilization on saturated core (\%)
+%   - Wasted GRO polls per second
+%   - napi_schedule calls per second
+%
+% Architecture note: measurements on ARM address RQ4.
+%   The paper measured on x86-64; differences in out-of-order execution,
+%   cache hierarchy, and BH scheduling may affect the exact ratio of wasted calls.
+
+%% ============================================================
+\section{Conclusion}
+\label{sec:conclusion}
+%% ============================================================
+
+% TODO: write this section once evaluation results are available
+
+% Summary:
+%   - EoI confirmed at source level through static analysis of WireGuard kernel code
+%   - Root cause: unconditional napi_schedule at queueing.h:196, not softirq priority
+%   - Probabilistic model: 1/N useful GRO invocations under N-way concurrent decryption
+%   - Prior fix (Mounah et al.): reduces per-call cost, count unchanged (orthogonal)
+%   - Proposed fix: conditional check eliminates dominant wasted invocations
+%   - Correctness: proven under stale read and STUB edge cases
+%
+% Future work:
+%   - Combine André's fix with paper's fix (orthogonal, additive benefit expected)
+%   - Cross-architecture comparison: x86-64 and RISC-V (via QEMU)
+%   - Per-batch GRO triggering as a longer-term architectural improvement
+%   - Handshake path analysis (blocking workqueue, separate problem)
 
 %% ============================================================
 \bibliographystyle{named}

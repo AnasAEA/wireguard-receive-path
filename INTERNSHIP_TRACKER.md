@@ -1,5 +1,5 @@
 # Internship Tracker — io_uring / WireGuard Performance Research
-# Inria KrakOS Team (LIG), Grenoble — Last updated: May 22, 2026
+# Inria KrakOS Team (LIG), Grenoble — Last updated: May 27, 2026
 
 ---
 
@@ -35,7 +35,7 @@
 | **May 29** | Register for defenses |
 | **June 5, noon** | Final report (6 pages, Moodle 295) |
 | **June 8** | Defense slides |
-| **June 9–12** | Defenses (F115 or F117, check ADE) |
+| **June 10, 16h–16h30** | Defense — confirmed with André — **salle F117** (Wed–Thu = F117, Fri = F115) |
 | **End of July** | Full solution + deeper analysis (post-defense continuation) |
 
 ---
@@ -51,26 +51,38 @@
 | — | Source code study: WireGuard + io-wq + wireguard-go | May 15–18 | ✅ Done |
 | — | May 21 meeting — EoI proof + blocking analysis | May 21, 9h | ✅ Done — new direction agreed |
 | 2. Design | Pipeline internals verified; André solution diff written + verified | May 22 | ✅ Done |
-| — | Pipeline diagrams (7 figures from sketch guide) | May 22 | 🟡 In progress |
-| 3. Implement | Apply diff to kernel source, compile, test correctness | This week | ⬜ |
-| 4. Measure | Baseline + patched throughput + latency; compare vs paper fix | This week | ⬜ |
-| 5. Report | Final report + defense slides | June 5 / June 8 | ⬜ |
+| — | Pipeline diagrams (all 7 figures generated + approved) | May 23 | ✅ Done |
+| 3. Implement | Apply diff to kernel source, compile, test correctness | Next at bureau | ⬜ |
+| 4. Measure | Baseline + patched throughput + latency; compare vs paper fix | Next at bureau | ⬜ |
+| 5. Report | Final report + defense slides | June 5 / June 8 | 🟡 In progress |
 
 ---
 
-## Current — May 22
+## Current — May 27 (Wednesday, bureau)
 
-### In progress
-- Generating 7 pipeline diagrams from `admin/PIPELINE_SKETCH_GUIDE.md`
+### Done (May 23–26)
+- ✅ All 7 diagrams generated and approved
+- ✅ Report started: Abstract + Introduction + Background written (`report/main.tex`)
+- ✅ Meeting May 26 with André: defense slot confirmed — **June 10, 16h–16h30**
+- ✅ Compilation + test guide written (`admin/COMPILATION_AND_TEST_GUIDE.md`)
+- ✅ Recap email sent to André
 
-### Today's tasks
-1. ⬜ Apply diff to `linux-source/drivers/net/wireguard/queueing.h` — 6-line change, confirm it compiles
-2. ⬜ Set up measurement baseline: iperf3 through WireGuard tunnel, record throughput + p50/p99 latency before patch
+### Today — May 27 (implementation day)
+1. ⬜ Check kernel config: `cat /proc/config.gz | zcat | grep CONFIG_WIREGUARD`
+2. ⬜ Install `kernel-devel-$(uname -r)` if not present
+3. ⬜ Clone Asahi kernel source: `git clone https://github.com/AsahiLinux/linux.git --depth=1 -b asahi`
+4. ⬜ Apply 6-line diff to `drivers/net/wireguard/queueing.h`
+5. ⬜ Build module: `make -j$(nproc) M=drivers/net/wireguard`
+6. ⬜ Load patched module: `sudo modprobe -r wireguard && sudo insmod wireguard.ko`
+7. ⬜ Set up two-namespace WireGuard tunnel
+8. ⬜ Run baseline measurement (unpatched): iperf3 + bpftrace wasted GRO counter
+9. ⬜ Run patched measurement: same setup, swap module
+10. ⬜ Record results in measurement log
 
-### This week
-3. ⬜ Register for defenses (deadline May 29)
-4. ⬜ Measure patched vs baseline — throughput and latency
-5. ⬜ Attempt paper fix reproduction (move `napi_schedule` → `queue_work_on`, dedicated `gro_wq`)
+### Remaining this week (May 28–30)
+- ⬜ Register for defenses — **deadline May 29**
+- ⬜ Write report sections 3–5 (root cause, related work, fix)
+- ⬜ Attempt paper fix reproduction if time allows
 
 ---
 
@@ -124,11 +136,30 @@
 
 ## Progress log
 
+### May 27, 2026 (Wednesday)
+
+- Implementation day: clone Asahi kernel, apply diff, build module, run measurements
+
+### May 26, 2026 (Tuesday)
+
+- Meeting with André (short): confirmed defense slot — **June 10, 16h–16h30**
+- Discussed intermediate report feedback: abstract too low-level, intro needs rewrite, diagrams needed (done), architecture question (ARM vs x86-64 vs RISC-V)
+- André aware of current state: diagrams done, report in progress, diff ready to apply
+
+### May 23, 2026 (Saturday)
+
+- Reviewed and approved all 6 pipeline diagrams — technically accurate across all key scenarios
+- Generated 7th diagram: complete data flow reference with all queues
+- All 7 diagrams complete and approved
+- Updated tracker; writing tasks planned for today
+
 ### May 22, 2026
-- Generating pipeline diagrams
+
+- Generated 6 pipeline diagrams from `admin/PIPELINE_SKETCH_GUIDE.md`
 - Applied all source analysis findings to `CODE_STUDY_PART2.md` and `admin/ANDRE_SOLUTION_PROPOSAL.md`
 
 ### May 21, 2026 — Meeting with Alain + André
+
 - Presented EoI chain — both convinced, direction confirmed promising
 - Key gaps identified: parallelism mechanics, GRO poll behavior, skb granularity
 - Paper's fix analyzed: reduces overhead but doesn't eliminate root cause (ordering constraint unchanged)
@@ -137,30 +168,36 @@
 - See `admin/MEETING_NOTES_2026-05-21.md` for full notes
 
 ### May 18, 2026 — Meeting with Alain + André: objective finalized
+
 - Proxy argument officially retired — io-wq ≠ WireGuard workqueue (source-confirmed)
 - Blocking analysis agreed as new objective
 - Work item inventory complete: decrypt/encrypt non-blocking; handshake workers blocking
 - See `admin/MEETING_NOTES_2026-05-18.md`
 
 ### May 15–18, 2026 — Source code study
+
 - EoI trigger confirmed: `queueing.h:196`, `napi_schedule(&peer->napi)`
 - `packet_crypt_wq` flags: `WQ_CPU_INTENSIVE | WQ_MEM_RECLAIM | WQ_PERCPU`
 - io-wq uses kthreads via `create_io_thread` — not `queue_work_on`
 - wireguard-go EoI impossible by construction (mutex-based ordering, user space)
 
 ### May 11, 2026 — Full-time start
+
 - Bureau 225, Inria. Full-time from May 11 to July 31.
 
 ### April 14–27, 2026 — Reports
+
 - TWS report submitted April 14
 - Intermediate report submitted April 27 after multiple André + Alain revision rounds
 
 ### March 6, 2026 — Live kernel investigation
+
 - Built and ran `cat_uring` (raw io_uring, no liburing)
 - Key finding: `IORING_FEAT_NO_IOWAIT` means io-wq is NOT triggered for buffered reads on kernel 6.x
 - 17 io_uring tracepoints confirmed working; bpftrace, perf, strace all operational
 
 ### January–February 2026 — Setup + reading
+
 - Installed Fedora Asahi Remix on MacBook M1 Pro
 - Read: Lord of the io_uring, Cloudflare worker pool article, Kernel VPN paper (Mounah et al.), DBMS paper
 - Set up GitHub repo, tools (perf, bpftrace, trace-cmd, gcc)
