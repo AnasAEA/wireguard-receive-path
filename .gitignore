@@ -43,3 +43,7 @@ report/*.pdf
 *.csv
 !results/**/*.csv
 !results/**/*.log
+results/
+scripts/keys/*_priv
+linux/
+scripts/keys/multipeer/*_priv
