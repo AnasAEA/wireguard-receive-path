@@ -1,5 +1,5 @@
 # Internship Tracker — io_uring / WireGuard Performance Research
-# Inria KrakOS Team (LIG), Grenoble — Last updated: May 27, 2026
+# Inria KrakOS Team (LIG), Grenoble — Last updated: May 29, 2026
 
 ---
 
@@ -58,31 +58,33 @@
 
 ---
 
-## Current — May 27 (Wednesday, bureau)
+## Current — May 29 (Friday, bureau)
 
-### Done (May 23–26)
+### Done (May 23–28)
 - ✅ All 7 diagrams generated and approved
 - ✅ Report started: Abstract + Introduction + Background written (`report/main.tex`)
 - ✅ Meeting May 26 with André: defense slot confirmed — **June 10, 16h–16h30**
 - ✅ Compilation + test guide written (`admin/COMPILATION_AND_TEST_GUIDE.md`)
-- ✅ Recap email sent to André
+- ✅ **May 28: patched module built + loaded; full measurement campaign run** (1→64 peers, CPU-pinning, ctx-switch/migration probes). See `admin/EXPERIMENTS_2026-05-28.md`.
 
-### Today — May 27 (implementation day)
-1. ⬜ Check kernel config: `cat /proc/config.gz | zcat | grep CONFIG_WIREGUARD`
-2. ⬜ Install `kernel-devel-$(uname -r)` if not present
-3. ⬜ Clone Asahi kernel source: `git clone https://github.com/AsahiLinux/linux.git --depth=1 -b asahi`
-4. ⬜ Apply 6-line diff to `drivers/net/wireguard/queueing.h`
-5. ⬜ Build module: `make -j$(nproc) M=drivers/net/wireguard`
-6. ⬜ Load patched module: `sudo modprobe -r wireguard && sudo insmod wireguard.ko`
-7. ⬜ Set up two-namespace WireGuard tunnel
-8. ⬜ Run baseline measurement (unpatched): iperf3 + bpftrace wasted GRO counter
-9. ⬜ Run patched measurement: same setup, swap module
-10. ⬜ Record results in measurement log
+### First-pass findings (May 28)
+- Patch works as designed: total GRO invocations −14–20% at 8–32 peers; wasted polls −22–24%.
+- Tail latency halved at 64 peers (~82ms → ~43ms). Strongest positive result.
+- Throughput flat — never the bottleneck on M1 loopback; paper's saturation regime unreachable.
+- **Honest weaknesses:** high run-to-run variance (uncontrolled E-cores / governor), only 1–3 runs, a possible −7.7% throughput regression at 48 peers that needs statistics, and proxy metrics instead of direct softirq time.
 
-### Remaining this week (May 28–30)
-- ⬜ Register for defenses — **deadline May 29**
-- ⬜ Write report sections 3–5 (root cause, related work, fix)
-- ⬜ Attempt paper fix reproduction if time allows
+### Today — May 29 (measurement hardening, not new claims)
+Decision (with Claude): no testbed/x86 access this week → go deep locally on 3 levers.
+1. ⬜ **Register for defenses — DEADLINE TODAY**
+2. ⬜ Pull harness upgrade on Fedora (`scripts/tuning.sh`, `measure_multipeer_v2.sh`, `run_repeated.sh`, `analyze_runs.py`)
+3. ⬜ **Variance control:** offline E-cores + performance governor + warm-up omit + 10 runs → `sudo bash scripts/run_repeated.sh 32 10 60`
+4. ⬜ **Direct mechanism metrics:** NET_RX softirq time + work_done histogram (built into v2)
+5. ⬜ **Bottleneck induction:** apply `admin/PATCH_DECRYPT_DELAY.md`, rebuild, sweep delay × fix → `sudo bash scripts/run_delay_sweep.sh 16 30 "0 1"`
+
+### Remaining (May 30 – June 5)
+- ⬜ Write report sections 3–5 (root cause, related work, fix) using hardened results
+- ⬜ Full draft → André by June 1–2
+- ⬜ Submit report — June 5, noon, Moodle 295, as `AitElHadj.pdf`
 
 ---
 
@@ -135,6 +137,19 @@
 ---
 
 ## Progress log
+
+### May 29, 2026 (Friday)
+
+- Reviewed full May 28 campaign. Verdict: mechanism validated, but findings not yet report-grade.
+- Decision: no real-NIC testbed / x86 box this week → harden measurements locally on 3 levers (variance control, direct mechanism metrics, bottleneck induction).
+- Built upgraded harness: `scripts/tuning.sh`, `measure_multipeer_v2.sh`, `run_repeated.sh`, `analyze_runs.py`, `analyze_one.py`, `run_delay_sweep.sh`; bottleneck patch documented in `admin/PATCH_DECRYPT_DELAY.md`.
+
+### May 28, 2026 (Thursday) — measurement campaign
+
+- Built + loaded patched module on Fedora Asahi (kernel `6.19.13-400.asahi.fc44`).
+- Ran 1→64 peer comparisons + CPU-pinning + ctx-switch/migration probes. Full log: `admin/EXPERIMENTS_2026-05-28.md`.
+- Patch suppresses 14–20% of GRO scheduling; tail latency ~halved at 64 peers; throughput flat (no saturation on loopback).
+- Self-corrected the −43.7% migration claim (wg-crypt workers are `WQ_PERCPU`-pinned, migrations are structurally 0).
 
 ### May 27, 2026 (Wednesday)
 
