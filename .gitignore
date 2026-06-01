@@ -13,7 +13,8 @@ io_uring_examples/**/target/
 
 # ── External source trees (checked out locally for study, not our work) ──
 wireguard-go/
-linux-source/
+# linux-source/ IS tracked: it holds the WireGuard module + key kernel files we
+# cite as proof in the analysis docs (small, curated — not a full kernel tree).
 
 # ── macOS junk ──────────────────────────────────────────
 .DS_Store

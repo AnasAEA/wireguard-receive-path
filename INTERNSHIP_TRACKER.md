@@ -33,6 +33,8 @@
 | Date | Deliverable |
 |---|---|
 | **May 29** | Register for defenses |
+| **May 30, 15h** | Visio with Teo (jitsi: `meet.jit.si/reuProjetCryptOnce`) — CloudLab + WireGuard setup (moved from 11h) |
+| **June 1 (Monday)** | Present code changes + M1 results + CloudLab plan to Alain + André |
 | **June 5, noon** | Final report (6 pages, Moodle 295) |
 | **June 8** | Defense slides |
 | **June 10, 16h–16h30** | Defense — confirmed with André — **salle F117** (Wed–Thu = F117, Fri = F115) |
@@ -58,7 +60,7 @@
 
 ---
 
-## Current — May 29 (Friday, bureau)
+## Current — June 1 (Monday, bureau)
 
 ### Done (May 23–28)
 - ✅ All 7 diagrams generated and approved
@@ -73,17 +75,32 @@
 - Throughput flat — never the bottleneck on M1 loopback; paper's saturation regime unreachable.
 - **Honest weaknesses:** high run-to-run variance (uncontrolled E-cores / governor), only 1–3 runs, a possible −7.7% throughput regression at 48 peers that needs statistics, and proxy metrics instead of direct softirq time.
 
-### Today — May 29 (measurement hardening, not new claims)
-Decision (with Claude): no testbed/x86 access this week → go deep locally on 3 levers.
-1. ⬜ **Register for defenses — DEADLINE TODAY**
-2. ⬜ Pull harness upgrade on Fedora (`scripts/tuning.sh`, `measure_multipeer_v2.sh`, `run_repeated.sh`, `analyze_runs.py`)
-3. ⬜ **Variance control:** offline E-cores + performance governor + warm-up omit + 10 runs → `sudo bash scripts/run_repeated.sh 32 10 60`
-4. ⬜ **Direct mechanism metrics:** NET_RX softirq time + work_done histogram (built into v2)
-5. ⬜ **Bottleneck induction:** apply `admin/PATCH_DECRYPT_DELAY.md`, rebuild, sweep delay × fix → `sudo bash scripts/run_delay_sweep.sh 16 30 "0 1"`
+### MAJOR — CloudLab access secured (May 29 meeting with Alain)
 
-### Remaining (May 30 – June 5)
-- ⬜ Write report sections 3–5 (root cause, related work, fix) using hardened results
-- ⬜ Full draft → André by June 1–2
+- Teo has a WireGuard testbed: **reserve 3 real machines on CloudLab**, run real-NIC measurements there.
+- Alain is giving access via **his CloudLab account** (faster than requesting our own).
+- **Visio with Teo tomorrow morning (May 30, time TBC):** how to use CloudLab, set up WireGuard on the machines, run the measurements.
+- **This dissolves the central limitation:** CloudLab = real NICs + many clients → the saturation regime the M1 loopback could never reach. Real throughput numbers become possible.
+- **Strategy shift:** CloudLab is now the main event for throughput. The local M1 work (variance-controlled runs, direct metrics) stays valuable as mechanism evidence; the delay-sweep becomes a *complement/backup*, not the headline.
+
+### Done (May 29–31)
+- ✅ Built v2 harness (variance control, direct metrics, delay-sweep) + runbook.
+- ✅ Visio with Teo (May 30, 15h): CloudLab walkthrough. Recommended node `c220g2`; topology 1 server + 2 clients; `rsync` to copy files; multi-namespace clients (each peer = its own allowed-ips), routing on the target.
+- ✅ Fetched the complete WireGuard module into the repo (`linux-source/`, Asahi) so every claim is backed by an openable line.
+- ✅ **Verified the code transfers to x86/v6.1** (paper's kernel): bug site, fix site, MPSC queue, rx_poll — all byte-identical; only `WQ_PERCPU` flag differs (no behavior change). See `admin/COMPARAISON_CODE_VERSIONS_FR.md` + `reference/wireguard-v6.1-x86/`.
+- ✅ Monday materials written (FR): code walkthrough, presentation, progress report, code-comparison.
+
+### Today — June 1 (Monday)
+1. ⬜ **Register for defenses — overdue, do first**
+2. ⬜ Meeting with Alain + André: present code changes (`admin/PREP_REUNION_ALAIN_CODE_2026-06-01_FR.md`)
+3. ⬜ Get the **CloudLab Project ID** (Alain / Brice / Teo) → finish account, join project
+4. ⬜ Ask: port the paper's fix (dedicated workqueue) for a 3-way comparison on CloudLab?
+5. ⬜ (If time) run the §5 bpftrace context proofs on Fedora so they're shown, not asserted
+
+### Remaining (June 2 – June 5)
+- ⬜ Set up WireGuard on CloudLab (c220g2: 1 server + 2 clients), real-NIC baseline stock vs patched
+- ⬜ Write report sections 3–5 using CloudLab + M1 results
+- ⬜ Full draft → André by June 2–3
 - ⬜ Submit report — June 5, noon, Moodle 295, as `AitElHadj.pdf`
 
 ---
@@ -132,17 +149,29 @@ Decision (with Claude): no testbed/x86 access this week → go deep locally on 3
 | André Freyssinet | Day-to-day supervisor | Andre.Freyssinet@scalagent.com |
 | Alain Tchana | Team lead (KrakOS) | Ensimag / Grenoble INP |
 | Brice Ekane | Team member | Has WireGuard test environment |
-| Teo Pisenti | Team member | Has WireGuard test environment |
+| Teo Pisenti | PhD, Toulouse-INP / IRIT / équipe SEPIA | CloudLab WireGuard testbed — visio May 30 11h (`meet.jit.si/reuProjetCryptOnce`) |
 
 ---
 
 ## Progress log
 
+### June 1, 2026 (Monday)
+
+- Meeting day with Alain + André: present the code changes. Materials ready (FR walkthrough + presentation + report + version comparison).
+- Verified the WireGuard receive path is identical on x86/v6.1 (paper) and ARM/Asahi → analysis + patch transfer. Only `WQ_PERCPU` flag differs (no behavior change).
+- Committed/pushed the workspace (reference sources + all FR docs).
+
+### May 30, 2026 (Saturday)
+
+- Visio with Teo (15h): CloudLab onboarding. Node `c220g2`, topology 1 server + 2 clients, `rsync` for file transfer, multi-namespace clients (each = a peer with its own allowed-ips), routing on the target to dispatch.
+
 ### May 29, 2026 (Friday)
 
 - Reviewed full May 28 campaign. Verdict: mechanism validated, but findings not yet report-grade.
-- Decision: no real-NIC testbed / x86 box this week → harden measurements locally on 3 levers (variance control, direct mechanism metrics, bottleneck induction).
-- Built upgraded harness: `scripts/tuning.sh`, `measure_multipeer_v2.sh`, `run_repeated.sh`, `analyze_runs.py`, `analyze_one.py`, `run_delay_sweep.sh`; bottleneck patch documented in `admin/PATCH_DECRYPT_DELAY.md`.
+- Built upgraded harness for local hardening: `scripts/tuning.sh`, `measure_multipeer_v2.sh`, `run_repeated.sh`, `analyze_runs.py`, `analyze_one.py`, `run_delay_sweep.sh`; bottleneck patch documented in `admin/PATCH_DECRYPT_DELAY.md`.
+- **Meeting with Alain — CloudLab unlocked.** Teo can reserve 3 real machines on CloudLab for real-NIC WireGuard measurements; Alain gives access via his account. Visio with Teo tomorrow morning. This reaches the saturation regime the M1 loopback can't.
+- Alain: present code changes + measurements to him and André **Monday June 1**. Need a presentation + a written report (code changes, M1 results, CloudLab next steps).
+- Strategy: CloudLab becomes the main throughput evidence; M1 work stays as mechanism evidence; delay-sweep becomes a complement.
 
 ### May 28, 2026 (Thursday) — measurement campaign
 
