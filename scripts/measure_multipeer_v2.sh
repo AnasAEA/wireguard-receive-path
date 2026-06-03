@@ -24,7 +24,7 @@ N=${2:-8}
 RESULTS_DIR=${3:?results_dir required}
 DURATION=${4:-60}
 WARMUP=5
-STREAMS=4   # per client; total = N * STREAMS
+STREAMS=${STREAMS:-4}   # per client; total = N * STREAMS. Override via env (run_improved.sh).
 
 mkdir -p "$RESULTS_DIR"
 
@@ -38,6 +38,10 @@ mkdir -p "$RESULTS_DIR"
     echo "total_streams: $((N * STREAMS))"
     echo "duration_s: $DURATION"
     echo "warmup_omit_s: $WARMUP"
+    P_FIX=/sys/module/wireguard/parameters/wg_eoi_fix
+    P_DELAY=/sys/module/wireguard/parameters/wg_decrypt_delay_us
+    echo "wg_eoi_fix: $( [ -r "$P_FIX" ] && cat "$P_FIX" || echo n/a )"
+    echo "wg_decrypt_delay_us: $( [ -r "$P_DELAY" ] && cat "$P_DELAY" || echo n/a )"
     echo "online_cpus: $(grep -c '1' /sys/devices/system/cpu/cpu[0-9]*/online 2>/dev/null || nproc) (approx)"
     echo "nproc_online: $(nproc)"
 } > "$RESULTS_DIR/info.txt"

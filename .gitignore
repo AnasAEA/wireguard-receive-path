@@ -48,3 +48,5 @@ results/
 scripts/keys/*_priv
 linux/
 scripts/keys/multipeer/*_priv
+scripts/__pycache__/
+notes/full_context_prompt.md
