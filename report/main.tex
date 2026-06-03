@@ -393,9 +393,11 @@ sysfs knobs: \texttt{wg\_eoi\_fix} (0\,=\,stock, 1\,=\,fix) and
 patched are compared within the same module instance and tunnel, eliminating
 variance from module reloads.
 
-\textbf{Topology and traffic.} One server namespace and $N$ client namespaces,
-each a separate WireGuard peer with its own key pair. iperf3 drives a fixed
-total of 32 streams split across $N$ peers ($\lfloor 32/N \rfloor$
+\textbf{Topology and traffic.} We use Linux network namespaces (isolated
+virtual network stacks within the same kernel) to simulate $N$ independent
+clients on a single machine: one server namespace and $N$ client namespaces,
+each holding a separate WireGuard peer with its own key pair. iperf3 drives a
+fixed total of 32 streams split across $N$ peers ($\lfloor 32/N \rfloor$
 streams/peer), holding offered load constant across the peer sweep. Each cell
 runs 30~s with a 5~s warm-up omitted.
 
@@ -409,17 +411,20 @@ efficiency cores are taken offline before each run (\emph{ecores mode}).
 
 \subsection{Results: Fixed-Load Peer Sweep}
 
-Table~\ref{tab:gro} shows GRO scheduling metrics at zero artificial delay. The
-fix consistently reduces wasted polls across all peer counts, including at one
-peer ($-$8.8\%), confirming the effect is driven by offered load per queue, not
-solely by peer count. The reduction grows with peers ($-$21.9\% at 8,
-$-$20.7\% at 32), consistent with more concurrent workers creating more EoI
-events.
+Table~\ref{tab:gro} shows GRO scheduling metrics at zero artificial delay.
+The baseline waste of $\approx$25\% at one peer reflects normal NAPI overhead:
+with only one peer's packets in flight, the poll occasionally runs just as the
+queue empties; this is unrelated to the EoI. The fix's effect at one peer
+($-$8.8\%) is modest for this reason. The EoI contribution grows with peer
+count as more concurrent workers increase out-of-order completions, producing
+larger reductions at 8 peers ($-$21.9\%) and 32 peers ($-$20.7\%).
 
 \begin{table}[t]
 \centering
 \caption{GRO scheduling metrics, median per second. 32 streams fixed total,
-E-cores offline, 0\,µs delay. $\Delta$ = patched vs.\ stock.}
+E-cores offline, 0\,µs delay. \emph{waste\%}: fraction of all polls that
+deliver nothing. \emph{batch}: mean packets delivered per useful poll
+(\texttt{work\_done}). $\Delta$ = patched vs.\ stock.}
 \label{tab:gro}
 \small
 \begin{tabular}{rrrrrr}
@@ -459,10 +464,11 @@ full peer range.
 \end{figure}
 
 \textbf{Throughput and latency.} Table~\ref{tab:tput} shows median throughput
-and latency. At $\geq$4 peers the system is pinned at the loopback/ChaCha20
-ceiling ($\approx$11.6~Gbps) under both builds, as expected: the GRO efficiency
-benefit is not visible in Gbps when \texttt{NET\_RX\_SOFTIRQ} does not
-saturate. Tail latency (p99) is marginally worse under the patch at $\geq$8
+and latency. At $\geq$4 peers the system is pinned at $\approx$11.6~Gbps under both
+builds. This ceiling is set by the loopback interface and the M1's ChaCha20
+throughput: the ARM NEON implementation encrypts fast enough that the bottleneck
+is memory bandwidth and packet overhead, not CPU. In this regime GRO efficiency
+gains are not visible in Gbps because \texttt{NET\_RX\_SOFTIRQ} never saturates. Tail latency (p99) is marginally worse under the patch at $\geq$8
 peers (e.g., 17.1$\to$19.5~ms at 8 peers): deferred wake adds a small queuing
 delay under high contention, discussed in Section~\ref{subsec:costwake}.
 
@@ -497,9 +503,13 @@ peers & build & Gbps & p50\,ms & p99\,ms & p99.9\,ms \\
 \subsection{Results: Regime Test (40\,µs Delay, 2-Core Bottleneck)}
 \label{subsec:regime}
 
-To approach the throughput-collapse regime of the paper, we extend per-packet
-decrypt cost to 40~µs via \texttt{wg\_decrypt\_delay\_us} and restrict
-execution to 2~CPU cores (\texttt{bottleneck} mode, 16 peers).
+To approach the throughput-collapse regime of \citeauthor{mounah2025}, we
+need decryption to compete with \texttt{NET\_RX\_SOFTIRQ} for CPU time. We
+induce this by extending per-packet decrypt cost to 40~µs via
+\texttt{wg\_decrypt\_delay\_us} (making workers slower) and restricting
+execution to 2~CPU cores (\texttt{bottleneck} mode), with 16 peers. This forces
+workers and the softirq to share the same two cores, mimicking the resource
+contention on a heavily loaded server.
 
 \begin{table}[t]
 \centering
@@ -530,16 +540,22 @@ which a loopback rig cannot reproduce even with artificial delay.
 \texttt{work\_done = 0} whenever the head is \textsc{uncrypted}, which happens
 systematically with $N > 1$ concurrent workers.
 
-\textbf{RQ2}: The prior fix changes GRO's scheduling context; it does not
-change the trigger. Wasted invocations occur at the same rate under their fix.
+\textbf{RQ2}: The prior fix changes GRO's scheduling context but not the
+trigger in \texttt{wg\_queue\_enqueue\_per\_peer\_rx}. By source inspection,
+the unconditional \texttt{napi\_schedule} call is unchanged in their patch,
+so the empty polls are still scheduled at the same rate; they are just cheaper
+to service.
 
 \textbf{RQ3}: The guard reduces wasted polls by 9--22\% in the peer sweep and
 20\% in the regime test. Batch size increases in both cases, confirming that
 scheduling is deferred to points where delivery is productive.
 
 \textbf{RQ4}: The EoI manifests on ARM with 25--31\% of GRO invocations wasted
-under stock. The patch code is structurally identical between
-\texttt{AsahiLinux/linux}~v6.19 and \texttt{torvalds/linux}~v6.1.
+under stock. We verified that the relevant files (\texttt{queueing.h},
+\texttt{receive.c}) are identical line-for-line between
+\texttt{AsahiLinux/linux}~v6.19 (Asahi) and \texttt{torvalds/linux}~v6.1
+(the version used in \citeauthor{mounah2025}), so the mechanism and the fix
+apply equally to both architectures.
 
 \subsection{The Cost of Each Wake}
 \label{subsec:costwake}
