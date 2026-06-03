@@ -38,8 +38,8 @@ echo "delay_us,fix,tput_gbps,wasted_s,useful_s,total_s,netrx_ms_s,p50_ms,p99_ms,
 
 cleanup() {
     bash "$SCRIPTS/teardown_multipeer.sh" "$N" 2>/dev/null || true
-    [ -w "$PARAM_DELAY" ] && echo 0 | sudo tee "$PARAM_DELAY" >/dev/null 2>&1 || true
-    [ -w "$PARAM_FIX" ] && echo 1 | sudo tee "$PARAM_FIX" >/dev/null 2>&1 || true
+    [ -w "$PARAM_DELAY" ] && echo 0 | tee "$PARAM_DELAY" >/dev/null 2>&1 || true
+    [ -w "$PARAM_FIX" ] && echo 1 | tee "$PARAM_FIX" >/dev/null 2>&1 || true
     tuning_restore
 }
 trap cleanup EXIT
@@ -56,9 +56,9 @@ tuning_leave_only $KEEP_CPUS
 bash "$SCRIPTS/setup_multipeer.sh" "$N"
 
 for d in $DELAYS; do
-    echo "$d" | sudo tee "$PARAM_DELAY" >/dev/null
+    echo "$d" | tee "$PARAM_DELAY" >/dev/null
     for fix in 0 1; do
-        echo "$fix" | sudo tee "$PARAM_FIX" >/dev/null
+        echo "$fix" | tee "$PARAM_FIX" >/dev/null
         echo ""
         echo "==== delay=${d}us  fix=${fix}  (N=$N, keep=[$KEEP_CPUS]) ===="
         sleep 1  # let the knob take effect on in-flight workers

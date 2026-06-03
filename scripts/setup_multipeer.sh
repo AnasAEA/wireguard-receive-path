@@ -34,19 +34,19 @@ for i in $(seq 0 $((N-1))); do
 done
 
 # ── Tear down any leftover state ──────────────────────────────────────────────
-sudo ip netns del ns_mp_server 2>/dev/null || true
+ip netns del ns_mp_server 2>/dev/null || true
 for i in $(seq 0 $((N-1))); do
-    sudo ip netns del ns_mp_client_${i} 2>/dev/null || true
+    ip netns del ns_mp_client_${i} 2>/dev/null || true
 done
 
 # ── Server namespace ──────────────────────────────────────────────────────────
 echo "Creating server namespace..."
-sudo ip netns add ns_mp_server
-sudo ip link add wg_mp_server type wireguard
-sudo ip link set wg_mp_server netns ns_mp_server
+ip netns add ns_mp_server
+ip link add wg_mp_server type wireguard
+ip link set wg_mp_server netns ns_mp_server
 
 # Build wg set command with all N peers
-WG_CMD="sudo ip netns exec ns_mp_server wg set wg_mp_server private-key $KEYS_DIR/server_priv listen-port $SERVER_PORT"
+WG_CMD="ip netns exec ns_mp_server wg set wg_mp_server private-key $KEYS_DIR/server_priv listen-port $SERVER_PORT"
 for i in $(seq 0 $((N-1))); do
     CLIENT_PUB=$(cat "$KEYS_DIR/client_${i}_pub")
     CLIENT_IP="10.99.$((i+1)).1"
@@ -54,8 +54,8 @@ for i in $(seq 0 $((N-1))); do
 done
 eval "$WG_CMD"
 
-sudo ip netns exec ns_mp_server ip addr add 10.99.0.1/16 dev wg_mp_server
-sudo ip netns exec ns_mp_server ip link set wg_mp_server up
+ip netns exec ns_mp_server ip addr add 10.99.0.1/16 dev wg_mp_server
+ip netns exec ns_mp_server ip link set wg_mp_server up
 
 # ── Client namespaces ─────────────────────────────────────────────────────────
 for i in $(seq 0 $((N-1))); do
@@ -64,24 +64,24 @@ for i in $(seq 0 $((N-1))); do
     CLIENT_PORT=$((51831 + i))
 
     echo "Creating client $i ($CLIENT_IP)..."
-    sudo ip netns add ns_mp_client_${i}
-    sudo ip link add wg_mp_client_${i} type wireguard
-    sudo ip link set wg_mp_client_${i} netns ns_mp_client_${i}
+    ip netns add ns_mp_client_${i}
+    ip link add wg_mp_client_${i} type wireguard
+    ip link set wg_mp_client_${i} netns ns_mp_client_${i}
 
-    sudo ip netns exec ns_mp_client_${i} wg set wg_mp_client_${i} \
+    ip netns exec ns_mp_client_${i} wg set wg_mp_client_${i} \
         private-key "$CLIENT_PRIV" \
         listen-port $CLIENT_PORT \
         peer "$SERVER_PUB" \
             allowed-ips 10.99.0.0/16 \
             endpoint 127.0.0.1:$SERVER_PORT
 
-    sudo ip netns exec ns_mp_client_${i} ip addr add ${CLIENT_IP}/16 dev wg_mp_client_${i}
-    sudo ip netns exec ns_mp_client_${i} ip link set wg_mp_client_${i} up
+    ip netns exec ns_mp_client_${i} ip addr add ${CLIENT_IP}/16 dev wg_mp_client_${i}
+    ip netns exec ns_mp_client_${i} ip link set wg_mp_client_${i} up
 done
 
 # ── Connectivity check ────────────────────────────────────────────────────────
 echo "Testing connectivity (client 0 → server)..."
-sudo ip netns exec ns_mp_client_0 ping -c 2 -q 10.99.0.1
+ip netns exec ns_mp_client_0 ping -c 2 -q 10.99.0.1
 
 echo ""
 echo "Multi-peer tunnel up: $N clients → ns_mp_server (10.99.0.1)"

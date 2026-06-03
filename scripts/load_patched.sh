@@ -5,13 +5,13 @@ set -e
 WKO="$(dirname "$0")/../linux/drivers/net/wireguard/wireguard.ko"
 
 if lsmod | grep -q wireguard; then
-    sudo rmmod wireguard
+    rmmod wireguard
 fi
 
 echo "Loading dependency modules..."
-sudo modprobe udp_tunnel ip6_udp_tunnel libcurve25519
+modprobe udp_tunnel ip6_udp_tunnel libcurve25519
 
 echo "Loading patched wireguard.ko..."
-sudo insmod "$WKO"
+insmod "$WKO"
 
 echo "Loaded: $(lsmod | grep wireguard | head -1)"

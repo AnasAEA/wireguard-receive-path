@@ -93,8 +93,8 @@ fi
 cleanup() {
     # Best-effort teardown for whatever peer count was last set up.
     for p in $PEERS; do bash "$SCRIPTS/teardown_multipeer.sh" "$p" 2>/dev/null || true; done
-    [ -w "$PARAM_DELAY" ] && echo 0 | sudo tee "$PARAM_DELAY" >/dev/null 2>&1 || true
-    [ -w "$PARAM_FIX" ]   && echo 1 | sudo tee "$PARAM_FIX"   >/dev/null 2>&1 || true
+    [ -w "$PARAM_DELAY" ] && echo 0 | tee "$PARAM_DELAY" >/dev/null 2>&1 || true
+    [ -w "$PARAM_FIX" ]   && echo 1 | tee "$PARAM_FIX"   >/dev/null 2>&1 || true
     tuning_restore
 }
 trap cleanup EXIT
@@ -107,13 +107,13 @@ else
 fi
 
 # Set the decrypt delay once (constant across the sweep).
-if [ -w "$PARAM_DELAY" ]; then echo "$DELAY_US" | sudo tee "$PARAM_DELAY" >/dev/null; fi
+if [ -w "$PARAM_DELAY" ]; then echo "$DELAY_US" | tee "$PARAM_DELAY" >/dev/null; fi
 
 # fix=0 -> stock behavior, fix=1 -> patched (André's guard).
 set_fix() {
     local fix=$1
     if [ "$USE_TOGGLE" = "1" ]; then
-        echo "$fix" | sudo tee "$PARAM_FIX" >/dev/null
+        echo "$fix" | tee "$PARAM_FIX" >/dev/null
         sleep 1   # let in-flight workers observe the new value
     else
         if [ "$fix" = "0" ]; then bash "$SCRIPTS/load_stock.sh"; else bash "$SCRIPTS/load_patched.sh"; fi

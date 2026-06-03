@@ -50,7 +50,7 @@ mkdir -p "$RESULTS_DIR"
 echo "[1/5] Starting $N iperf3 servers..."
 for i in $(seq 0 $((N-1))); do
     PORT=$((5201 + i))
-    sudo ip netns exec ns_mp_server iperf3 -s -p $PORT --one-off \
+    ip netns exec ns_mp_server iperf3 -s -p $PORT --one-off \
         > "$RESULTS_DIR/iperf3_server_${i}.json" 2>&1 &
 done
 sleep 1
@@ -58,7 +58,7 @@ sleep 1
 # ── Combined bpftrace probe: GRO counts + NET_RX softirq time + batch hist ────
 # vec 3 == NET_RX_SOFTIRQ.
 echo "[2/5] Starting bpftrace (GRO + NET_RX softirq time + batch histogram)..."
-sudo bpftrace -e '
+bpftrace -e '
   kretprobe:wg_packet_rx_poll /retval == 0/ { @wasted += 1; }
   kretprobe:wg_packet_rx_poll /retval > 0/  { @useful += 1; @batch = lhist(retval, 0, 64, 4); }
   tracepoint:irq:softirq_entry /args->vec == 3/ { @s[cpu] = nsecs; }
@@ -82,7 +82,7 @@ echo "[3/5] Launching $N iperf3 clients ($DURATION s, omit ${WARMUP}s)..."
 CLIENT_PIDS=()
 for i in $(seq 0 $((N-1))); do
     PORT=$((5201 + i))
-    sudo ip netns exec ns_mp_client_${i} \
+    ip netns exec ns_mp_client_${i} \
         iperf3 -c 10.99.0.1 -p $PORT -t $DURATION -O $WARMUP -P $STREAMS \
         --json > "$RESULTS_DIR/iperf3_client_${i}.json" 2>&1 &
     CLIENT_PIDS+=($!)
@@ -91,7 +91,7 @@ done
 # ── Latency: 20 Hz ping, non-quiet so per-packet RTTs are kept ────────────────
 echo "[4/5] Starting 20 Hz ping latency probe from ns_mp_client_0..."
 PING_COUNT=$(( (DURATION - WARMUP) * 20 ))
-sudo ip netns exec ns_mp_client_0 \
+ip netns exec ns_mp_client_0 \
     ping -i 0.05 -c "$PING_COUNT" 10.99.0.1 > "$RESULTS_DIR/ping_latency.txt" 2>&1 &
 PING_PID=$!
 
@@ -100,7 +100,7 @@ wait $PING_PID 2>/dev/null || true
 
 echo "[5/5] Stopping bpftrace..."
 grep -E '^\s*NET_RX' /proc/softirqs > "$RESULTS_DIR/softirqs_after.txt" 2>/dev/null || true
-sudo kill "$BPFTRACE_PID" 2>/dev/null || true
+kill "$BPFTRACE_PID" 2>/dev/null || true
 sleep 1
 
 echo "  done -> $RESULTS_DIR"

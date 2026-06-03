@@ -36,14 +36,15 @@ tuning_detect_ecores() {
         cap=$(cat "$c")
         id=$(basename "$(dirname "$c")")
         id=${id#cpu}
-        [ "$cap" -lt "$maxcap" ] && echo "$id"
+        [ "$cap" -lt "$maxcap" ] && echo "$id" || true
     done
+    return 0
 }
 
 _tuning_set_online() {
     local id=$1 val=$2 path="$CPU_BASE/cpu$id/online"
     [ -w "$path" ] || { echo "  cpu$id: online not writable (skipped)"; return 0; }
-    if echo "$val" | sudo tee "$path" >/dev/null 2>&1; then
+    if echo "$val" | tee "$path" >/dev/null 2>&1; then
         echo "  cpu$id -> online=$val"
     else
         echo "  cpu$id: failed to set online=$val (skipped)"
@@ -54,7 +55,7 @@ tuning_set_governor() {
     local gov=${1:-performance} g found=0
     for g in "$CPU_BASE"/cpu[0-9]*/cpufreq/scaling_governor; do
         [ -w "$g" ] || continue
-        echo "$gov" | sudo tee "$g" >/dev/null 2>&1 && found=1
+        if echo "$gov" | tee "$g" >/dev/null 2>&1; then found=1; fi
     done
     if [ "$found" = "1" ]; then
         echo "  governor -> $gov (where available)"
@@ -66,7 +67,7 @@ tuning_set_governor() {
 # Offline the efficiency cores and lock the governor. Records the E-core list
 # in TUNING_ECORES so tuning_restore can bring exactly those back.
 tuning_apply() {
-    TUNING_ECORES=$(tuning_detect_ecores | tr '\n' ' ' | sed 's/ $//')
+    TUNING_ECORES=$(tuning_detect_ecores | tr '\n' ' ' | sed 's/ $//' || true)
     echo "[tuning] applying variance control"
     if [ -n "$TUNING_ECORES" ]; then
         echo "  efficiency cores detected: $TUNING_ECORES"
