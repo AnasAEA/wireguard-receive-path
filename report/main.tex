@@ -201,18 +201,46 @@ run in the softirq directly.
 \label{sec:sota}
 %% ============================================================
 
-\citeauthor{mounah2025}~\cite{mounah2025} first identified the EoI, diagnosing
-it as a priority conflict: the GRO poll runs at high softirq priority and
-repeatedly preempts the workers producing the packets it needs. Their two fixes
-both move GRO out of the softirq: one onto a dedicated workqueue, one into
-kernel threads, recovering 4.7$\times$ throughput and cutting tail latency.
+\textbf{The Execution Order Inversion.}
+\citeauthor{mounah2025}~\cite{mounah2025} first identified and named the EoI in
+WireGuard's receive path. They diagnose it as a priority conflict: the GRO poll
+runs at high softirq priority and preempts the workers that are producing the
+packets it needs. Their fix moves GRO execution to a dedicated workqueue running
+at normal priority, eliminating the preemption and recovering $4.7\times$
+throughput. An alternative variant using dedicated kernel threads achieves a
+similar result with lower tail latency. Both approaches lower the \emph{cost} of
+each empty poll but leave the unconditional trigger unchanged, so empty polls
+continue to fire at the same rate. Our work targets the other half: reducing the
+\emph{count} of empty polls by guarding the trigger. The two fixes are
+orthogonal and can be combined.
 
-These fixes lower the \emph{cost} of each poll but not their \emph{count}. The
-unconditional trigger in \texttt{wg\_queue\_enqueue\_per\_peer\_rx} is
-unchanged, so polls still fire after every completion whether or not the head is
-ready. Our work addresses the other side: checking head readiness before
-scheduling eliminates empty polls at their source. The two fixes are orthogonal
-and can be combined.
+\textbf{Kernel bypass approaches.}
+A different strategy for high-speed packet I/O is to bypass the kernel stack
+altogether. netmap~\cite{rizzo2012netmap} exposes raw NIC rings to userspace,
+eliminating per-packet system call overhead. The eXpress Data Path
+(XDP)~\cite{hoiland2018xdp} runs eBPF programs at the earliest possible point
+in the kernel, before memory allocation, reaching near-wire speed on commodity
+hardware. DPDK takes the furthest step: a dedicated poll-mode driver that
+removes interrupt overhead entirely. These approaches trade generality and
+security isolation for throughput. WireGuard deliberately stays in the kernel to
+inherit the security guarantees of the kernel networking stack and interoperate
+with the rest of the system. The EoI is a consequence of this in-kernel design,
+and fixing it in-kernel preserves these properties.
+
+\textbf{Kernel asynchronous I/O.}
+\texttt{io\_uring}~\cite{axboe2019} is the kernel's general-purpose
+asynchronous I/O interface, also designed to reduce context-switch and
+system-call overhead through submission and completion rings shared between
+kernel and userspace. \citeauthor{mounah2025} connect WireGuard's workqueue
+model directly to this lineage: their fix can be seen as applying the
+asynchronous dispatch pattern to the GRO stage. Our fix targets a different
+layer, improving the scheduling policy within that asynchronous stage rather
+than its execution context.
+
+% NOTE: a citation for a VPN performance comparison paper (IPsec vs WireGuard
+% at scale) would strengthen the argument in the first paragraph. Candidates:
+% search "WireGuard performance comparison IPsec" on Google Scholar; there are
+% several 2020--2023 measurement papers from network research groups.
 
 %% ============================================================
 \section{Root Cause Analysis}
