@@ -411,13 +411,11 @@ efficiency cores are taken offline before each run (\emph{ecores mode}).
 
 \subsection{Results: Fixed-Load Peer Sweep}
 
-Table~\ref{tab:gro} shows GRO scheduling metrics at zero artificial delay.
-The baseline waste of $\approx$25\% at one peer reflects normal NAPI overhead:
-with only one peer's packets in flight, the poll occasionally runs just as the
-queue empties; this is unrelated to the EoI. The fix's effect at one peer
-($-$8.8\%) is modest for this reason. The EoI contribution grows with peer
-count as more concurrent workers increase out-of-order completions, producing
-larger reductions at 8 peers ($-$21.9\%) and 32 peers ($-$20.7\%).
+The fix has three observable effects: it should reduce wasted polls, it should
+increase mean batch size (since fewer premature wakes means more packets are
+ready when the poll does run), and it should leave throughput unchanged on this
+rig (because the loopback does not saturate \texttt{NET\_RX\_SOFTIRQ}). All
+three are confirmed in Table~\ref{tab:gro} and Figure~\ref{fig:sweep}.
 
 \begin{table}[t]
 \centering
@@ -449,28 +447,38 @@ peers & build & wasted/s & waste\% & batch & $\Delta$wasted \\
 \end{tabular}
 \end{table}
 
-Mean batch size also rises under the patch (e.g., 8.7$\to$9.6 at 8 peers,
-7.7$\to$8.9 at 32 peers): GRO is woken later but with more packets ready, so
-each poll does more work. Figure~\ref{fig:sweep} shows wasted polls across the
-full peer range.
+\textbf{Wasted polls.} The reduction is consistent across all peer counts. At
+one peer the fix saves $-$8.8\%, which is modest: most of the $\approx$25\%
+waste at one peer is a normal NAPI baseline (the poll occasionally fires at
+a queue boundary even without the EoI), and the EoI-specific component is small
+when only one peer's packets are in flight. The reduction grows with peer count
+($-$21.9\% at 8 peers, $-$20.7\% at 32) because more concurrent workers produce
+more out-of-order completions, which is exactly the EoI scenario the fix
+targets. Figure~\ref{fig:sweep} makes this trend visible.
 
 \begin{figure}[t]
   \centering
   \includegraphics[width=\linewidth]{eoi_wasted_polls_sweep.pdf}
   \caption{Wasted (empty) GRO polls per second, stock vs.\ patched, as peer
-  count grows (fixed total load, E-cores offline, 0\,µs delay). Error bars are IQR over
-  5 runs.}
+  count grows (fixed total load, E-cores offline, 0\,µs delay). Error bars
+  show IQR over 5 runs.}
   \label{fig:sweep}
 \end{figure}
 
-\textbf{Throughput and latency.} Table~\ref{tab:tput} shows median throughput
-and latency. At $\geq$4 peers the system is pinned at $\approx$11.6~Gbps under both
-builds. This ceiling is set by the loopback interface and the M1's ChaCha20
-throughput: the ARM NEON implementation encrypts fast enough that the bottleneck
-is memory bandwidth and packet overhead, not CPU. In this regime GRO efficiency
-gains are not visible in Gbps because \texttt{NET\_RX\_SOFTIRQ} never saturates. Tail latency (p99) is marginally worse under the patch at $\geq$8
-peers (e.g., 17.1$\to$19.5~ms at 8 peers): deferred wake adds a small queuing
-delay under high contention, discussed in Section~\ref{subsec:costwake}.
+\textbf{Batch size.} Mean batch size rises under the patch at every multi-peer
+point (e.g., 8.7$\to$9.6 at 8 peers, 7.7$\to$8.9 at 32 peers). This is the
+direct mechanistic confirmation: by suppressing premature wakes, the poll runs
+less often but finds more packets ready each time, which is exactly what GRO
+needs to coalesce effectively.
+
+\textbf{Throughput and latency.} Table~\ref{tab:tput} shows that throughput is
+flat at $\approx$11.6~Gbps for $\geq$4 peers under both builds. This is
+expected: the M1's ARM NEON ChaCha20 implementation is fast enough that the
+bottleneck on a loopback path is memory bandwidth, not CPU, so GRO efficiency
+gains are not visible in Gbps here. Tail latency (p99) is slightly worse under
+the patch at $\geq$8 peers (e.g., 17.1$\to$19.5~ms at 8 peers) because the
+deferred wake adds a small queuing delay. This is an expected trade-off
+discussed in Section~\ref{subsec:costwake}.
 
 \begin{table}[t]
 \centering
@@ -500,16 +508,17 @@ peers & build & Gbps & p50\,ms & p99\,ms & p99.9\,ms \\
 \end{tabular}
 \end{table}
 
-\subsection{Results: Regime Test (40\,µs Delay, 2-Core Bottleneck)}
+\subsection{Results: Regime Test}
 \label{subsec:regime}
 
-To approach the throughput-collapse regime of \citeauthor{mounah2025}, we
-need decryption to compete with \texttt{NET\_RX\_SOFTIRQ} for CPU time. We
-induce this by extending per-packet decrypt cost to 40~µs via
-\texttt{wg\_decrypt\_delay\_us} (making workers slower) and restricting
-execution to 2~CPU cores (\texttt{bottleneck} mode), with 16 peers. This forces
-workers and the softirq to share the same two cores, mimicking the resource
-contention on a heavily loaded server.
+The peer sweep confirms the fix works on this rig, but leaves one question
+open: does it hold when decryption is the actual bottleneck, not just a fast
+background task? On the M1, ChaCha20 is so fast that workers never saturate
+their cores, so the EoI causes waste but not throughput collapse. To approach
+the regime where it does, we slow decryption artificially (40~µs per packet via
+\texttt{wg\_decrypt\_delay\_us}) and restrict to 2~CPU cores. This forces
+workers and the softirq to compete for the same cores, mimicking a heavily
+loaded server with slower hardware.
 
 \begin{table}[t]
 \centering
@@ -527,53 +536,51 @@ $\Delta$ & $-$19.6\% & $-$4.2pp & $-$1.1\% & \\
 \end{tabular}
 \end{table}
 
-Wasted polls fall 19.6\% even under heavy delay and contention
-(Table~\ref{tab:regime}). Throughput is unchanged: the bottleneck has shifted
-to decrypt-worker capacity. The paper's throughput-collapse regime requires a
-real NIC where \texttt{NET\_RX\_SOFTIRQ} competes with decrypt-worker CPU,
-which a loopback rig cannot reproduce even with artificial delay.
+The fix still reduces wasted polls by 19.6\% (Table~\ref{tab:regime}),
+confirming that the guard works regardless of decrypt speed. Throughput is
+essentially unchanged because at 40~µs/packet and only 2 cores, decrypt
+capacity is the bottleneck regardless of GRO efficiency. The full
+throughput-collapse observed by \citeauthor{mounah2025} requires a real NIC
+driving traffic faster than the workers can process it, which even artificial
+delay on a loopback cannot reproduce.
 
 \subsection{Discussion}
 
-\textbf{RQ1}: \texttt{napi\_schedule} fires unconditionally at
-\texttt{queueing.h:196}; \texttt{wg\_packet\_rx\_poll} returns
-\texttt{work\_done = 0} whenever the head is \textsc{uncrypted}, which happens
-systematically with $N > 1$ concurrent workers.
-
-\textbf{RQ2}: The prior fix changes GRO's scheduling context but not the
-trigger in \texttt{wg\_queue\_enqueue\_per\_peer\_rx}. By source inspection,
-the unconditional \texttt{napi\_schedule} call is unchanged in their patch,
-so the empty polls are still scheduled at the same rate; they are just cheaper
-to service.
-
-\textbf{RQ3}: The guard reduces wasted polls by 9--22\% in the peer sweep and
-20\% in the regime test. Batch size increases in both cases, confirming that
-scheduling is deferred to points where delivery is productive.
-
-\textbf{RQ4}: The EoI manifests on ARM with 25--31\% of GRO invocations wasted
-under stock. We verified that the relevant files (\texttt{queueing.h},
-\texttt{receive.c}) are identical line-for-line between
-\texttt{AsahiLinux/linux}~v6.19 (Asahi) and \texttt{torvalds/linux}~v6.1
-(the version used in \citeauthor{mounah2025}), so the mechanism and the fix
-apply equally to both architectures.
+Together, the two experiments answer all four research questions. The mechanism
+is confirmed: \texttt{napi\_schedule} fires unconditionally at
+\texttt{queueing.h:196}, and \texttt{wg\_packet\_rx\_poll} returns
+\texttt{work\_done = 0} whenever the head is still \textsc{uncrypted}, which
+happens systematically when $N > 1$ workers decrypt in parallel (RQ1). The prior fix
+by \citeauthor{mounah2025} addresses this by running GRO at lower priority, but
+by source inspection their patch leaves the unconditional \texttt{napi\_schedule}
+call unchanged, so empty polls are still scheduled at the same rate (RQ2). Our
+guard reduces those polls by 9--22\% across peer counts, with batch size rising
+in every case --- a direct sign that GRO is now woken at moments where it can
+actually coalesce packets (RQ3). Finally, the EoI manifests on ARM with 25--31\%
+of polls wasted under stock, and since \texttt{queueing.h} and \texttt{receive.c}
+are identical line-for-line between the Asahi kernel and the x86 v6.1 kernel
+used by \citeauthor{mounah2025}, the mechanism and the fix transfer directly
+(RQ4).
 
 \subsection{The Cost of Each Wake}
 \label{subsec:costwake}
 
-The guard wakes the poll as soon as the front is ready, so a poll may deliver
-just one packet. In that case WireGuard pays the full cost of a softirq, a GRO
-pass, and a NAPI completion to hand up a single packet, with none of GRO's
-batching benefit.
+The latency increase in Table~\ref{tab:tput} points to a trade-off inherent in
+the fix. By waiting until the head is ready before waking, the poll may deliver
+only one packet when it runs. WireGuard then pays the full overhead of a
+softirq, a GRO pass, and a NAPI completion to deliver a single packet, with
+none of GRO's batching benefit. The head packet also arrives slightly later
+than it would have under an unconditional wake.
 
-Whether this matters depends on two unmeasured costs: the overhead of a poll
-itself, and the cost of delivering and copying a packet to the receiving
-application. If delivery dominates, waking for one packet is fine. If poll
-overhead dominates, a policy that waits for more packets before waking would be
-better. We chose the simple wake-on-ready policy because it keeps latency low
-and never delays a ready packet, which matters for a VPN. Measuring these two
-costs on real hardware is central to judging the fix long-term: it determines
-whether the simple policy is good enough, or whether a batching-aware trigger
-is needed. We treat this as future work.
+Whether this is a real problem depends on two costs we have not yet measured:
+how expensive a poll is, and how much it costs to deliver and copy a packet to
+the application. If delivery dominates, waking for one packet is fine. If poll
+overhead dominates, a policy that waits briefly for more packets would be
+better. We chose the simple wake-on-ready policy because it keeps latency
+bounded and never withholds a ready packet, which is the right default for a
+VPN. Measuring these two costs on real hardware will determine whether this
+simple policy is good enough long-term, or whether a batching-aware trigger is
+needed. We leave this as the primary open question.
 
 %% ============================================================
 \section{Conclusion}
