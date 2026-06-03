@@ -291,7 +291,7 @@ consumer) because it caches its result; calling it from a worker would corrupt
 that state. Instead we read the consumer's position directly from
 \texttt{peer->rx\_queue.tail}. Because this field is written only by the
 consumer (\texttt{queueing.c:87,92,101}), a worker can safely read it: a
-slightly stale value is harmless because the check is only a hint --- if we
+slightly stale value is harmless because the check is only a hint: if we
 mistakenly skip a wake, the worker that eventually makes the head ready will
 schedule the poll. If \texttt{tail} points to the stub sentinel (a dummy node
 the queue uses to mark the empty state), we schedule unconditionally, which
