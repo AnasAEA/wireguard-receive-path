@@ -79,8 +79,8 @@ and evaluate the fix on an ARM platform (Apple M1~Pro).
 
 WireGuard~\cite{donenfeld2017} is a modern VPN integrated into the Linux kernel
 since version~5.6 (2020). It uses ChaCha20-Poly1305 encryption~\cite{rfc8439}
-and the Noise protocol framework~\cite{noise}. Its minimal design and
-competitive performance have made it the preferred replacement for older VPN
+and the Noise protocol framework~\cite{noise}. Its minimal codebase and
+competitive performance have made it a common replacement for older VPN
 solutions such as IPsec and OpenVPN.
 
 At multi-gigabit throughput, however, WireGuard exhibits unexpected performance
@@ -96,8 +96,8 @@ WireGuard calls \texttt{napi\_schedule} after every decrypted packet regardless
 of queue state. GRO can only deliver if the \emph{head} of the per-peer queue
 is already decrypted. With $N$ packets decrypting concurrently the head
 finishes first with probability $1/N$, so on average $(N\!-\!1)/2$ polls per
-batch find nothing to deliver. This is a trigger logic problem, not a
-scheduling priority problem.
+batch find nothing to deliver. The problem is in the trigger logic,
+not the scheduling priority.
 
 This work presents a source-level analysis and a targeted fix: a six-line guard
 at the scheduling site that invokes GRO only when the head is ready. We prove
@@ -214,19 +214,20 @@ after every decrypted packet, so a poll running while the head is not ready
 still does no useful work. Moving that work to a cheaper context makes each
 empty poll less harmful, but the empty polls remain.
 
-Our work targets the other half of the problem. We identify the unconditional
-trigger as the root cause and remove empty polls at their source by checking
-whether the head is ready before scheduling the poll at all. The two approaches
-are orthogonal: theirs lowers the cost per poll, ours lowers the count, and
-they can be combined.
+Our work addresses the other side. We identify the unconditional trigger as the
+root cause and eliminate empty polls at their source by checking whether the
+head is ready before scheduling the poll at all. The two fixes are orthogonal:
+one lowers cost per poll, the other lowers poll count. They can be applied
+together.
 
 %% ============================================================
 \section{Root Cause Analysis}
 \label{sec:rootcause}
 %% ============================================================
 
-The overhead arises from three interacting facts: delivery is gated by the
-queue head, decryption finishes out of order, and the GRO trigger ignores both.
+Three conditions interact to produce the overhead: delivery is gated by the
+queue head, decryption finishes out of order across cores, and the GRO trigger
+checks neither before firing.
 
 \subsection{Delivery Is Gated by the Head}
 
@@ -234,9 +235,8 @@ Each packet carries a state (\texttt{PACKET\_CB(skb)->state}, an
 \texttt{atomic\_t}): \textsc{uncrypted} on enqueue, \textsc{crypted} on
 success, \textsc{dead} on failure. \texttt{wg\_packet\_rx\_poll} walks from the
 head and delivers while state is not \textsc{uncrypted}, halting at the first
-\textsc{uncrypted} entry (\texttt{receive.c:451}). The key invariant is
-absolute: no packet can be delivered while the head is still pending, no matter
-how many later packets are ready.
+\textsc{uncrypted} entry (\texttt{receive.c:451}). No packet can be delivered while the head
+is still pending, regardless of how many later packets are ready.
 
 \subsection{Decryption Finishes Out of Order}
 
@@ -398,7 +398,7 @@ events.
 
 \begin{table}[t]
 \centering
-\caption{GRO scheduling metrics --- median/s. 32 streams fixed total,
+\caption{GRO scheduling metrics, median per second. 32 streams fixed total,
 ecores, 0\,µs delay. $\Delta$ = patched vs.\ stock.}
 \label{tab:gro}
 \small
@@ -424,9 +424,9 @@ peers & build & wasted/s & waste\% & batch & $\Delta$wasted \\
 \end{tabular}
 \end{table}
 
-The rise in mean batch size under the patch (e.g., 8.7$\to$9.6 at 8 peers,
-7.7$\to$8.9 at 32 peers) is the mechanistic confirmation: fewer but larger
-batches mean GRO is woken only when it can deliver more. Figure~\ref{fig:sweep}
+Mean batch size rises under the patch (e.g., 8.7$\to$9.6 at 8 peers,
+7.7$\to$8.9 at 32 peers), which directly reflects fewer but larger
+delivery windows: GRO is woken later, but with more to do. Figure~\ref{fig:sweep}
 shows wasted polls across the full peer range.
 
 \begin{figure}[t]
@@ -449,7 +449,7 @@ Section~\ref{subsec:costwake}.
 
 \begin{table}[t]
 \centering
-\caption{Throughput and latency --- median. 32 streams fixed total, ecores,
+\caption{Throughput and latency, median. 32 streams fixed total, ecores,
 0\,µs delay.}
 \label{tab:tput}
 \small
@@ -484,7 +484,7 @@ execution to 2~CPU cores (\texttt{bottleneck} mode, 16 peers).
 
 \begin{table}[t]
 \centering
-\caption{Regime test --- 16 peers, 40\,µs delay, 2 cores. Median, 5 runs.}
+\caption{Regime test: 16 peers, 40\,µs delay, 2 cores. Median, 5 runs.}
 \label{tab:regime}
 \small
 \begin{tabular}{lrrrr}
@@ -507,19 +507,18 @@ with artificial delay.
 
 \subsection{Discussion}
 
-\textbf{RQ1} (mechanism): Confirmed at source level. The unconditional
-\texttt{napi\_schedule} at \texttt{queueing.h:196} fires after every decrypted
-packet; \texttt{wg\_packet\_rx\_poll} returns \texttt{work\_done = 0} whenever
-the head is \textsc{uncrypted}, systematically with $N > 1$ concurrent workers.
+\textbf{RQ1} (mechanism): The unconditional \texttt{napi\_schedule} at
+\texttt{queueing.h:196} fires after every decrypted packet;
+\texttt{wg\_packet\_rx\_poll} returns \texttt{work\_done = 0} whenever the head
+is \textsc{uncrypted}. This happens systematically with $N > 1$ concurrent
+workers, which is the common case.
 
 \textbf{RQ2} (prior fix): The prior fix changes GRO's scheduling context but
-not the trigger logic; wasted invocations occur at the same rate under their
-fix.
+not the trigger. Wasted invocations occur at the same rate under their fix.
 
-\textbf{RQ3} (conditional guard): Confirmed effective. The guard reduces
-wasted polls by 9--22\% in the peer sweep and 20\% in the regime test. Batch
-size increases in both cases, confirming that scheduling is deferred until
-delivery is productive.
+\textbf{RQ3} (conditional guard): The guard reduces wasted polls by 9--22\% in
+the peer sweep and 20\% in the regime test. Batch size increases in both cases,
+confirming that scheduling is deferred to points where delivery is productive.
 
 \textbf{RQ4} (ARM): The EoI manifests on ARM with 25--31\% of GRO invocations
 wasted under stock. The patch code is structurally identical between
@@ -529,10 +528,10 @@ wasted under stock. The patch code is structurally identical between
 \label{subsec:costwake}
 
 The guard fixes \emph{when} to wake the poll, but leaves a second question
-open: whether each wake is worth its cost. Because the guard wakes the poll as
-soon as the front is ready, a poll may deliver as little as one packet. WireGuard
-then pays the full poll cost --- scheduling the softirq, running GRO, completing
-the NAPI --- to hand up a single packet, getting none of GRO's batching benefit.
+open: whether each wake is worth its cost. Because the guard wakes the poll as soon as the front is ready, a poll may
+deliver as little as one packet. In that case WireGuard pays the full cost of a
+softirq, a GRO pass, and a NAPI completion to hand up a single packet, with
+none of GRO's batching benefit.
 
 Whether this matters depends on two unmeasured costs: the overhead of a poll
 itself, and the cost of delivering and copying a packet to the receiving
@@ -557,9 +556,9 @@ call after every decrypted packet, which triggers GRO polls that systematically
 find nothing to deliver when the per-peer queue head is still
 \textsc{uncrypted}. The fraction of wasted polls grows with core count.
 
-The proposed fix --- a six-line conditional guard reading
-\texttt{READ\_ONCE(peer->rx\_queue.tail)} --- skips the schedule when the head
-is pending. We proved correctness under stale reads and the stub sentinel edge
+The fix is a six-line conditional guard that reads
+\texttt{READ\_ONCE(peer->rx\_queue.tail)} and skips \texttt{napi\_schedule}
+when the head is still pending. We proved correctness under stale reads and the stub sentinel edge
 case. Experimental evaluation on ARM (Apple M1~Pro) confirms a 9--22\%
 reduction in wasted GRO polls across peer counts 1--32 at fixed total load, and
 a 20\% reduction under artificial heavy-crypto conditions with 2-core
@@ -568,9 +567,9 @@ Throughput is unchanged on this loopback rig, as expected: the benefit appears
 in poll-efficiency metrics, not Gbps, because the M1 loopback does not saturate
 \texttt{NET\_RX\_SOFTIRQ}.
 
-The fix by \citeauthor{mounah2025} and ours are orthogonal: theirs reduces the
-per-invocation cost of GRO; ours reduces the invocation count. A combined
-deployment should yield additive benefit.
+The fix by \citeauthor{mounah2025} reduces the cost of each GRO invocation;
+ours reduces how many invocations happen. The two are independent, and
+applying both together should give additional improvement over either alone.
 
 \smallskip\noindent\textbf{Future work.}
 (1)~Validate the throughput effect on x86-64 hardware with a real 25~Gbps NIC
