@@ -137,14 +137,14 @@ Section~\ref{sec:conclusion} concludes.
 
 \subsection{WireGuard's Receive Pipeline}
 
-WireGuard's receive path has three stages. Stage~1 runs in bottom-half (BH)
-context: it de-encapsulates incoming UDP datagrams and dispatches them for
-decryption. Stage~2 performs ChaCha20-Poly1305 decryption inside a
-\emph{workqueue}, a pool of kernel threads running at normal scheduler
-priority. Stage~3 reassembles decrypted packets and passes them to the network
-stack through Generic Receive Offload (GRO), executing as a \emph{softirq}, a
-kernel routine that runs at higher priority than normal threads and cannot
-sleep.
+WireGuard's receive path~\cite{wireguard-linux} has three stages. Stage~1
+runs in bottom-half (BH) context: it de-encapsulates incoming UDP datagrams
+and dispatches them for decryption. Stage~2 performs ChaCha20-Poly1305
+decryption inside a \emph{workqueue}, a pool of kernel threads running at
+normal scheduler priority~\cite{linux-workqueue}. Stage~3 reassembles
+decrypted packets and passes them to the network stack through Generic Receive
+Offload (GRO), executing as a \emph{softirq}, a kernel routine that runs at
+higher priority than normal threads and cannot sleep.
 
 Two separate queues serve different purposes (Figure~\ref{fig:queues}):
 \begin{itemize}
@@ -169,9 +169,9 @@ state \textsc{uncrypted}. When a worker finishes, it flips the state to
 
 \subsection{NAPI, GRO, and Softirqs}
 
-NAPI (New API) avoids per-packet interrupts by batching: after the first
-packet arrives, the kernel disables the hardware interrupt and instead processes
-packets in groups. Each receive queue is paired with a poll function; WireGuard
+NAPI (New API) avoids per-packet interrupts by batching~\cite{linux-napi}:
+after the first packet arrives, the kernel disables the hardware interrupt and
+instead processes packets in groups. Each receive queue is paired with a poll function; WireGuard
 creates one per peer, using \texttt{wg\_packet\_rx\_poll}. To request a poll,
 code calls \texttt{napi\_schedule}, which marks the queue as ``scheduled'' and
 raises a software interrupt. This does not run the poll immediately; it only
@@ -280,7 +280,7 @@ schedules a poll, but the head is still pending.
 \subsection{The Trigger Ignores Both}
 
 When a worker finishes, it calls \texttt{napi\_schedule} unconditionally
-(\texttt{queueing.h:195-196}):
+(\texttt{queueing.h:195--196},~\cite{wireguard-linux}):
 
 \begin{lstlisting}[language=C]
 atomic_set_release(&PACKET_CB(skb)->state, state);
