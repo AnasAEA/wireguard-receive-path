@@ -58,8 +58,8 @@ Name, date and signature: AIT EL HADJ ANAS, 05/06/2026
 WireGuard is a modern VPN built into the Linux kernel. Under sustained
 multi-gigabit traffic with 1,000 concurrent clients, it reaches only 19.2\% of
 available bandwidth. Prior work traced this to an Execution Order Inversion
-(EoI): concurrent decryption triggers GRO reassembly so frequently that the CPU
-saturates. That work moved reassembly to a background thread and recovered
+(EoI): concurrent decryption triggers Generic Receive Offload (GRO) reassembly
+so frequently that the CPU saturates. That work moved reassembly to a background thread and recovered
 4.7$\times$ throughput.
 
 We show, through source-level analysis, that this fix is incomplete. It makes
@@ -87,8 +87,9 @@ At multi-gigabit throughput, however, WireGuard exhibits unexpected performance
 degradation on multi-core systems. \citeauthor{mounah2025}~\cite{mounah2025}
 measured a throughput collapse to 19.2\% of line rate and 94\% CPU utilization
 under 25~Gbps with 1,000 clients. They identified an Execution Order Inversion
-(EoI) and proposed moving GRO from a high-priority softirq to a normal-priority
-workqueue, recovering 4.7$\times$ throughput.
+(EoI) and proposed moving GRO from a high-priority softirq (a deferred
+interrupt handler) to a normal-priority workqueue (a pool of background kernel
+threads), recovering 4.7$\times$ throughput.
 
 Despite this result, the fix is incomplete. Moving GRO lowers the cost of each
 wasted poll but does not lower their count. The root cause is unchanged:
@@ -140,7 +141,9 @@ context: it de-encapsulates incoming UDP datagrams and dispatches them for
 decryption. Stage~2 performs ChaCha20-Poly1305 decryption inside a
 \emph{workqueue}, a pool of kernel threads running at normal scheduler
 priority. Stage~3 reassembles decrypted packets and passes them to the network
-stack through Generic Receive Offload (GRO), executing as a \emph{softirq}.
+stack through Generic Receive Offload (GRO), executing as a \emph{softirq}, a
+kernel routine that runs at higher priority than normal threads and cannot
+sleep.
 
 Two separate queues serve different purposes (Figure~\ref{fig:queues}):
 \begin{itemize}
@@ -165,8 +168,8 @@ state \textsc{uncrypted}. When a worker finishes, it flips the state to
 
 \subsection{NAPI, GRO, and Softirqs}
 
-NAPI batches packet delivery: after the first packet arrives, the kernel stops
-per-packet interrupts and polls the device in batches instead. Each receive
+NAPI (New API) batches packet delivery: after the first packet arrives, the
+kernel stops per-packet interrupts and polls the device in batches instead. Each receive
 queue has a \texttt{napi\_struct} and a poll function; WireGuard assigns each
 peer its own, with \texttt{wg\_packet\_rx\_poll} as its poll function. Calling
 \texttt{napi\_schedule} sets a ``scheduled'' flag and raises
@@ -285,8 +288,9 @@ from a worker. Instead we read the consumer cursor directly: in this
 multi-producer single-consumer queue, \texttt{peer->rx\_queue.tail} is written
 only by the consumer (\texttt{queueing.c:87,92,101}), so
 \texttt{READ\_ONCE(peer->rx\_queue.tail)} is safe as a hint. If \texttt{tail}
-points to the stub sentinel the worker schedules unconditionally, costing at
-most one harmless extra poll.
+points to the stub sentinel (a dummy node the queue uses to mark the empty
+state) the worker schedules unconditionally, costing at most one harmless extra
+poll.
 
 \subsection{The Change}
 
@@ -361,8 +365,11 @@ runs 30~s with a 5~s warm-up omitted.
 
 \textbf{Variance control and metrics.} Each (peers, build) cell is measured
 5~times; stock and patched alternate order each run to cancel drift. GRO poll
-counts and batch size (\texttt{work\_done}) are collected with bpftrace probes
-on \texttt{wg\_packet\_rx\_poll}. Latency is from 20~Hz ping (p50/p99/p99.9).
+counts and batch size (\texttt{work\_done}, the number of packets delivered per
+poll pass) are collected with bpftrace (a Linux kernel dynamic tracing tool)
+probes on \texttt{wg\_packet\_rx\_poll}. Latency is from 20~Hz ping
+(p50/p99/p99.9). To reduce variance from the M1's asymmetric cores, the
+efficiency cores are taken offline before each run (\emph{ecores mode}).
 
 \subsection{Results: Fixed-Load Peer Sweep}
 
@@ -376,7 +383,7 @@ events.
 \begin{table}[t]
 \centering
 \caption{GRO scheduling metrics, median per second. 32 streams fixed total,
-ecores, 0\,µs delay. $\Delta$ = patched vs.\ stock.}
+E-cores offline, 0\,µs delay. $\Delta$ = patched vs.\ stock.}
 \label{tab:gro}
 \small
 \begin{tabular}{rrrrrr}
@@ -410,7 +417,7 @@ full peer range.
   \centering
   \includegraphics[width=\linewidth]{eoi_wasted_polls_sweep.pdf}
   \caption{Wasted (empty) GRO polls per second, stock vs.\ patched, as peer
-  count grows (fixed total load, ecores, 0\,µs delay). Error bars are IQR over
+  count grows (fixed total load, E-cores offline, 0\,µs delay). Error bars are IQR over
   5 runs.}
   \label{fig:sweep}
 \end{figure}
@@ -425,8 +432,8 @@ delay under high contention, discussed in Section~\ref{subsec:costwake}.
 
 \begin{table}[t]
 \centering
-\caption{Throughput and latency, median. 32 streams fixed total, ecores,
-0\,µs delay.}
+\caption{Throughput and latency, median. 32 streams fixed total,
+E-cores offline, 0\,µs delay.}
 \label{tab:tput}
 \small
 \begin{tabular}{rrrrrr}
