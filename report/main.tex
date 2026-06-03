@@ -92,9 +92,10 @@ interrupt handler) to a normal-priority workqueue (a pool of background kernel
 threads), recovering 4.7$\times$ throughput.
 
 Despite this result, the fix is incomplete. Moving GRO lowers the cost of each
-wasted poll but does not lower their count. The root cause is unchanged:
-WireGuard calls \texttt{napi\_schedule} after every decrypted packet regardless
-of queue state. GRO can only deliver if the \emph{head} of the per-peer queue is
+wasted poll (an invocation of the reassembly function that delivers nothing) but
+does not lower their count. The root cause is unchanged: WireGuard calls
+\texttt{napi\_schedule} (the function that requests a GRO poll) after every
+decrypted packet regardless of queue state. GRO can only deliver if the \emph{head} of the per-peer queue is
 already decrypted. With $N$ packets decrypting concurrently the head finishes
 first with probability $1/N$, so on average $(N\!-\!1)/2$ polls per batch find
 nothing to deliver. The problem is in the trigger logic, not the scheduling
@@ -168,16 +169,18 @@ state \textsc{uncrypted}. When a worker finishes, it flips the state to
 
 \subsection{NAPI, GRO, and Softirqs}
 
-NAPI (New API) batches packet delivery: after the first packet arrives, the
-kernel stops per-packet interrupts and polls the device in batches instead. Each receive
-queue has a \texttt{napi\_struct} and a poll function; WireGuard assigns each
-peer its own, with \texttt{wg\_packet\_rx\_poll} as its poll function. Calling
-\texttt{napi\_schedule} sets a ``scheduled'' flag and raises
-\texttt{NET\_RX\_SOFTIRQ}; it does not run the poll immediately. Repeated calls
-while the flag is set collapse into a single pending poll.
+NAPI (New API) avoids per-packet interrupts by batching: after the first
+packet arrives, the kernel disables the hardware interrupt and instead processes
+packets in groups. Each receive queue is paired with a poll function; WireGuard
+creates one per peer, using \texttt{wg\_packet\_rx\_poll}. To request a poll,
+code calls \texttt{napi\_schedule}, which marks the queue as ``scheduled'' and
+raises a software interrupt. This does not run the poll immediately; it only
+schedules it to run shortly after. Repeated calls while the queue is already
+marked collapse into a single pending poll.
 
-The softirq fires at the next BH re-enable point (\texttt{spin\_unlock\_bh}),
-which in the decrypt worker's loop is the next iteration. When it fires,
+The poll runs shortly after \texttt{napi\_schedule} returns, at the next point
+where the worker briefly re-enables interrupt handling (a call to
+\texttt{spin\_unlock\_bh} at the end of each loop iteration). When it fires,
 \texttt{wg\_packet\_rx\_poll} walks the per-peer queue from its head and passes
 packets to GRO, which merges consecutive packets of the same flow to amortize
 the stack-traversal cost. The poll stops at the first \textsc{uncrypted} entry
@@ -218,7 +221,7 @@ and can be combined.
 
 Three conditions interact to produce the overhead: delivery is gated by the
 queue head, decryption finishes out of order across cores, and the GRO trigger
-checks neither before firing.
+fires unconditionally regardless of whether the head is ready or not.
 
 \subsection{Delivery Is Gated by the Head}
 
@@ -282,15 +285,17 @@ The fix schedules the poll only when the front of the per-peer queue is no
 longer \textsc{uncrypted}. If the front is still pending the wake is skipped;
 the worker that eventually makes the front ready will wake the poll then.
 
-Reading the front safely from worker context requires care. The consumer-side
-accessor \texttt{wg\_prev\_queue\_peek} caches its result and must not be called
-from a worker. Instead we read the consumer cursor directly: in this
-multi-producer single-consumer queue, \texttt{peer->rx\_queue.tail} is written
-only by the consumer (\texttt{queueing.c:87,92,101}), so
-\texttt{READ\_ONCE(peer->rx\_queue.tail)} is safe as a hint. If \texttt{tail}
-points to the stub sentinel (a dummy node the queue uses to mark the empty
-state) the worker schedules unconditionally, costing at most one harmless extra
-poll.
+Reading the front from worker context requires care. The standard accessor
+\texttt{wg\_prev\_queue\_peek} is reserved for the poll (the queue's single
+consumer) because it caches its result; calling it from a worker would corrupt
+that state. Instead we read the consumer's position directly from
+\texttt{peer->rx\_queue.tail}. Because this field is written only by the
+consumer (\texttt{queueing.c:87,92,101}), a worker can safely read it: a
+slightly stale value is harmless because the check is only a hint --- if we
+mistakenly skip a wake, the worker that eventually makes the head ready will
+schedule the poll. If \texttt{tail} points to the stub sentinel (a dummy node
+the queue uses to mark the empty state), we schedule unconditionally, which
+costs at most one extra poll.
 
 \subsection{The Change}
 
@@ -314,12 +319,15 @@ the guard passes, and the poll finds work. If the front is already
 \textsc{uncrypted} the guard correctly skips the wake. For stale reads: if this
 worker misses a concurrent flip to \textsc{crypted}, the core that made that
 flip runs the same guard and schedules the poll, so no packet is stranded. The
-read is safely relaxed (\texttt{atomic\_read}): it is a hint, not a
-synchronization point.
+read can be relaxed (\texttt{atomic\_read}, no memory barrier): we are only
+deciding whether to wake, not consuming decrypted data, so no stronger ordering
+guarantee is needed.
 
-If a schedule lands while a poll is running, NAPI records a \texttt{MISSED}
-bit and re-runs the poll once (\texttt{dev.c:6744,6825}). No delivery is lost;
-at worst it is deferred by one poll.
+NAPI also handles the case where \texttt{napi\_schedule} is called while a poll
+is already running: rather than dropping the request, NAPI records an internal
+\texttt{MISSED} flag and runs the poll one more time once the current run
+finishes (\texttt{dev.c:6744,6825}). This ensures no delivery is lost; at worst
+it is deferred by one extra poll.
 
 \subsection{Residual Limitation}
 
