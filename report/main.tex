@@ -555,7 +555,7 @@ by \citeauthor{mounah2025} addresses this by running GRO at lower priority, but
 by source inspection their patch leaves the unconditional \texttt{napi\_schedule}
 call unchanged, so empty polls are still scheduled at the same rate (RQ2). Our
 guard reduces those polls by 9--22\% across peer counts, with batch size rising
-in every case --- a direct sign that GRO is now woken at moments where it can
+in every case, a direct sign that GRO is now woken at moments where it can
 actually coalesce packets (RQ3). Finally, the EoI manifests on ARM with 25--31\%
 of polls wasted under stock, and since \texttt{queueing.h} and \texttt{receive.c}
 are identical line-for-line between the Asahi kernel and the x86 v6.1 kernel
