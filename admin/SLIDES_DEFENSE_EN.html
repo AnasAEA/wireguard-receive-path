@@ -285,20 +285,19 @@ img { display: block; margin: 0 auto; }
 .tag { color: #b91c1c; font-weight: bold; }
 footer { color: #888; }
 ;" data-marpit-pagination-total="16" data-size="16:9">
-<h2 id="whats-next--two-open-problems">What's next — two open problems</h2>
-<p><strong>1. Real hardware validation</strong></p>
+<h2 id="whats-next">What's next</h2>
+<p><strong>1. Real hardware</strong> — CloudLab (x86, 25G NIC, 1,000 peers)</p>
 <ul>
-<li>CloudLab: x86 server, real <strong>25G NIC</strong>, up to 1,000 peers — the paper's exact regime.</li>
-<li>Need to confirm the fix actually reduces <strong>throughput collapse</strong>, not just poll counts.</li>
-<li>Also: does the ARM behavior reproduce on x86? The code is identical, but the out-of-order completion patterns may differ.</li>
+<li>Does the fix reduce <strong>throughput collapse</strong>, not just poll counts?</li>
+<li>Does ARM behavior reproduce on x86?</li>
 </ul>
 <p><strong>2. A better fix</strong></p>
 <ul>
-<li>The current fix wakes on the first ready packet — but one-packet polls don't benefit from GRO at all.</li>
-<li>The right policy: <strong>wake only when waking pays off</strong> — i.e., when the batching gain outweighs the poll cost.</li>
-<li>To design that, we need to measure: <em>how expensive is one poll?</em> vs <em>how expensive is one packet delivery + copy to userspace?</em></li>
-<li>Those numbers will tell us whether we need a batching-aware trigger, and what the threshold should be.</li>
+<li>Current fix wakes on the first ready packet → <strong>one-packet polls get no GRO benefit</strong>.</li>
+<li>Right policy: <strong>wake only when waking pays off</strong>.</li>
+<li>Requires measuring: <em>poll overhead</em> vs <em>packet delivery + copy to userspace</em>.</li>
 </ul>
+<p><strong>3. Combine with the prior fix</strong> — orthogonal, should be additive.</p>
 <footer>WireGuard · Execution Order Inversion · Anas Ait El Hadj · Inria KrakOS</footer>
 </section>
 </foreignObject></svg><svg data-marpit-svg="" viewBox="0 0 1280 720"><foreignObject width="1280" height="720"><section id="12" data-paginate="true" data-footer="WireGuard · Execution Order Inversion · Anas Ait El Hadj · Inria KrakOS" data-class="lead" data-theme="default" data-style="section { font-size: 26px; }

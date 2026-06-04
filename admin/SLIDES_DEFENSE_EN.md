@@ -250,18 +250,18 @@ I can't reproduce that on a laptop.
 
 ---
 
-## What's next — two open problems
+## What's next
 
-**1. Real hardware validation**
-- CloudLab: x86 server, real **25G NIC**, up to 1,000 peers — the paper's exact regime.
-- Need to confirm the fix actually reduces **throughput collapse**, not just poll counts.
-- Also: does the ARM behavior reproduce on x86? The code is identical, but the out-of-order completion patterns may differ.
+**1. Real hardware** — CloudLab (x86, 25G NIC, 1,000 peers)
+- Does the fix reduce **throughput collapse**, not just poll counts?
+- Does ARM behavior reproduce on x86?
 
 **2. A better fix**
-- The current fix wakes on the first ready packet — but one-packet polls don't benefit from GRO at all.
-- The right policy: **wake only when waking pays off** — i.e., when the batching gain outweighs the poll cost.
-- To design that, we need to measure: *how expensive is one poll?* vs *how expensive is one packet delivery + copy to userspace?*
-- Those numbers will tell us whether we need a batching-aware trigger, and what the threshold should be.
+- Current fix wakes on the first ready packet → **one-packet polls get no GRO benefit**.
+- Right policy: **wake only when waking pays off**.
+- Requires measuring: *poll overhead* vs *packet delivery + copy to userspace*.
+
+**3. Combine with the prior fix** — orthogonal, should be additive.
 
 <!--
 (1m) So what's still open?
