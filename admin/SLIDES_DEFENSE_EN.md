@@ -26,9 +26,11 @@ Anas Ait El Hadj — Inria internship (KrakOS)
 Supervisors: **Alain Tchana** · **André Freyssinet**
 
 <!--
-(15s) Hello — I'm Anas, my internship is about a performance problem in
-WireGuard's receive path. Three goals: understand the mechanism, locate the
-bug, evaluate the fix.
+(15s) So — my internship is about a performance problem buried inside
+WireGuard's receive path. One CPU core saturates, throughput collapses, and
+the reason turns out to be something surprisingly subtle. I'll walk you through
+how the pipeline works, where it breaks, what the fix looks like, and what
+I measured. Let's go.
 -->
 
 ---
@@ -40,10 +42,14 @@ bug, evaluate the fix.
 - **My work**: understand the receive pipeline from the source code, identify the root cause of the EoI, and fix it at the trigger.
 
 <!--
-(45s) WireGuard is fast for one client. The problem is on the server side:
-1,000 clients, 25 Gbps, and throughput collapses to 19% of what the link can
-carry because one CPU saturates. Prior work named this the EoI and proposed a
-fix: 4.7× improvement. But the root cause is still there — my work targets it.
+(45s) WireGuard is known for being fast and simple. But put it on a server
+with a thousand clients pushing 25 Gbps, and one core hits 94% utilization
+and throughput collapses to 19% of line rate. That's not a network limit —
+that's a CPU problem. Mounah and co-authors at SYSTOR 2025 found the cause,
+named it the Execution Order Inversion, and proposed a fix that recovered 4.7×
+throughput. But when I read their patch, I noticed: the root cause is still
+there. Their fix makes each wasted operation cheaper to run. Mine stops it from
+running in the first place. That's what this talk is about.
 -->
 
 ---
@@ -55,9 +61,10 @@ fix: 4.7× improvement. But the root cause is still there — my work targets it
 <span class="small">Three engines, three execution contexts. We unpack each one, then we'll see exactly where it breaks.</span>
 
 <!--
-(30s) Here is the packet's journey — three stages, three execution contexts.
-I'll explain each one, and then we'll see where the problem is. Keep this map
-in mind.
+(30s) Here's a packet's journey through WireGuard. Three stages — receive,
+decrypt, deliver. Three different execution contexts. I'll explain each one,
+and then when we look at the bug it'll be obvious exactly where the problem
+is. Keep this map in mind.
 -->
 
 ---
@@ -69,15 +76,24 @@ in mind.
 <span class="small">Each client = one **peer** with its **own ordered queue** and its **own NAPI**. One shared decryption workshop for all peers.</span>
 
 <!--
-(1m30s) First, the peer. Each client at the other end of the tunnel is a
-"peer" — it has its own queue that records arrival order, and its own NAPI.
-NAPI is the batching mechanism: instead of an interrupt for every packet, the
-kernel rings once, mutes the doorbell, and collects in batches. The important
-point: calling napi_schedule does NOT run the poll immediately — it just sets
-a flag and schedules it for a moment later. And WireGuard builds its own NAPI
-per peer, on a virtual interface, woken by hand from the decrypt workers.
-Key: one shared decryption workshop, but each peer has its own delivery queue.
-This contrast is what will explain why the bug grows with peer count.
+(1m30s) First, the peer. Each client on the other end of a WireGuard tunnel
+is a "peer" — identified by a public key, not an IP address. Each peer gets
+its own ordered receive queue — that queue is what preserves packet order —
+and its own NAPI instance.
+
+NAPI is WireGuard's batching mechanism. The analogy I like: without NAPI,
+the kernel gets an interrupt for every single packet, like a postman ringing
+your doorbell for every envelope. At a million packets a second, the CPU just
+runs to the door constantly and never gets anything else done. NAPI's idea:
+ring once, mute the doorbell, collect everything in one go.
+
+The critical detail — and this will come back — is that calling napi_schedule
+does NOT run the poll immediately. It sets a flag and raises a software
+interrupt. The actual poll runs a moment later. WireGuard creates one of these
+per peer on a virtual interface, woken by hand from the decrypt workers.
+
+So: one shared decryption workshop for all peers, but each peer has its own
+delivery queue. That contrast is the seed of the bug.
 -->
 
 ---
@@ -89,13 +105,18 @@ This contrast is what will explain why the bug grows with peer count.
 <span class="small">Decryption is too heavy for the softirq → delegated to a **background pool**. One worker per core → decrypts **in parallel** → finishes **out of order**.</span>
 
 <!--
-(1m15s) Decryption — ChaCha20-Poly1305 — is too heavy to do in the softirq,
-which is borrowed time where you can't linger. So WireGuard delegates it to a
-workqueue: background kernel threads that can take their time. There's one
-worker per CPU core, so several packets decrypt simultaneously on several cores.
-This is fast — but here's the seed of the bug: they finish OUT OF ORDER. The
-core handling packet 5 may finish before the one handling packet 2. Each worker,
-when done, calls napi_schedule to wake the peer's NAPI.
+(1m15s) Why is there a workqueue at all? Because decryption — ChaCha20-Poly1305
+— is heavy. The softirq is borrowed time: you're not allowed to do long work
+there. So WireGuard delegates decryption to background kernel threads.
+
+The important part: there's one worker per CPU core. So if you have 8 cores,
+up to 8 packets from the same peer can be decrypting at the same time. That's
+fast. But — and this is the seed of the bug — they finish OUT OF ORDER. The
+core handling packet 5 might finish before the core handling packet 2. There's
+no reason the hardware respects arrival order.
+
+When a worker finishes, it calls napi_schedule to ring the peer's NAPI. Every
+worker. After every packet. Unconditionally.
 -->
 
 ---
@@ -107,11 +128,13 @@ when done, calls napi_schedule to wake the peer's NAPI.
 <span class="small">Pushing a packet up the stack has a **fixed cost per packet** → GRO **staples packets into one parcel** → one trip instead of N. WireGuard has **2 fronts**.</span>
 
 <!--
-(45s) GRO — Generic Receive Offload — staples consecutive packets of the same
-flow into one larger unit before passing them up the stack. The idea: the stack
-has a fixed traversal cost per packet, so it's better to pay it once for a batch
-of 10 than 10 times for individuals. WireGuard uses GRO at stage 3 to batch the
-decrypted packets before delivery. This is what the bug destroys.
+(45s) GRO — Generic Receive Offload — is the optimization the bug destroys.
+The idea is simple: traversing the network stack has a fixed cost per packet.
+If you have 40 packets of the same flow, it's far better to staple them into
+one big unit and traverse the stack once, rather than 40 times. GRO does that.
+WireGuard uses it at stage 3 to batch decrypted packets before handing them
+to the application. When GRO works well, you get big batches. When something
+wakes it for nothing, those batches fall apart.
 -->
 
 ---
@@ -123,10 +146,10 @@ decrypted packets before delivery. This is what the bug destroys.
 <span class="small">The red box: <span class="tag">napi_schedule unconditional</span> — fires after **every** completion, regardless of queue state. This is the problem.</span>
 
 <!--
-(45s) The full pipeline. Everything works — until you look at the red box in
-the middle. After every decrypted packet, unconditionally, a worker wakes the
-NAPI. Not "only if the head is ready". After EVERY one. That's the trigger we
-need to look at.
+(45s) Here's the full pipeline. Look at the red box in the middle. After every
+decrypted packet — not "if the head is ready", not "if there's something to
+deliver" — unconditionally, every worker rings the NAPI. That single
+unconditional call is where the bug lives.
 -->
 
 ---
@@ -136,17 +159,28 @@ need to look at.
 ![height:430px](../diagrams/bug_zoom_en.svg)
 
 <!--
-(2m — this is the core, slow down) Here's why that unconditional wake is a
-problem. Two facts together. One: the workqueue decrypts out of order — core 2
-finishes packet 5 before core 0 finishes packet 2. Two: after every completion,
-napi_schedule fires. So the NAPI wakes, looks at the head of the ordered
-queue — packet 2, still encrypted — and returns with work_done = 0. Nothing
-delivered. A wasted wake. And worse: because GRO found nothing to batch, the
-batching benefit is lost too. The bug wastes CPU AND breaks batching. With N
-cores, the head finishes first with probability 1/N — so (N-1)/N wakes are
-wasted. The more cores, the worse it gets.
+(2m — this is the core of the talk, actually slow down here) So here's what
+happens. Two facts collide.
 
-Punchline: "we wake up to deliver, but there's nothing ready at the front."
+Fact one: the workqueue decrypts out of order. Core 2 finishes packet 5 before
+core 0 finishes packet 2.
+
+Fact two: every worker, when it's done, calls napi_schedule unconditionally.
+
+So the NAPI wakes up. It looks at the head of the ordered queue. The head is
+packet 2 — still encrypted. It returns work_done = 0. Nothing delivered. A
+completely wasted softirq pass.
+
+And there's a second cost that's easy to miss: because the NAPI found nothing
+at the head, GRO couldn't batch anything either. So the bug doesn't just waste
+CPU time — it also breaks the batching optimization we just talked about.
+
+With N cores decrypting in parallel, the head packet finishes first with
+probability 1/N. So (N-1)/N wakes are wasted. Eight cores means 87.5% of wakes
+do nothing. And the more peers you have, the more this compounds.
+
+The punchline: we're ringing the doorbell every time any worker finishes, but
+delivery can only start once the first packet in line is ready.
 -->
 
 ---
@@ -167,42 +201,110 @@ if (tail == (struct sk_buff *)&peer->rx_queue.empty ||
 - **Effect:** premature wakes disappear → GRO gets full batches back.
 
 <!--
-(1m) The fix: six lines. Before waking the NAPI, read the consumer cursor of
-the per-peer queue. If the head is still uncrypted, skip the wake — the worker
-that finishes the head will do it. Why is it safe? That cursor is written by
-only one entity, the poll itself, so reading it from a worker is safe as a
-hint. A stale read in the worst case means one missed wake, caught right after
-by NAPI's MISSED mechanism. Expected result: premature wakes gone, GRO gets its
-batches back.
+(1m) The fix is six lines. The idea is almost obvious once you see the bug:
+before waking the NAPI, check whether there's actually something for it to do.
+Read the consumer cursor of the queue. If the head is still uncrypted, skip the
+wake entirely — the worker that eventually finishes the head will do it.
+
+Why is it safe to read that cursor from a worker? Because it's written by only
+one entity — the poll itself. So it's a safe, lock-free hint. The worst case is
+a slightly stale read where we miss a wake. And NAPI handles that: it has an
+internal "MISSED" mechanism that re-runs the poll once if a schedule lands while
+one is already running. No packet ever gets stranded.
+
+The expected result: premature wakes gone, GRO gets its batches back.
 -->
 
 ---
 
-## Results and next steps
+## Results — what the numbers say
 
-**ARM (M1, loopback) — 9–22% fewer wasted polls, batch size up:**
+**On ARM (M1, loopback, 5 runs each):**
 
 | | 1 peer | 8 peers | 32 peers |
 |---|---|---|---|
 | Δ wasted polls | −8.8% | **−21.9%** | **−20.7%** |
 | Batch size | 3.1 → 3.3 | 8.7 → **9.6** | 7.7 → **8.9** |
 
-- Throughput flat — expected on loopback (ChaCha20 is faster than the link).
-- **Honest limit:** the throughput collapse needs a real NIC (25G).
-- **Next:** CloudLab (x86, 25G) to measure the throughput gain.
-- **Prior fix + our fix are orthogonal** — they can be combined.
+- The reduction **grows with peer count** — exactly what the 1/N model predicts.
+- **Batch size rising** is the direct confirmation: GRO is woken less but does more each time.
+- Throughput flat — expected, the loopback never saturates `NET_RX_SOFTIRQ`.
 
 <!--
-(1m15s) On my M1, in a loopback multi-peer setup, the fix reduces wasted polls
-by 9 to 22% — growing with peer count, exactly as the theory predicts. Batch
-size rises in every case, which directly shows GRO is woken less often but with
-more to do each time. Throughput is flat because on a loopback, ChaCha20 is
-fast enough that NET_RX_SOFTIRQ never saturates — the throughput collapse of
-the paper requires a real NIC. I have CloudLab access for that next step.
-And to be clear: the prior fix (cheaper polls) and our fix (fewer polls) are
-independent and can be combined.
+(1m) On my M1 in a loopback setup with multiple peers, the fix consistently
+reduces wasted polls by 9 to 22 percent. The reduction grows with peer count —
+one peer barely moves, eight peers drops by 22%. That's exactly what the 1/N
+model predicts: more peers means more concurrent workers, more out-of-order
+completions, more wasted wakes to eliminate.
 
-Thank you — questions?
+The batch size numbers are what I find most convincing. At 8 peers, each
+useful poll goes from delivering 8.7 packets on average to 9.6. That's direct
+evidence: GRO is woken later, but when it wakes it finds more ready. The
+mechanism works exactly as expected.
+
+Throughput is flat, which is expected — on a loopback, ChaCha20 on the M1 is
+fast enough that the softirq never saturates. The throughput collapse the paper
+saw requires a real NIC pushing traffic faster than the workers can process it.
+I can't reproduce that on a laptop.
+-->
+
+---
+
+## What's next — two open problems
+
+**1. Real hardware validation**
+- CloudLab: x86 server, real **25G NIC**, up to 1,000 peers — the paper's exact regime.
+- Need to confirm the fix actually reduces **throughput collapse**, not just poll counts.
+- Also: does the ARM behavior reproduce on x86? The code is identical, but the out-of-order completion patterns may differ.
+
+**2. A better fix**
+- The current fix wakes on the first ready packet — but one-packet polls don't benefit from GRO at all.
+- The right policy: **wake only when waking pays off** — i.e., when the batching gain outweighs the poll cost.
+- To design that, we need to measure: *how expensive is one poll?* vs *how expensive is one packet delivery + copy to userspace?*
+- Those numbers will tell us whether we need a batching-aware trigger, and what the threshold should be.
+
+<!--
+(1m) So what's still open?
+
+Two things. First, I need to run this on real hardware. I have CloudLab access —
+x86 servers with a real 25G NIC. That's where I can reproduce the paper's regime
+and see whether the fix actually moves the throughput needle, not just the
+poll-count metrics. I genuinely don't know yet whether the 20% fewer polls
+translates to 20% more throughput, or less, or more — it depends on how much
+of the bottleneck was the wasted polls versus something else.
+
+Second, the current fix is correct but not optimal. It wakes as soon as the
+head is ready. But if only the head is ready and nothing behind it, that's a
+one-packet poll with no batching. You've paid the full cost of a softirq pass
+to hand up a single packet. That might be fine — or it might not be. To know,
+I need to measure two costs: the overhead of a poll itself, and the cost of
+delivering and copying a packet to userspace. Those numbers point to a better
+fix: a batching-aware trigger that waits for enough to be ready before waking.
+
+That's the fix I'd actually like to reach. The current one is a safe, correct
+step in that direction.
+-->
+
+---
+
+<!-- _class: lead -->
+
+## Summary
+
+**Understood** the receive pipeline from the source code (NAPI, workqueue, GRO).
+
+**Located** the root cause: one unconditional line that wakes the wrong thing at the wrong time.
+
+**Fixed it** in 6 lines. Confirmed: 9–22% fewer wasted polls on ARM, batch size up.
+
+**Still to do:** real NIC measurements + a batching-aware trigger.
+
+<span class="small">Thank you — questions?</span>
+
+<!--
+(30s) Three things done: understood the mechanism, found the bug, confirmed the
+fix works. And two things still to do: validate on real hardware, and design a
+smarter trigger. That's the natural continuation. Thank you.
 -->
 
 ---
@@ -214,6 +316,13 @@ Thank you — questions?
 - **One** workqueue object (`packet_crypt_wq`, `device.c:346`), shared by all peers.
 - **Per-CPU = the *workers* are per core**: `queue_work_on(cpu, …)` dispatches each item to a specific core. It is **not** N workqueues.
 
+<!--
+It's not N workqueues — there's one object, allocated once. "Per-CPU" describes
+the workers: each core gets one, and WireGuard uses queue_work_on to pin each
+packet to a specific core. The diagram shows it well: one red box, several
+employees.
+-->
+
 ---
 
 <!-- _header: "APPENDIX" -->
@@ -224,6 +333,15 @@ Thank you — questions?
 → `wg_packet_rx_poll` → `napi_complete_done` → `napi_disable` → `netif_napi_del`
 
 The poll runs at the next `spin_unlock_bh` in the worker loop — not immediately.
+
+<!--
+The full lifecycle in seven steps. The one people get wrong is napi_schedule:
+it doesn't run anything. It sets a bit and raises NET_RX_SOFTIRQ. The actual
+poll runs at the next point where the worker re-enables bottom halves —
+specifically, the spin_unlock_bh at the end of each loop iteration. That's why
+calling napi_schedule from inside the worker loop produces a poll that runs
+almost immediately, but not synchronously.
+-->
 
 ---
 
@@ -251,3 +369,12 @@ kretprobe:wg_packet_rx_poll { @work_done = lhist(retval, 0, 64, 8); }
 
 - **Spike in bucket 0** = wasted wakes (EoI signature).
 - The fix must **collapse bucket 0** and shift mass to > 1 (real batches).
+
+<!--
+One line of bpftrace traces the return value of wg_packet_rx_poll — that's
+work_done, the number of packets delivered in each pass. A histogram of that
+value tells the whole story: if the EoI is happening, you see a massive spike
+at zero. The fix should make that spike disappear and push the mass toward
+larger values. It's a direct, architecture-independent measurement of the
+mechanism. Works the same on ARM and x86.
+-->
