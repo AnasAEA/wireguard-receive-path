@@ -1,5 +1,5 @@
 # Internship Tracker — io_uring / WireGuard Performance Research
-# Inria KrakOS Team (LIG), Grenoble — Last updated: May 29, 2026
+# Inria KrakOS Team (LIG), Grenoble — Last updated: June 6, 2026
 
 ---
 
@@ -8,7 +8,7 @@
 | Field | Details |
 |---|---|
 | Organization | Inria KrakOS Team (LIG), Grenoble |
-| Duration | January 2026 – July 2026 |
+| Duration | January 2026 – July 31, 2026 (Extended) |
 | Supervisor | André Freyssinet (ScalAgent) |
 | Team Lead | Alain Tchana (Ensimag) |
 | Bureau | 225, Inria |
@@ -32,13 +32,10 @@
 
 | Date | Deliverable |
 |---|---|
-| **May 29** | Register for defenses |
-| **May 30, 15h** | Visio with Teo (jitsi: `meet.jit.si/reuProjetCryptOnce`) — CloudLab + WireGuard setup (moved from 11h) |
-| **June 1 (Monday)** | Present code changes + M1 results + CloudLab plan to Alain + André |
-| **June 5, noon** | Final report (6 pages, Moodle 295) |
+| **June 5, noon** | Final report (6 pages, Moodle 295) — ✅ Submitted |
 | **June 8** | Defense slides |
 | **June 10, 16h–16h30** | Defense — confirmed with André — **salle F117** (Wed–Thu = F117, Fri = F115) |
-| **End of July** | Full solution + deeper analysis (post-defense continuation) |
+| **July 31** | End of internship: Full CloudLab measurements, evaluate combined fixes (ours + paper's), and further analysis. |
 
 ---
 
@@ -54,54 +51,36 @@
 | — | May 21 meeting — EoI proof + blocking analysis | May 21, 9h | ✅ Done — new direction agreed |
 | 2. Design | Pipeline internals verified; André solution diff written + verified | May 22 | ✅ Done |
 | — | Pipeline diagrams (all 7 figures generated + approved) | May 23 | ✅ Done |
-| 3. Implement | Apply diff to kernel source, compile, test correctness | Next at bureau | ⬜ |
-| 4. Measure | Baseline + patched throughput + latency; compare vs paper fix | Next at bureau | ⬜ |
-| 5. Report | Final report + defense slides | June 5 / June 8 | 🟡 In progress |
+| 3. Implement | Apply diff to kernel source, compile, test correctness | May 27 | ✅ Done |
+| 4. Measure | Baseline + patched throughput + latency on M1 | May 28 | ✅ Done |
+| 5. Report | Final report (Moodle 295) | June 5 | ✅ Submitted |
+| — | Defense presentation & slides | June 8 | 🟡 Trimming to 10 min |
+| 6. CloudLab | Deep saturation measurements & combination with paper's fix | July 2026 | ⬜ Pending Account Approval |
 
 ---
 
-## Current — June 1 (Monday, bureau)
+## Current — June 6 (Saturday, library)
 
-### Done (May 23–28)
-- ✅ All 7 diagrams generated and approved
-- ✅ Report started: Abstract + Introduction + Background written (`report/main.tex`)
-- ✅ Meeting May 26 with André: defense slot confirmed — **June 10, 16h–16h30**
-- ✅ Compilation + test guide written (`admin/COMPILATION_AND_TEST_GUIDE.md`)
-- ✅ **May 28: patched module built + loaded; full measurement campaign run** (1→64 peers, CPU-pinning, ctx-switch/migration probes). See `admin/EXPERIMENTS_2026-05-28.md`.
+### Done (June 1–5)
+- ✅ **Final report (6 pages)** submitted on time to Moodle 295 (June 5).
+- ✅ **Team Presentation (June 4):** Presented the defense slides to the KrakOS team. The presentation was very well-received and effective, but took ~13 minutes (target is 10 minutes max).
+- ✅ **CloudLab Setup Initiated:** Alain successfully created the new project "WG" in CloudLab, and it got accepted.
+- ✅ **Internship Extension Confirmed:** Spoke with Alain. The internship is extended to July 31. The primary goal for this post-defense period is to run thorough real-NIC measurements on CloudLab, extract concrete results on how our solution performs under saturation, explore further improvements, and try combining our conditional check with the paper's dedicated workqueue fix.
 
-### First-pass findings (May 28)
-- Patch works as designed: total GRO invocations −14–20% at 8–32 peers; wasted polls −22–24%.
-- Tail latency halved at 64 peers (~82ms → ~43ms). Strongest positive result.
-- Throughput flat — never the bottleneck on M1 loopback; paper's saturation regime unreachable.
-- **Honest weaknesses:** high run-to-run variance (uncontrolled E-cores / governor), only 1–3 runs, a possible −7.7% throughput regression at 48 peers that needs statistics, and proxy metrics instead of direct softirq time.
+### Today — June 6 (Saturday, library)
+1. ⬜ **Trim Defense Presentation:** Cut the current 13-minute presentation (`admin/SLIDES_DEFENSE_EN.md` / `admin/SPEAKER_NOTES_EN.md`) down to exactly 10 minutes max.
+2. ⬜ Check CloudLab account status periodically (currently pending: "Your account has not been approved yet!").
 
-### MAJOR — CloudLab access secured (May 29 meeting with Alain)
+### Remaining Pre-Defense (June 8 – June 10)
+- ⬜ Finalize and submit defense slides (June 8).
+- ⬜ **June 10, 16h–16h30:** Final Defense (Salle F117).
 
-- Teo has a WireGuard testbed: **reserve 3 real machines on CloudLab**, run real-NIC measurements there.
-- Alain is giving access via **his CloudLab account** (faster than requesting our own).
-- **Visio with Teo tomorrow morning (May 30, time TBC):** how to use CloudLab, set up WireGuard on the machines, run the measurements.
-- **This dissolves the central limitation:** CloudLab = real NICs + many clients → the saturation regime the M1 loopback could never reach. Real throughput numbers become possible.
-- **Strategy shift:** CloudLab is now the main event for throughput. The local M1 work (variance-controlled runs, direct metrics) stays valuable as mechanism evidence; the delay-sweep becomes a *complement/backup*, not the headline.
-
-### Done (May 29–31)
-- ✅ Built v2 harness (variance control, direct metrics, delay-sweep) + runbook.
-- ✅ Visio with Teo (May 30, 15h): CloudLab walkthrough. Recommended node `c220g2`; topology 1 server + 2 clients; `rsync` to copy files; multi-namespace clients (each peer = its own allowed-ips), routing on the target.
-- ✅ Fetched the complete WireGuard module into the repo (`linux-source/`, Asahi) so every claim is backed by an openable line.
-- ✅ **Verified the code transfers to x86/v6.1** (paper's kernel): bug site, fix site, MPSC queue, rx_poll — all byte-identical; only `WQ_PERCPU` flag differs (no behavior change). See `admin/COMPARAISON_CODE_VERSIONS_FR.md` + `reference/wireguard-v6.1-x86/`.
-- ✅ Monday materials written (FR): code walkthrough, presentation, progress report, code-comparison.
-
-### Today — June 1 (Monday)
-1. ⬜ **Register for defenses — overdue, do first**
-2. ⬜ Meeting with Alain + André: present code changes (`admin/PREP_REUNION_ALAIN_CODE_2026-06-01_FR.md`)
-3. ⬜ Get the **CloudLab Project ID** (Alain / Brice / Teo) → finish account, join project
-4. ⬜ Ask: port the paper's fix (dedicated workqueue) for a 3-way comparison on CloudLab?
-5. ⬜ (If time) run the §5 bpftrace context proofs on Fedora so they're shown, not asserted
-
-### Remaining (June 2 – June 5)
-- ⬜ Set up WireGuard on CloudLab (c220g2: 1 server + 2 clients), real-NIC baseline stock vs patched
-- ⬜ Write report sections 3–5 using CloudLab + M1 results
-- ⬜ Full draft → André by June 2–3
-- ⬜ Submit report — June 5, noon, Moodle 295, as `AitElHadj.pdf`
+### Post-Defense (June 11 – July 31)
+- ⬜ Gain access to the CloudLab "WG" project once account is approved.
+- ⬜ Set up WireGuard on CloudLab (c220g2: 1 server + 2 clients), real-NIC baseline stock vs patched.
+- ⬜ Run thorough measurements to extract important results on how our solution performs under saturation.
+- ⬜ Implement and test the combination of our fix (conditional NAPI schedule) with the paper's fix (dedicated `gro_wq`).
+- ⬜ Investigate further improvements to the solution based on CloudLab metrics.
 
 ---
 
@@ -130,15 +109,11 @@
 | napi_schedule calls vs GRO deliveries | bpftrace `napi_poll` tracepoint |
 | work_done = 0 frequency | bpftrace on `wg_packet_rx_poll` return |
 
-### Tracepoints confirmed available
-- `workqueue_queue_work` — moment work enqueued to `packet_crypt_wq`
-- `workqueue_execute_start` — moment worker begins
-- `napi_poll` — each GRO poll invocation (captures `work_done`)
-
 ### Three configurations to compare
 1. **Baseline** — unmodified WireGuard (unconditional `napi_schedule`)
 2. **André's fix** — conditional `napi_schedule` (head-readiness check)
 3. **Paper's fix** — `napi_schedule` → `queue_work_on` on dedicated `gro_wq`
+4. **Combined fix** — applying both our conditional check AND the paper's dedicated workqueue.
 
 ---
 
@@ -149,11 +124,23 @@
 | André Freyssinet | Day-to-day supervisor | Andre.Freyssinet@scalagent.com |
 | Alain Tchana | Team lead (KrakOS) | Ensimag / Grenoble INP |
 | Brice Ekane | Team member | Has WireGuard test environment |
-| Teo Pisenti | PhD, Toulouse-INP / IRIT / équipe SEPIA | CloudLab WireGuard testbed — visio May 30 11h (`meet.jit.si/reuProjetCryptOnce`) |
+| Teo Pisenti | PhD, Toulouse-INP / IRIT / équipe SEPIA | CloudLab WireGuard testbed |
 
 ---
 
 ## Progress log
+
+### June 6, 2026 (Saturday)
+- Working from the library.
+- Main focus: Trimming the defense presentation from 13 minutes down to the required 10 minutes.
+- CloudLab account is still awaiting approval ("Your account has not been approved yet!"). Alain has successfully created the "WG" project.
+
+### June 5, 2026 (Friday)
+- ✅ **Final report submitted** on time to Moodle 295.
+- Spoke with Alain: internship continues until July 31. Goal is to go all the way with CloudLab measurements, extract thorough results, and explore combining our fix with the paper's fix.
+
+### June 4, 2026 (Thursday)
+- Presented the defense slides to the team. The presentation was really good, but ran over time (almost 13 minutes instead of the maximum 10 minutes).
 
 ### June 1, 2026 (Monday)
 

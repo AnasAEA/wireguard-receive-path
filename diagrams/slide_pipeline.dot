@@ -1,0 +1,15 @@
+// Pipeline simplifié pour la diapo 9 (« on assemble ») — 6 blocs, gros texte, paysage
+digraph PIPE {
+  rankdir=LR; fontname="Helvetica"; nodesep=0.45; ranksep=0.55; bgcolor="transparent";
+  node [fontname="Helvetica", fontsize=15, style="rounded,filled", shape=box];
+  edge [fontname="Helvetica", fontsize=12, penwidth=1.6];
+
+  A1 [label="①  NIC : NAPI du pilote\n+ GRO #1 (conditionnel)\nudp_offload.c:800", fillcolor="#dbeafe"];
+  A2 [label="②  WireGuard reçoit →\nmise en file 2 phases :\n• file ORDONNÉE (par pair)\n• queue_work_on(cpu)\nqueueing.h:152", fillcolor="#dbeafe"];
+  B1 [label="③  WORKQUEUE par-CPU\ndéchiffre EN PARALLÈLE\n→ fin DANS LE DÉSORDRE\nreceive.c:493", fillcolor="#fee2e2"];
+  B2 [label="④  ★ napi_schedule\nINCONDITIONNEL\nqueueing.h:196", fillcolor="#fecaca", color="#b91c1c", penwidth=3];
+  C1 [label="⑤  NAPI WireGuard :\nwg_packet_rx_poll\ns'arrête au 1er UNCRYPTED\n→ réveils À VIDE\nreceive.c:451", fillcolor="#dcfce7"];
+  C2 [label="⑥  GRO #2 → application\nreceive.c:411", fillcolor="#dcfce7"];
+
+  A1 -> A2 -> B1 -> B2 -> C1 -> C2;
+}

@@ -1,0 +1,22 @@
+// Zoom « bug EoI » pour la diapo 10 — rendu : dot -Tsvg bug_zoom.dot -o bug_zoom.svg
+digraph BUG {
+  rankdir=TB; fontname="Helvetica"; ranksep=0.55; nodesep=0.4;
+  label="Le bug (EoI) — à la jointure  workqueue → 2ᵉ NAPI";
+  labelloc=t; fontsize=16;
+  node [fontname="Helvetica", fontsize=11, style="rounded,filled", fillcolor=white];
+  edge [fontname="Helvetica", fontsize=10];
+
+  subgraph cluster_wq { label="workqueue par-CPU : déchiffrement EN PARALLÈLE"; style=filled; color="#fee2e2";
+    w0 [label="cœur 0 : paquet n°2\n(PAS encore fini)"];
+    w2 [label="cœur 2 : paquet n°5\nFINI en premier"];
+  }
+  SCHED [label="★ napi_schedule(&peer->napi)\nréveil APRÈS CHAQUE paquet (inconditionnel)\nqueueing.h:196", shape=box, fillcolor="#fecaca", color="#b91c1c", penwidth=3];
+  POLL  [label="wg_packet_rx_poll regarde la TÊTE de la file\ntête = n°2, encore UNCRYPTED → repart À VIDE (work_done = 0)\nreceive.c:451-453", shape=box, fillcolor="#dcfce7"];
+  GRO   [label="conséquence : GRO #2 n'accumule rien → perd ses lots\n(le bug ne gâche pas que du CPU : il casse aussi le regroupement)", shape=note, fillcolor="#fef9c3"];
+  FIX   [label="✔ correctif : lire rx_queue.tail AVANT de réveiller ;\nne réveiller QUE SI la tête est déchiffrée", shape=box, fillcolor="#bbf7d0"];
+
+  w2 -> SCHED [label="finit dans le désordre"];
+  SCHED -> POLL [label="réveille"];
+  POLL -> GRO [style=dashed];
+  POLL -> FIX [style=dashed, label="ce qu'on change"];
+}

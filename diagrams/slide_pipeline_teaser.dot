@@ -1,0 +1,13 @@
+// Teaser « la carte » pour la diapo 4 — 3 gros blocs lisibles de loin
+digraph TEASER {
+  rankdir=LR; fontname="Helvetica"; nodesep=0.6; ranksep=0.8; bgcolor="transparent";
+  node [fontname="Helvetica", fontsize=20, style="rounded,filled", shape=box, width=3.0, height=1.7];
+  edge [fontname="Helvetica", fontsize=17, penwidth=2.2];
+
+  A [label="①  NAPI de la CARTE\nreçoit le paquet chiffré\n+ GRO #1 (conditionnel)", fillcolor="#dbeafe"];
+  B [label="②  WORKQUEUE par-CPU\ndéchiffre EN PARALLÈLE\n(fin dans le désordre)", fillcolor="#fee2e2"];
+  C [label="③  NAPI de WIREGUARD\nremet en ORDRE + GRO #2\n(interface virtuelle wg0)", fillcolor="#dcfce7"];
+
+  A -> B [label="  paquet chiffré  "];
+  B -> C [label="  paquet déchiffré  "];
+}

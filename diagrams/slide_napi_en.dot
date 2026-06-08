@@ -1,0 +1,18 @@
+// NAPI, simplified for slide 6
+digraph NAPISLIDE {
+  rankdir=TB; fontname="Helvetica"; nodesep=0.4; ranksep=0.45; bgcolor="transparent";
+  label="NAPI — ring once, then collect the mailbox in batches";
+  labelloc=t; fontsize=18;
+  node [fontname="Helvetica", fontsize=15, style="rounded,filled", fillcolor="#dbeafe"];
+  edge [fontname="Helvetica", fontsize=12, penwidth=1.6];
+
+  PB [label="WITHOUT NAPI: ring at EVERY packet → \"interrupt storm\" → the CPU collapses", shape=note, fillcolor="#fee2e2"];
+  S1 [label="(1) the doorbell rings ONCE  (then we mute it)", fillcolor="#bfdbfe"];
+  S2 [label="(2) tick \"to do\" + raise a flag (NOTHING runs yet) = napi_schedule"];
+  S3 [label="(3) later: we collect the mailbox = net_rx_action calls poll()"];
+  S4 [label="(4) poll() COLLECTS up to 64 packets (the \"budget\")"];
+  S5 [label="(5) mailbox empty → napi_complete_done: flush GRO, re-arm the doorbell"];
+  KEY [label="NAPI = a RECORD + a FUNCTION (NOT a running program) - runs in a softirq", shape=note, fillcolor="#fef9c3"];
+
+  PB -> S1 -> S2 -> S3 -> S4 -> S5 -> KEY;
+}

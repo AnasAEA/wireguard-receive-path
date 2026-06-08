@@ -496,7 +496,7 @@ void wg_packet_decrypt_worker(struct work_struct *work)
 						 work)->ptr;
 	struct sk_buff *skb;
 
-	while ((skb = ptr_ring_consume_bh(&queue->ring)) != NULL) { // spinlock untill we get a packet
+	while ((skb = ptr_ring_onsume_bh(&queue->ring)) != NULL) { // spinlock untill we get a packet
 		enum packet_state state =
 			likely(decrypt_packet(skb, PACKET_CB(skb)->keypair)) ?
 				PACKET_STATE_CRYPTED : PACKET_STATE_DEAD;

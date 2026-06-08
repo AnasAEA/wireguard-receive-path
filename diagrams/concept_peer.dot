@@ -1,0 +1,32 @@
+digraph PEER {
+  rankdir=TB; fontname="Helvetica"; ranksep=0.5; nodesep=0.45;
+  label="Le « pair » — VPN : avec qui je parle ? Une wg0, beaucoup de correspondants";
+  labelloc=t; fontsize=14;
+  node [fontname="Helvetica", fontsize=10, style="rounded,filled", fillcolor=white];
+  edge [fontname="Helvetica", fontsize=9];
+
+  WG [label="wg0 — la « porte du tunnel » (interface VIRTUELLE, logicielle)\nelle tient la LISTE de tous les correspondants (peer_list)", shape=box, fillcolor="#bfdbfe"];
+
+  subgraph cluster_p1 { label="Correspondant n°1 = une FICHE  (struct wg_peer — peer.h:37)"; style=filled; color="#ede9fe";
+    P1 [label="carte d'identité = clé publique  (PAS l'adresse IP, qui peut changer)\nadresse du moment · IP autorisées (peer.h:64) · clés de session (peer.h:43)", fillcolor=white];
+    Q1 [label="SA file d'attente\n(à livrer DANS L'ORDRE) — peer.h:39", shape=cylinder, fillcolor="#fde68a"];
+    N1 [label="SA boîte + sonnette\n(napi) — peer.h:65", shape=box, fillcolor="#dcfce7"];
+    P1 -> Q1 [style=invis]; P1 -> N1 [style=invis];
+  }
+  subgraph cluster_pN { label="Correspondant n°N  (… jusqu'à 1000 dans l'article)"; style=filled; color="#ede9fe";
+    PN [label="clé publique · adresse · IP autorisées · clés", fillcolor=white];
+    QN [label="SA file (ordonnée)", shape=cylinder, fillcolor="#fde68a"];
+    NN [label="SA napi", shape=box, fillcolor="#dcfce7"];
+    PN -> QN [style=invis]; PN -> NN [style=invis];
+  }
+
+  WQ [label="UN SEUL atelier de déchiffrement, PARTAGÉ par TOUS les correspondants\n(workqueue par-CPU, packet_crypt_wq — device.c:346)", shape=cylinder, fillcolor="#fee2e2"];
+
+  WG -> P1;
+  WG -> PN [label="…  N correspondants"];
+  Q1 -> WQ [style=dashed, label="à déchiffrer"];
+  QN -> WQ [style=dashed];
+
+  NOTE [label="CHAQUE correspondant a SA file + SA sonnette → l'ordre (et le bug) est PAR correspondant.\nMais l'atelier est UNIQUE et partagé → plus il y a de correspondants, plus ça s'emmêle.\n1 correspondant : on ne voit rien.  8 / 16 / 32… : la régression apparaît et grandit.", shape=note, fillcolor="#fee2e2"];
+  WQ -> NOTE [style=invis];
+}

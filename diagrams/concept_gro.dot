@@ -1,0 +1,26 @@
+digraph GRO {
+  rankdir=LR; fontname="Helvetica"; ranksep=0.6; nodesep=0.3;
+  label="GRO — agrafer les enveloppes d'un même destinataire, ne monter l'escalier qu'UNE fois";
+  labelloc=t; fontsize=14;
+  node [fontname="Helvetica", fontsize=10, style="rounded,filled", fillcolor=white];
+  edge [fontname="Helvetica", fontsize=9];
+
+  COST [label="Monter un paquet dans la pile = un « péage » FIXE,\npayé à CHAQUE paquet (peu importe sa taille).\n40 petits paquets = 40 péages = embouteillage.", shape=note, fillcolor="#fee2e2"];
+
+  subgraph cluster_in { label="4 enveloppes du MÊME destinataire (même flux)"; style=filled; color="#dbeafe";
+    p1[label="enveloppe 1"]; p2[label="enveloppe 2"]; p3[label="enveloppe 3"]; p4[label="enveloppe 4"];
+  }
+  GRO   [label="On les AGRAFE au lieu de monter tout de suite\n= napi_gro_receive (les empile dans la napi)\nnetdevice.h:4251 ; chez WG : receive.c:411", shape=hexagon, fillcolor="#dcfce7"];
+  BIG   [label="UN seul gros colis\n(1+2+3+4)", shape=box, fillcolor="#bbf7d0"];
+  FLUSH [label="Quand la relève finit : on monte le colis\n= napi_complete_done → gro_flush_normal (dev.c:6803)", shape=box, fillcolor="#dcfce7"];
+  STACK [label="pile / application\nUN seul voyage d'escalier au lieu de 4\n(1 péage au lieu de 4)", shape=box, fillcolor="#eeeeee"];
+
+  COST -> p1 [style=invis];
+  p1->GRO; p2->GRO; p3->GRO; p4->GRO;
+  GRO->BIG->FLUSH->STACK;
+
+  FRONTS [label="DEUX moments GRO chez WireGuard :\nFront #1 = enveloppe EXTERNE chiffrée (côté carte) — CONDITIONNEL, WG ne l'active pas (udp_offload.c:800)\nFront #2 = lettre INTERNE déchiffrée (côté wg0) — fait EXPLICITEMENT par WG (receive.c:411)", shape=note, fillcolor="#fef9c3"];
+  BUG    [label="Lien avec le bug : si on « ferme le colis » trop tôt (réveil à vide, work_done=0),\non n'a rien agrafé → GRO #2 perd ses gros colis → on perd la performance.", shape=note, fillcolor="#fee2e2"];
+  STACK -> FRONTS [style=invis];
+  FRONTS -> BUG [style=invis];
+}

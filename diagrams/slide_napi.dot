@@ -1,0 +1,18 @@
+// NAPI simplifié pour la diapo 6 — gros texte, peu de boîtes
+digraph NAPISLIDE {
+  rankdir=TB; fontname="Helvetica"; nodesep=0.4; ranksep=0.45; bgcolor="transparent";
+  label="NAPI — sonner UNE fois, puis relever la boîte par lots";
+  labelloc=t; fontsize=18;
+  node [fontname="Helvetica", fontsize=15, style="rounded,filled", fillcolor="#dbeafe"];
+  edge [fontname="Helvetica", fontsize=12, penwidth=1.6];
+
+  PB [label="SANS NAPI : sonner à CHAQUE paquet → « interrupt storm » → le CPU s'effondre", shape=note, fillcolor="#fee2e2"];
+  S1 [label="① la sonnette retentit UNE fois  (puis on la COUPE)", fillcolor="#bfdbfe"];
+  S2 [label="② on coche « à faire » + on lève un drapeau (RIEN ne tourne encore) = napi_schedule"];
+  S3 [label="③ plus tard : on relève la boîte = net_rx_action appelle poll()"];
+  S4 [label="④ poll() RAMASSE jusqu'à 64 paquets (le « budget »)"];
+  S5 [label="⑤ boîte vide → napi_complete_done : vide le GRO, RÉACTIVE la sonnette"];
+  KEY [label="NAPI = une FICHE + une FONCTION (PAS un thread) — tourne en softirq", shape=note, fillcolor="#fef9c3"];
+
+  PB -> S1 -> S2 -> S3 -> S4 -> S5 -> KEY;
+}

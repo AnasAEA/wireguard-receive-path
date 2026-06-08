@@ -1,0 +1,55 @@
+digraph WG_RX {
+  rankdir=TB; compound=true; fontname="Helvetica"; ranksep=0.55; nodesep=0.4;
+  node [fontname="Helvetica", fontsize=10, style="rounded,filled", fillcolor=white];
+  edge [fontname="Helvetica", fontsize=9];
+
+  subgraph cluster0 { label="① Matériel + IRQ"; style=filled; color="#eeeeee";
+    H [label="NIC reçoit UDP chiffré", shape=parallelogram, fillcolor="#dddddd"];
+  }
+  subgraph cluster1 { label="② Softirq NET_RX — NAPI pilote NIC (EXTERNES chiffrés)"; style=filled; color="#dbeafe";
+    PNIC  [label="poll() du pilote NIC"];
+    GRO1  [label="GRO #1 (CONDITIONNEL)\nudp_gro_receive\nudp_offload.c:785 / :800-815", shape=hexagon, fillcolor="#bfdbfe"];
+    ENCAP [label="encap_rcv = wg_receive\nsocket.c:355-356 -> :316"];
+    RECV  [label="wg_packet_receive\nreceive.c:542 (MESSAGE_DATA :574)"];
+    CONS  [label="wg_packet_consume_data\nreceive.c:509"];
+    ENQ2  [label="enqueue_per_device_and_peer\nqueueing.h:152 (2 phases)"];
+  }
+  subgraph cluster_d { label="◆ Structures de données partagées"; style=filled; color="#fef9c3";
+    RXQ  [label="peer->rx_queue\nMPSC ORDONNÉE (par pair)", shape=cylinder, fillcolor="#fde68a"];
+    RING [label="decrypt_queue.ring\nptr_ring global",        shape=cylinder, fillcolor="#fde68a"];
+    WQD  [label="packet_crypt_wq\nworkqueue PAR-CPU\ndevice.c:346", shape=cylinder, fillcolor="#fde68a"];
+  }
+  subgraph cluster2 { label="③ Workqueue wg-crypt — un worker PAR CPU"; style=filled; color="#fee2e2";
+    WORK  [label="wg_packet_decrypt_worker\nreceive.c:493"];
+    DEC   [label="decrypt_packet :501\n-> CRYPTED / DEAD"];
+    ENQRX [label="enqueue_per_peer_rx\nqueueing.h:188"];
+    SCHED [label="★ napi_schedule(&peer->napi)\nqueueing.h:196 — SITE DU BUG", shape=box, style="rounded,filled", fillcolor="#fecaca", color="#b91c1c", penwidth=3];
+  }
+  subgraph cluster3 { label="④ Softirq NET_RX — NAPI WireGuard par pair (INTERNES déchiffrés)"; style=filled; color="#dcfce7";
+    SOFT   [label="____napi_schedule dev.c:4957\npoll_list :4984 + raise softirq :4990"];
+    NRX    [label="net_rx_action dev.c:7914\n-> napi_poll -> poll()"];
+    RXPOLL [label="wg_packet_rx_poll receive.c:438\nstop au 1er UNCRYPTED :451-453"];
+    DONE   [label="consume_data_done receive.c:335\nskb->dev = wg0 :375"];
+    GRO2   [label="GRO #2 napi_gro_receive(&peer->napi)\nreceive.c:411", shape=hexagon, fillcolor="#bbf7d0"];
+  }
+  subgraph cluster4 { label="⑤ Hôte"; style=filled; color="#eeeeee";
+    APP [label="pile IP hôte -> application", fillcolor="#dddddd"];
+  }
+
+  H -> PNIC [style=bold, label="IRQ→softirq"];
+  PNIC -> GRO1 -> ENCAP -> RECV -> CONS -> ENQ2;
+  ENQ2 -> RXQ  [style=dashed, label="Phase1: enqueue (ORDRE)\nUNCRYPTED"];
+  ENQ2 -> RING [style=dashed, label="Phase2: ptr_ring_produce"];
+  ENQ2 -> WQD  [style=bold,   label="queue_work_on(cpu)\ntourniquet :168-171"];
+  WQD  -> WORK [style=bold,   label="réveille worker du CPU"];
+  WORK -> RING [style=dashed, label="ptr_ring_consume :499"];
+  WORK -> DEC -> ENQRX -> SCHED;
+  ENQRX -> RXQ [style=dashed, label="écrit état CRYPTED/DEAD"];
+  SCHED -> SOFT;
+  SOFT -> NRX  [style=bold,   label="raise NET_RX softirq"];
+  NRX  -> RXPOLL;
+  RXPOLL -> RXQ  [style=dashed, label="peek tête (curseur tail) :451"];
+  RXPOLL -> DONE [label="paquet prêt"];
+  RXPOLL -> RXPOLL [style=dashed, color="#b91c1c", label="tête UNCRYPTED → work_done=0 ⚡ EoI"];
+  DONE -> GRO2 -> APP;
+}

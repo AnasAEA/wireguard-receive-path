@@ -1,0 +1,16 @@
+// Workqueue simplifiée pour la diapo 7 — gros texte
+digraph WQSLIDE {
+  rankdir=TB; fontname="Helvetica"; nodesep=0.45; ranksep=0.5; bgcolor="transparent";
+  label="Workqueue — confier le travail LONG à un « bureau à l'arrière »";
+  labelloc=t; fontsize=18;
+  node [fontname="Helvetica", fontsize=15, style="rounded,filled", fillcolor="#dbeafe"];
+  edge [fontname="Helvetica", fontsize=12, penwidth=1.6];
+
+  SOFT [label="l'ACCUEIL (softirq) : interdit d'y faire du travail LONG\n→ on ne peut PAS déchiffrer ici"];
+  HAND [label="on POSE le travail sur un cœur précis = queue_work_on(cpu)  (queueing.h:171)"];
+  WQ   [label="le BUREAU À L'ARRIÈRE : workqueue par-CPU = UN employé (thread) PAR CŒUR", shape=cylinder, fillcolor="#fee2e2"];
+  OOO  [label="ils déchiffrent EN MÊME TEMPS → fin DANS LE DÉSORDRE  ← la graine du bug", shape=note, fillcolor="#fef9c3"];
+  SCHED [label="chaque employé qui a fini SONNE la NAPI du pair = napi_schedule", fillcolor="#dcfce7"];
+
+  SOFT -> HAND -> WQ -> OOO -> SCHED;
+}

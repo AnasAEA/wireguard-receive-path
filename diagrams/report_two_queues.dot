@@ -1,0 +1,26 @@
+// Figure rapport — les deux files et leurs deux rôles (§2.1)
+// rendu : dot -Tpdf report_two_queues.dot -o report_two_queues.pdf
+digraph TWOQUEUES {
+  rankdir=TB; fontname="Helvetica"; nodesep=0.45; ranksep=0.5; bgcolor="white";
+  node [fontname="Helvetica", fontsize=11, style="rounded,filled", fillcolor=white];
+  edge [fontname="Helvetica", fontsize=10];
+
+  PKT [label="incoming packet (from peer A)", shape=box, fillcolor="#eeeeee"];
+
+  PEERQ [label="per-peer RX queue  (prev_queue)\nROLE: delivery ORDER\narrival order · state = UNCRYPTED", shape=cylinder, fillcolor="#dbeafe"];
+  RING  [label="global device ring  (ptr_ring)\nROLE: which CPU decrypts\nround-robin across cores", shape=cylinder, fillcolor="#fef3c7"];
+
+  subgraph cluster_cpus {
+    label="decrypt workers — one per core (run concurrently)"; style=filled; color="#fee2e2"; fontsize=10;
+    c0[label="CPU 0"]; c1[label="CPU 1"]; c2[label="CPU 2"]; c3[label="CPU 3"];
+  }
+
+  POLL  [label="wg_packet_rx_poll\nreads the HEAD, delivers in order, stops at first UNCRYPTED", shape=box, fillcolor="#dcfce7"];
+  STACK [label="network stack (GRO)", shape=box, fillcolor="#eeeeee"];
+
+  PKT -> PEERQ [label="  Phase 1 (fix order)  "];
+  PKT -> RING  [label="  Phase 2 (pick CPU)  "];
+  RING -> c0; RING -> c1; RING -> c2; RING -> c3;
+  c1 -> PEERQ [style=dashed, label="  workers flip state\n  UNCRYPTED → CRYPTED  ", constraint=false];
+  PEERQ -> POLL -> STACK;
+}

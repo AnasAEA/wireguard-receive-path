@@ -1,0 +1,15 @@
+// GRO, simplified for slide 8 — vertical, big text
+digraph GROSLIDE {
+  rankdir=TB; fontname="Helvetica"; nodesep=0.4; ranksep=0.5; bgcolor="transparent";
+  node [fontname="Helvetica", fontsize=16, style="rounded,filled", fillcolor=white];
+  edge [fontname="Helvetica", fontsize=13, penwidth=1.6];
+
+  IN  [label="4 packets of the SAME flow  (packet 1 - 2 - 3 - 4)", fillcolor="#dbeafe"];
+  GRO [label="STAPLE them instead of going up right away\n= napi_gro_receive   (receive.c:411)", shape=hexagon, fillcolor="#dcfce7"];
+  BIG [label="ONE big parcel  (1+2+3+4)", fillcolor="#bbf7d0"];
+  UP  [label="napi_complete_done → gro_flush_normal:\nONE trip up the stack instead of 4\n(the per-packet \"toll\" is paid once)", fillcolor="#dcfce7"];
+  FRONTS [label="2 fronts in WireGuard:\n#1 external encrypted (NIC) - CONDITIONAL\n#2 internal decrypted (wg0) - EXPLICIT", shape=note, fillcolor="#fef9c3"];
+
+  IN -> GRO -> BIG -> UP;
+  UP -> FRONTS [style=invis];
+}

@@ -1,0 +1,16 @@
+// Workqueue, simplified for slide 7
+digraph WQSLIDE {
+  rankdir=TB; fontname="Helvetica"; nodesep=0.45; ranksep=0.5; bgcolor="transparent";
+  label="Workqueue — hand LONG work to a \"back office\"";
+  labelloc=t; fontsize=18;
+  node [fontname="Helvetica", fontsize=15, style="rounded,filled", fillcolor="#dbeafe"];
+  edge [fontname="Helvetica", fontsize=12, penwidth=1.6];
+
+  SOFT [label="the FRONT DESK (softirq): not allowed to do LONG work / to \"take a pause\"\n→ we CANNOT decrypt here"];
+  HAND [label="we DROP the work on a specific core = queue_work_on(cpu)  (queueing.h:171)"];
+  WQ   [label="the BACK OFFICE: per-CPU workqueue = ONE worker (thread) PER CORE", shape=cylinder, fillcolor="#fee2e2"];
+  OOO  [label="they decrypt AT THE SAME TIME → finish OUT OF ORDER  ← the seed of the bug", shape=note, fillcolor="#fef9c3"];
+  SCHED [label="each finished worker RINGS the peer's NAPI = napi_schedule", fillcolor="#dcfce7"];
+
+  SOFT -> HAND -> WQ -> OOO -> SCHED;
+}

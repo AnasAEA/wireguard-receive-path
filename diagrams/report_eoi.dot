@@ -1,0 +1,29 @@
+// Figure rapport — Execution Order Inversion: concurrent decryption -> wasted poll
+// rendu : dot -Tpdf report_eoi.dot -o report_eoi.pdf
+digraph EOI {
+  rankdir=TB; fontname="Helvetica"; nodesep=0.5; ranksep=0.5; bgcolor="white";
+  node [fontname="Helvetica", fontsize=11];
+  edge [fontname="Helvetica", fontsize=10];
+
+  A [shape=box, style="rounded,filled", fillcolor="#eeeeee",
+     label="Peer A: packets 0, 1, 2, 3 arrive in order"];
+
+  subgraph cluster_cpu {
+    label="(1) dispatched round-robin, decrypted concurrently";
+    style=filled; color="#fee2e2"; fontsize=10;
+    c0 [shape=box, style="rounded,filled", fillcolor=white, label="CPU 0\npkt 0\nrunning"];
+    c1 [shape=box, style="rounded,filled", fillcolor=white, label="CPU 1\npkt 1\nrunning"];
+    c2 [shape=box, style="rounded,filled", fillcolor="#bbf7d0", label="CPU 2\npkt 2\nfinishes first"];
+    c3 [shape=box, style="rounded,filled", fillcolor=white, label="CPU 3\npkt 3\nrunning"];
+  }
+
+  Q [shape=record, style=filled, fillcolor="#dbeafe",
+     label="(2) per-peer RX queue (head at top)|{<h>pkt 0\nUNCRYPTED|pkt 1\nUNCRYPTED|pkt 2\nCRYPTED|pkt 3\nUNCRYPTED}"];
+
+  P [shape=box, style="rounded,filled", fillcolor="#fef9c3",
+     label="(3) napi_schedule (fired by CPU 2) runs wg_packet_rx_poll\nhead = pkt 0 is UNCRYPTED  ->  stop  ->  work_done = 0 (wasted)\npkt 2 is decrypted, but unreachable behind the head"];
+
+  A -> c0; A -> c1; A -> c2; A -> c3;
+  c2 -> Q:h [style=dashed, label=" marks pkt 2 CRYPTED "];
+  Q -> P;
+}

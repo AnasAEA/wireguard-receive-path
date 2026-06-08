@@ -1,0 +1,46 @@
+// Three kernel engines — overview slide (landscape, slide-friendly)
+digraph ENGINES {
+  rankdir=TB; fontname="Helvetica"; bgcolor="transparent";
+  nodesep=0.7; ranksep=0.8;
+  node [fontname="Helvetica", fontsize=14, style="filled", shape=box, width=3.6, height=2.5, fixedsize=true];
+  edge [fontname="Helvetica", fontsize=12, penwidth=1.8, color="#64748b"];
+
+  NAPI [label=<
+    <table border="0" cellborder="0" cellspacing="3">
+      <tr><td align="center"><b>NAPI — the doorbell</b></td></tr>
+      <tr><td align="center">Ring ONCE, mute,<br/>collect a batch</td></tr>
+      <tr><td align="center"><font color="#475569">(not one interrupt per packet)</font></td></tr>
+      <tr><td align="center"> </td></tr>
+      <tr><td align="center"><font color="#b91c1c">napi_schedule only sets a flag<br/>+ raises a softirq — poll runs LATER</font></td></tr>
+    </table>>, fillcolor="#dbeafe", color="#3b82f6", penwidth=2];
+
+  WQ [label=<
+    <table border="0" cellborder="0" cellspacing="3">
+      <tr><td align="center"><b>Workqueue — the workshop</b></td></tr>
+      <tr><td align="center">Decryption (ChaCha20-Poly1305)<br/>too heavy for the softirq</td></tr>
+      <tr><td align="center"><font color="#475569">→ background threads</font></td></tr>
+      <tr><td align="center"> </td></tr>
+      <tr><td align="center"><font color="#b91c1c">ONE worker per core → IN PARALLEL<br/>→ finish OUT OF ORDER</font></td></tr>
+    </table>>, fillcolor="#fee2e2", color="#ef4444", penwidth=2];
+
+  GRO [label=<
+    <table border="0" cellborder="0" cellspacing="3">
+      <tr><td align="center"><b>GRO — the stapler</b></td></tr>
+      <tr><td align="center">Traversing the stack costs the<br/>same fixed price per packet</td></tr>
+      <tr><td align="center"><font color="#475569">→ staple same-flow packets</font></td></tr>
+      <tr><td align="center"> </td></tr>
+      <tr><td align="center"><font color="#15803d">One trip up the stack<br/>instead of N</font></td></tr>
+    </table>>, fillcolor="#dcfce7", color="#22c55e", penwidth=2];
+
+  {rank=same; NAPI -> WQ -> GRO;}
+
+  SEED [label=<
+    <table border="0" cellborder="0" cellspacing="2">
+      <tr><td align="center"><b>The contrast that seeds the bug</b></td></tr>
+      <tr><td align="center">ONE shared workshop&#160;&#160;·&#160;&#160;but each peer has its OWN ordered queue + its OWN NAPI</td></tr>
+    </table>>, shape=box, style="rounded,filled", fillcolor="#fef9c3", color="#ca8a04", penwidth=2, fontsize=14, width=8.0, height=0.9];
+
+  NAPI -> SEED [style=invis];
+  WQ -> SEED [style=invis];
+  GRO -> SEED [style=invis];
+}

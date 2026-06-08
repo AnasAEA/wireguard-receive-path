@@ -1,0 +1,24 @@
+digraph WQ {
+  rankdir=TB; fontname="Helvetica"; ranksep=0.5; nodesep=0.4;
+  label="Workqueue — l'accueil ne peut pas traiter une tâche longue : on confie au bureau à l'arrière";
+  labelloc=t; fontsize=14;
+  node [fontname="Helvetica", fontsize=10, style="rounded,filled", fillcolor=white];
+  edge [fontname="Helvetica", fontsize=9];
+
+  SOFT [label="L'ACCUEIL (softirq NET_RX)\ninterdit d'y rester longtemps / d'y « faire une pause »\n→ on NE PEUT PAS déchiffrer ici (calcul trop long)", shape=box, fillcolor="#dbeafe"];
+  HAND [label="On POSE le dossier sur un bureau précis\n= queue_work_on(cpu, …) — queueing.h:171", shape=box, fillcolor="#dbeafe"];
+  WQ   [label="LE BUREAU À L'ARRIÈRE (workqueue packet_crypt_wq — device.c:346)\nPERCPU = un employé par cœur · CPU_INTENSIVE = ne pénalise pas les autres · MEM_RECLAIM = employé de secours", shape=cylinder, fillcolor="#fee2e2"];
+
+  subgraph cluster_workers { label="de VRAIS employés (threads), UN PAR CŒUR — ils ont le temps (peuvent dormir)"; style=filled; color="#fee2e2";
+    w0 [label="employé cœur 0\ndéchiffre — wg_packet_decrypt_worker (receive.c:493)", fillcolor=white];
+    w1 [label="employé cœur 1\ndéchiffre", fillcolor=white];
+    w2 [label="employé cœur 2\ndéchiffre", fillcolor=white];
+  }
+  OOO   [label="ils déchiffrent EN MÊME TEMPS → ils finissent DANS LE DÉSORDRE\n(le cœur 2 finit le n°5 avant que le cœur 0 finisse le n°2)\n← c'est la GRAINE du bug", shape=note, fillcolor="#fef9c3"];
+  SCHED [label="chaque employé qui a fini SONNE la boîte du correspondant\n= napi_schedule(&peer->napi) — queueing.h:196 → (étape suivante)", shape=box, fillcolor="#dcfce7"];
+
+  SOFT -> HAND -> WQ;
+  WQ -> w0; WQ -> w1; WQ -> w2;
+  w0 -> OOO; w1 -> OOO; w2 -> OOO;
+  OOO -> SCHED;
+}

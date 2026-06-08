@@ -1,0 +1,22 @@
+// "EoI bug" zoom for slide 10
+digraph BUG {
+  rankdir=TB; fontname="Helvetica"; ranksep=0.55; nodesep=0.4;
+  label="The bug (EoI) — at the seam  workqueue → 2nd NAPI";
+  labelloc=t; fontsize=16;
+  node [fontname="Helvetica", fontsize=11, style="rounded,filled", fillcolor=white];
+  edge [fontname="Helvetica", fontsize=10];
+
+  subgraph cluster_wq { label="per-CPU workqueue: decryption IN PARALLEL"; style=filled; color="#fee2e2";
+    w0 [label="core 0: packet 2\n(NOT done yet)"];
+    w2 [label="core 2: packet 5\nfinishes first"];
+  }
+  SCHED [label="napi_schedule(&peer->napi)\nwakes AFTER EVERY packet (unconditional)\nqueueing.h:196", shape=box, fillcolor="#fecaca", color="#b91c1c", penwidth=3];
+  POLL  [label="wg_packet_rx_poll looks at the HEAD of the queue\nhead = packet 2, still UNCRYPTED → returns EMPTY (work_done = 0)\nreceive.c:451-453", shape=box, fillcolor="#dcfce7"];
+  GRO   [label="consequence: GRO #2 batches nothing → loses its groups\n(the bug wastes more than CPU: it also breaks batching)", shape=note, fillcolor="#fef9c3"];
+  FIX   [label="fix: read rx_queue.tail BEFORE waking;\nwake ONLY IF the head is decrypted", shape=box, fillcolor="#bbf7d0"];
+
+  w2 -> SCHED [label="finishes out of order"];
+  SCHED -> POLL [label="wakes"];
+  POLL -> GRO [style=dashed];
+  POLL -> FIX [style=dashed, label="what we change"];
+}

@@ -1,0 +1,49 @@
+// Friend's architecture figure, in our report style (light, Helvetica, pastel fills).
+// rendu : dot -Tpdf friend_firecracker.dot -o friend_firecracker.pdf
+digraph FC {
+  rankdir=TB; fontname="Helvetica"; compound=true; nodesep=0.5; ranksep=0.7; bgcolor="white";
+  node [fontname="Helvetica", fontsize=11, style="rounded,filled", fillcolor=white];
+  edge [fontname="Helvetica", fontsize=10];
+
+  // ---- Top layer: the guest side (Target VM + Observer) ----
+  subgraph cluster_guest {
+    label=""; style=filled; color="#f1f5f9"; margin=16;
+
+    subgraph cluster_vm {
+      label="Target Virtual Machine"; labelloc=b; style=filled; color="#dbeafe"; fontsize=12; margin=14;
+      // three VM threads, drawn as labelled downward arrows
+      vt0 [label="VM Th0", shape=plaintext, style=""]; ve0 [shape=point, width=0.02];
+      vt1 [label="VM Th1", shape=plaintext, style=""]; ve1 [shape=point, width=0.02];
+      vt2 [label="VM Th2", shape=plaintext, style=""]; ve2 [shape=point, width=0.02];
+      vt0 -> ve0; vt1 -> ve1; vt2 -> ve2;
+      vcpu  [label="vCPU", shape=triangle, fillcolor="#bfdbfe", height=0.9, width=1.1];
+      vsched [label="Scheduler:\nMechanism", shape=plaintext, style=""];
+      { rank=same; vcpu; vsched; }
+    }
+
+    obs [label="Observer", shape=box, style="filled", fillcolor="#dcfce7", width=2.6, height=1.8];
+  }
+
+  // ---- Middle: hypervisor ----
+  fc [label="Firecracker", shape=box, fillcolor="#fef9c3", width=5.0, height=0.7];
+  cpu [label="CPU", shape=diamond, fillcolor="#fde68a", height=1.0, width=1.3];
+
+  // ---- Bottom layer: Host (T0/T1/T2 live INSIDE here, as requested) ----
+  subgraph cluster_host {
+    label="Host"; labelloc=b; style=filled; color="#fee2e2"; fontsize=13; margin=16;
+    hsched [label="Scheduler:\nPolicy + Mechanism", shape=plaintext, style=""];
+    // the three host threads T0, T1, T2 (labelled downward arrows), now inside Host
+    t0 [label="T0", shape=plaintext, style=""]; t0e [shape=point, width=0.02];
+    t1 [label="T1", shape=plaintext, style=""]; t1e [shape=point, width=0.02];
+    t2 [label="T2", shape=plaintext, style=""]; t2e [shape=point, width=0.02];
+    t0 -> t0e; t1 -> t1e; t2 -> t2e;
+    { rank=same; t0; t1; t2; hsched; }
+  }
+
+  // ---- Cross-layer flows ----
+  vsched -> obs [label="  Observer reads info\l  from shared memory\l", constraint=false];
+  obs -> fc  [label="  Information transmission via virtio  "];
+  fc  -> cpu [style=invis];
+  fc  -> hsched [lhead=cluster_host];
+  cpu -> hsched [style=invis];
+}

@@ -1,0 +1,13 @@
+// Teaser "the map" for slide 4 — 3 big legible blocks
+digraph TEASER {
+  rankdir=LR; fontname="Helvetica"; nodesep=0.6; ranksep=0.8; bgcolor="transparent";
+  node [fontname="Helvetica", fontsize=20, style="rounded,filled", shape=box, width=3.0, height=1.7];
+  edge [fontname="Helvetica", fontsize=17, penwidth=2.2];
+
+  A [label="(1)  NIC's NAPI\nreceives the encrypted packet\n+ GRO #1 (conditional)", fillcolor="#dbeafe"];
+  B [label="(2)  per-CPU WORKQUEUE\ndecrypts IN PARALLEL\n(finishes out of order)", fillcolor="#fee2e2"];
+  C [label="(3)  WIREGUARD's NAPI\nre-ORDERs + GRO #2\n(virtual interface wg0)", fillcolor="#dcfce7"];
+
+  A -> B [label="  encrypted packet  "];
+  B -> C [label="  decrypted packet  "];
+}

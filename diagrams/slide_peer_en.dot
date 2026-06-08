@@ -1,0 +1,15 @@
+// Peer, simplified for slide 5
+digraph PEERSLIDE {
+  rankdir=TB; fontname="Helvetica"; nodesep=0.5; ranksep=0.55; bgcolor="transparent";
+  label="The \"peer\" — one wg0, many correspondents";
+  labelloc=t; fontsize=18;
+  node [fontname="Helvetica", fontsize=15, style="rounded,filled", fillcolor=white];
+  edge [fontname="Helvetica", fontsize=12, penwidth=1.6];
+
+  WG [label="wg0 — VIRTUAL interface: holds the list of all correspondents (peers)", fillcolor="#bfdbfe"];
+  P  [label="EACH peer (up to 1000) = one record:\npublic key (identity, not the IP)  -  ITS OWN ordered queue  -  ITS OWN NAPI", fillcolor="#ede9fe"];
+  WQ [label="ONE single decryption workshop, SHARED by all (per-CPU workqueue)", shape=cylinder, fillcolor="#fee2e2"];
+  NOTE [label="queue + NAPI ARE PER PEER -> ordering (and the bug) is PER peer;\nbut the workshop is SINGLE -> more peers = more disorder = growing regression", shape=note, fillcolor="#fef9c3"];
+
+  WG -> P -> WQ -> NOTE;
+}

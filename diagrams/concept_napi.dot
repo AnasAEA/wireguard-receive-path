@@ -1,0 +1,30 @@
+digraph NAPI {
+  rankdir=TB; fontname="Helvetica"; ranksep=0.5; nodesep=0.4;
+  label="NAPI — « arrête de sonner à chaque lettre, je relèverai la boîte moi-même »";
+  labelloc=t; fontsize=14;
+  node [fontname="Helvetica", fontsize=10, style="rounded,filled", fillcolor=white];
+  edge [fontname="Helvetica", fontsize=9];
+
+  PB [label="SANS NAPI : le facteur sonne à CHAQUE lettre.\nÀ 1 000 000 lettres/s, le CPU ne fait que courir ouvrir la porte\n(« interrupt storm ») → il s'effondre.", shape=note, fillcolor="#fee2e2"];
+
+  subgraph cluster_cycle {
+    label="AVEC NAPI : sonner UNE fois, puis relever la boîte par lots"; style=filled; color="#dbeafe";
+    IRQ  [label="① La sonnette retentit UNE fois\n(interruption matérielle — puis on COUPE la sonnette)", shape=parallelogram, fillcolor="#bfdbfe"];
+    SCH  [label="② On coche « à faire » sur une liste + on lève un drapeau\n(RIEN ne s'exécute encore !)\n= napi_schedule  (dev.c:6729 ; poll_list+softirq dev.c:4984,4990)"];
+    NRX  [label="③ Plus tard, on va relever la boîte\n= net_rx_action (créneau softirq) appelle poll()  (dev.c:7914)"];
+    POLL [label="④ poll() RAMASSE jusqu'à 64 lettres (le « budget »)\nex. wg_packet_rx_poll — renvoie combien il en a pris (work_done)"];
+    CMP  [label="⑤ Boîte vide → « j'ai fini, rendors-moi »\n= napi_complete_done : vide le GRO, se retire, RÉACTIVE la sonnette  (dev.c:6771)"];
+    IRQ -> SCH -> NRX -> POLL -> CMP;
+  }
+
+  STRUCT [label="NAPI = une FICHE + une FONCTION  (PAS un programme qui tourne)\nla fiche : poll (fonction de relève) · budget = 64 · état · liste · zone GRO\ncréée par netif_napi_add  (netdevice.h:2831 → dev.c:7558)", shape=box, fillcolor="#fef9c3"];
+
+  CTX [label="Où se fait la relève ? dans un CRÉNEAU EMPRUNTÉ (softirq),\njuste après une sonnette — PAS un employé à soi.\n(sous très forte charge : le kthread ksoftirqd/N)", shape=note, fillcolor="#dcfce7"];
+
+  LIFE [label="Sa vie chez WireGuard (7 étapes) :\ncréer (netif_napi_add) → activer (napi_enable) → cocher « à faire » (napi_schedule)\n→ relever (poll) → finir (napi_complete_done) → désactiver → détruire", shape=box, fillcolor="#ede9fe"];
+
+  PB -> IRQ [style=invis];
+  CMP -> STRUCT [style=invis];
+  STRUCT -> CTX [style=invis];
+  CTX -> LIFE [style=invis];
+}

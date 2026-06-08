@@ -1,0 +1,15 @@
+// Pair simplifié pour la diapo 5 — gros texte
+digraph PEERSLIDE {
+  rankdir=TB; fontname="Helvetica"; nodesep=0.5; ranksep=0.55; bgcolor="transparent";
+  label="Le « pair » — une wg0, beaucoup de correspondants";
+  labelloc=t; fontsize=18;
+  node [fontname="Helvetica", fontsize=15, style="rounded,filled", fillcolor=white];
+  edge [fontname="Helvetica", fontsize=12, penwidth=1.6];
+
+  WG [label="wg0 — interface VIRTUELLE : tient la liste de tous les correspondants (pairs)", fillcolor="#bfdbfe"];
+  P  [label="CHAQUE pair (jusqu'à 1000) = une fiche :\nclé publique (identité, pas l'IP)  ·  SA file ORDONNÉE  ·  SA NAPI", fillcolor="#ede9fe"];
+  WQ [label="UN SEUL atelier de déchiffrement, PARTAGÉ par tous (workqueue par-CPU)", shape=cylinder, fillcolor="#fee2e2"];
+  NOTE [label="file + NAPI PAR pair → l'ordre (et le bug) est PAR pair ;\nmais l'atelier est UNIQUE → plus de pairs = plus de désordre = régression croissante", shape=note, fillcolor="#fef9c3"];
+
+  WG -> P -> WQ -> NOTE;
+}
