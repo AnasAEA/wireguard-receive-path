@@ -1,3 +1,5 @@
+![WireGuard's receive path — source-level analysis and a six-line fix for the Execution Order Inversion](diagrams/banner.png)
+
 # Workqueue Scheduling Overhead in WireGuard
 
 ### Source-level analysis and a targeted fix for Execution Order Inversion
@@ -83,3 +85,9 @@ saturates); validating throughput on a real 25 G NIC is the next step.
 - C. Mounah *et al.*, "The Impact of Kernel Asynchronous APIs on the Performance
   of a Kernel VPN," SYSTOR 2025.
 - [WireGuard](https://www.wireguard.com/) — Jason A. Donenfeld.
+
+## License
+
+Released under the **GNU General Public License v2.0** — see [`LICENSE`](LICENSE).
+GPL-2.0 is used throughout because the kernel modification (`linux-source/.../receive.c`)
+is a derivative of the Linux kernel and WireGuard, both GPL-2.0.
