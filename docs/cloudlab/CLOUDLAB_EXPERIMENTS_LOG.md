@@ -57,14 +57,15 @@ if we re-instantiate on different hardware, add a new block rather than overwrit
 The deliverable of Phase C. Fill as E2–E5 produce numbers. Medians; note units.
 Keep stock and patched side by side.
 
-| Quantity | Source (plan) | Stock @8p | Patched | Notes |
-|----------|---------------|-------|---------|-------|
-| `T_decrypt` (per packet) | E2 | **~5–6 µs** | — | mode [4K,8K)ns, 6.85M samples; probed `decrypt_packet` |
-| `Δ_complete` (inter-completion) | E3 | — | — | per-peer median (TODO) |
-| `C_poll` (empty/wasted poll) | E4 | **~1.0 µs** | — | `@poll_avg_ns[0]`=1018 ns |
-| delivery setup (fixed, k≥1) | E4 | **~3.6 µs** | — | jump [0]→[1] = 5265−1018 minus 1×C_deliver |
-| `C_deliver` (per packet in poll) | E4 | **~1.66 µs** | — | slope of `@poll_avg_ns` over k=1..16 |
-| `C_stack` (GRO benefit / poll) | E5 + E6 | **~3.6 µs** | — | = delivery-setup amortized; per-pkt cost 5.3µs@batch1 → 1.9µs@batch16 |
+| Quantity | Source | Stock @8p | Notes |
+|----------|--------|-----------|-------|
+| `T_decrypt` (per packet) | E2 | **~5–6 µs** | mode [4K,8K)ns, 6.85M samples |
+| `Δ_complete` (decrypt gap, per core) | E3 | **bimodal: ~5 µs (active) / ~100 µs (idle)** | active mode ≈ T_decrypt; sets the affordable trigger delay |
+| `C_poll` (empty/wasted poll) | E4 | **~1.0 µs** | `@poll_avg_ns[0]`=1010 (clean, poll-only) |
+| delivery setup (fixed, k≥1) | E4 | **~3.7 µs** | line intercept; the prize batching amortizes |
+| `C_deliver` (per packet in poll) | E4 | **~1.64 µs** | slope k=1..16; clean run |
+| `napi_gro_receive` (per pkt) | E5 | **~1 µs** (tail ~10µs) | component of C_deliver; tail = GRO flush up stack |
+| `C_stack` (batch prize / poll) | E4/E5 | **~3.7 µs/poll** | = delivery-setup; per-pkt 5.3µs@batch1 → 1.9µs@batch16 |
 
 **Derived trigger inputs (once the above are filled):**
 - Break-even batch size `k*` where `(k−1)·C_stack > C_poll`: —
@@ -132,6 +133,27 @@ Mean packets per GRO flush. M1 ref: 3.1→3.3 (1p), 8.7→9.6 (8p), 7.7→8.9 (3
   parallel-decrypt disorder that comes with MANY peers. **Decisive test = E0.5
   multi-peer + ≥5 repeats with a normalized metric.** Do NOT draw conclusions from
   this single 1-peer run.
+
+### 2026-06-19 — E3+E4+E5 cost model COMPLETE (stock @8p)
+
+- **Clean poll cost** (`measure_pollcost.sh`, poll-only — no decrypt-probe inflation):
+  C_poll = **1010 ns**, C_deliver ≈ **1.64 µs/pkt** (slope k=1..16), delivery-setup
+  ≈ **3.7 µs** (intercept). Matches the decrypt-probed run → numbers are robust.
+- **`measure_gro.sh`:** `@gro_ns` mode ~1 µs/pkt (tail ~10µs = GRO flush up stack) →
+  part of C_deliver. `@delta_ns` (per-core decrypt gap) **bimodal**: ~4–8 µs (core
+  cranking back-to-back, ≈ T_decrypt) and ~64–256 µs (idle between bursts).
+- **Cost-model table now filled** (see summary table above).
+- **Trigger design the data supports:** when a poll hits an UNCRYPTED head, the next
+  completion is ~5–10 µs away (active cadence). A trigger that **delays the wake/poll
+  by ~5–10 µs (or until ≥k packets ready)** lets the head + followers crypt, turning
+  the 0–4-packet polls into bigger batches and amortizing the ~3.7 µs/poll setup —
+  for only a few µs of added latency. Break-even: batching saves ~3.7µs per avoided
+  poll; the cost is the added delay bounded by Δ_complete.
+- Cost of today's waste: 865k wasted polls × ~1µs ≈ 0.87s CPU; plus ~1.9M delivering
+  polls × 3.7µs ≈ 7s of per-poll setup over 20s (across cores) — the setup overhead
+  dominates, and bigger batches attack it directly.
+- Caveat: single runs, N=8 only; want repeats + the 32/64/128 sweep to confirm the
+  costs hold with more concurrency before finalizing the trigger threshold.
 
 ### 2026-06-19 — E2+E4 cost model (stock @8p) — first per-step costs
 

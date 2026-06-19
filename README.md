@@ -67,10 +67,14 @@ saturates); validating throughput on a real 25 G NIC is the next step.
 | Path | Contents |
 |------|----------|
 | `report/` | Final 6-page report (LaTeX source + figures) |
-| `admin/` | Defense slides (`SLIDES_DEFENSE_EN`), speaker notes, meeting prep |
+| `docs/cloudlab/` | CloudLab measurement phase: plan, runbook, lab log, findings |
+| `docs/defense/` | Defense slides (`SLIDES_DEFENSE_EN`), speaker notes, builder |
+| `docs/study/` | Source/pipeline analysis (`CODE_STUDY_*`, diagrams, solution proposal) |
+| `docs/meetings/` | Supervisor meeting notes, prep, and progress reports |
+| `docs/experiments/` | M1 experiment runbooks |
 | `diagrams/` | Graphviz sources (`.dot`) and rendered `.svg`/`.png` |
 | `linux-source/` | Curated kernel files cited as proof (WireGuard module, GRO, UDP offload) |
-| `scripts/` | Measurement harness (multi-peer, repeated runs, analysis) |
+| `scripts/` | Measurement harness (`cloudlab/` testbed + multi-peer, repeated runs, analysis) |
 | `notes/`, `reference/` | Source-study notes and reference material |
 | `io_uring_examples/` | Early io_uring exploration (the original framing) |
 
@@ -78,7 +82,7 @@ saturates); validating throughput on a real 25 G NIC is the next step.
 
 - **Report:** `report/main.tex` — *Workqueue Scheduling Overhead in WireGuard:
   Source-Level Analysis and a Targeted Fix for Execution Order Inversion*
-- **Defense deck:** `admin/SLIDES_DEFENSE_EN.md` (Marp → HTML/PDF)
+- **Defense deck:** `docs/defense/SLIDES_DEFENSE_EN.md` (Marp → HTML/PDF)
 
 ## References
 

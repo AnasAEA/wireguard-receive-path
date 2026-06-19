@@ -58,9 +58,9 @@
 | E0.6 | bpftrace symbol check on `dut` | A Provision | DONE | 2026-06-17 |
 | E1   | Reproduce EoI + stock/patched A/B | B Validate | DONE | 2026-06-19 — EoI reproduced (33% wasted @8p); fix fires (skips 9.4%) but **null on real NIC** (napi_schedule ~63% no-op under load) |
 | E2   | `T_decrypt` — per-packet decrypt time | C Cost model | DONE | 2026-06-19 (~5–6µs @8p) |
-| E3   | `Δ_complete` — inter-completion gap per peer | C Cost model | TODO | — |
-| E4   | `C_poll` + `C_deliver` — poll duration vs work_done | C Cost model | DONE* | 2026-06-19 (C_poll~1µs, C_deliver~1.66µs; *re-run poll-only for clean nums) |
-| E5   | `C_stack` + GRO batch-size distribution | C Cost model | TODO | — |
+| E3   | `Δ_complete` — inter-completion gap | C Cost model | DONE | 2026-06-19 (bimodal ~5µs/~100µs) |
+| E4   | `C_poll` + `C_deliver` — poll duration vs work_done | C Cost model | DONE | 2026-06-19 (C_poll~1.0µs, C_deliver~1.64µs, setup~3.7µs; clean poll-only) |
+| E5   | `C_stack` + GRO cost | C Cost model | DONE | 2026-06-19 (gro~1µs/pkt; C_stack~3.7µs/poll) |
 | E6   | System view — perf / mpstat (core saturation) | C Cost model | TODO | — |
 
 ---

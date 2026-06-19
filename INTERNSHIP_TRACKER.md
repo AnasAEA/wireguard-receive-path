@@ -1,5 +1,5 @@
 # Internship Tracker — io_uring / WireGuard Performance Research
-# Inria KrakOS Team (LIG), Grenoble — Last updated: June 6, 2026
+# Inria KrakOS Team (LIG), Grenoble — Last updated: June 12, 2026
 
 ---
 
@@ -33,8 +33,8 @@
 | Date | Deliverable |
 |---|---|
 | **June 5, noon** | Final report (6 pages, Moodle 295) — ✅ Submitted |
-| **June 8** | Defense slides |
-| **June 10, 16h–16h30** | Defense — confirmed with André — **salle F117** (Wed–Thu = F117, Fri = F115) |
+| **June 8** | Defense slides — ✅ Done (finalized + trimmed to 10 min) |
+| **June 10, 16h–16h30** | Defense — **salle F117** — ✅ **Done, went really well** |
 | **July 31** | End of internship: Full CloudLab measurements, evaluate combined fixes (ours + paper's), and further analysis. |
 
 ---
@@ -54,33 +54,30 @@
 | 3. Implement | Apply diff to kernel source, compile, test correctness | May 27 | ✅ Done |
 | 4. Measure | Baseline + patched throughput + latency on M1 | May 28 | ✅ Done |
 | 5. Report | Final report (Moodle 295) | June 5 | ✅ Submitted |
-| — | Defense presentation & slides | June 8 | 🟡 Trimming to 10 min |
-| 6. CloudLab | Deep saturation measurements & combination with paper's fix | July 2026 | ⬜ Pending Account Approval |
+| — | Defense presentation & slides | June 8 | ✅ Done — trimmed to 10 min (9 main + 7 appendix) |
+| — | **Defense (salle F117)** | **June 10** | ✅ **Done — went really well** |
+| 6. Improve | Instrument receive path (per-step costs) → design batching-aware trigger | June–July 2026 | ⬜ CloudLab account approved; plan w/ Alain June 15 |
+| 7. CloudLab | Benchmark the improved solution on real NIC; combine with paper's fix | July 2026 | ⬜ Deferred until solution is improved |
 
 ---
 
-## Current — June 6 (Saturday, library)
+## Current — June 12 (post-defense)
 
-### Done (June 1–5)
-- ✅ **Final report (6 pages)** submitted on time to Moodle 295 (June 5).
-- ✅ **Team Presentation (June 4):** Presented the defense slides to the KrakOS team. The presentation was very well-received and effective, but took ~13 minutes (target is 10 minutes max).
-- ✅ **CloudLab Setup Initiated:** Alain successfully created the new project "WG" in CloudLab, and it got accepted.
-- ✅ **Internship Extension Confirmed:** Spoke with Alain. The internship is extended to July 31. The primary goal for this post-defense period is to run thorough real-NIC measurements on CloudLab, extract concrete results on how our solution performs under saturation, explore further improvements, and try combining our conditional check with the paper's dedicated workqueue fix.
+### Done (June 8–10) — graded phase complete ✅
+- ✅ **Defense slides finalized & trimmed to 10 min:** merged the 3 component slides into one "three kernel engines" diagram; redrew the pipeline as a snake (flow turns DOWN into the red `napi_schedule` box); arrow-glyph + typography cleanup; pagination shows total; defense date on title. 9 main + 7 appendix slides. Committed + pushed.
+- ✅ **Defense held June 10, 16h–16h30, salle F117 — went really well.** Answered most jury questions confidently; good feedback on the final report too. Several jury professors had already seen the June 4 KrakOS seminar (an effective dry run). Overall a strong success.
+- ✅ **Repo polished for sharing:** renamed `Io-uring-Internship` → `wireguard-receive-path`; added README + banner, GPL-2.0 license, and topics. Defense Q&A prep: `admin/DEFENSE_QA_PREP_EN.md`.
 
-### Today — June 6 (Saturday, library)
-1. ⬜ **Trim Defense Presentation:** Cut the current 13-minute presentation (`admin/SLIDES_DEFENSE_EN.md` / `admin/SPEAKER_NOTES_EN.md`) down to exactly 10 minutes max.
-2. ⬜ Check CloudLab account status periodically (currently pending: "Your account has not been approved yet!").
+### Direction (set by Alain, June 12) — improve the solution *before* benchmarking it
 
-### Remaining Pre-Defense (June 8 – June 10)
-- ⬜ Finalize and submit defense slides (June 8).
-- ⬜ **June 10, 16h–16h30:** Final Defense (Salle F117).
+Alain's guidance: do **not** rush to benchmark the current 6-line fix as if it were the final solution. The priority is to make the solution **better** (toward the batching-aware trigger). To do that, we first need detailed instrumentation — measure how long **each step** of the receive path takes, and measure everything we can. Those numbers show how the solution actually performs and give the cost model needed to design the batching-aware trigger.
 
-### Post-Defense (June 11 – July 31)
-- ⬜ Gain access to the CloudLab "WG" project once account is approved.
-- ⬜ Set up WireGuard on CloudLab (c220g2: 1 server + 2 clients), real-NIC baseline stock vs patched.
-- ⬜ Run thorough measurements to extract important results on how our solution performs under saturation.
-- ⬜ Implement and test the combination of our fix (conditional NAPI schedule) with the paper's fix (dedicated `gro_wq`).
-- ⬜ Investigate further improvements to the solution based on CloudLab metrics.
+- ✅ **CloudLab account approved** (project "WG"). Hardware now available (`c220g2`: 1 server + 2 clients).
+- ⬜ **Instrument the receive path** — per-step timing/cost breakdown (decrypt, queue ops, poll overhead, GRO, delivery + copy-to-userspace). "Measure everything."
+- ⬜ Use that cost model to design the **batching-aware trigger** — wake only when waking *pays off* (poll overhead vs. delivery cost).
+- ⬜ (Later) benchmark the improved solution on the real NIC; combine with the paper's dedicated `gro_wq`; check whether ARM behavior reproduces on x86.
+
+> **Next meeting: Monday June 15, 14h — with Alain**, to define the measurement plan and methodology (how to instrument and what to measure).
 
 ---
 
@@ -88,12 +85,13 @@
 
 | File | Contents |
 |---|---|
-| `CODE_STUDY_NOTES.md` | Full WireGuard + workqueue source analysis with file:line citations |
-| `CODE_STUDY_PART2.md` | Pipeline internals: queue structure, CPU distribution, GRO poll behavior, four cases |
-| `admin/ANDRE_SOLUTION_PROPOSAL.md` | Diff + reasoning + probabilistic argument + residual limitation |
-| `admin/PIPELINE_SKETCH_GUIDE.md` | 7 diagrams with scenarios, data structures, parallelism, EoI, fix |
-| `admin/MEETING_NOTES_2026-05-21.md` | May 21 meeting outcome, gaps, plan |
-| `IO_URING_REFERENCE.md` | io_uring internals, io-wq architecture, source findings |
+| `docs/study/CODE_STUDY_NOTES.md` | Full WireGuard + workqueue source analysis with file:line citations |
+| `docs/study/CODE_STUDY_PART2.md` | Pipeline internals: queue structure, CPU distribution, GRO poll behavior, four cases |
+| `docs/study/ANDRE_SOLUTION_PROPOSAL.md` | Diff + reasoning + probabilistic argument + residual limitation |
+| `docs/study/PIPELINE_SKETCH_GUIDE.md` | 7 diagrams with scenarios, data structures, parallelism, EoI, fix |
+| `docs/meetings/MEETING_NOTES_2026-05-21.md` | May 21 meeting outcome, gaps, plan |
+| `docs/study/IO_URING_REFERENCE.md` | io_uring internals, io-wq architecture, source findings |
+| `docs/cloudlab/CLOUDLAB_EXPERIMENTS_LOG.md` | CloudLab lab log: testbed, EoI repro, null-fix diagnosis, cost model |
 | `notes/notes_kernelVPN_paper.md` | Mounah et al. — EoI root cause, patch, evaluation |
 
 ---
@@ -129,6 +127,18 @@
 ---
 
 ## Progress log
+
+### June 12, 2026 (Friday) — post-defense direction set
+- ✅ **CloudLab account approved** (project "WG"). Hardware available.
+- **Talked with Alain — new direction.** Don't benchmark the current fix as if it's the final solution. First *improve* it toward the batching-aware trigger; to do that, instrument the receive path and measure everything (especially per-step costs) to understand how the solution performs and build the cost model the better trigger needs.
+- **Meeting set: Monday June 15, 14h with Alain** — define the measurement plan + methodology.
+
+### June 10–12, 2026 — Defense done ✅
+- ✅ **Defense (June 10, 16h–16h30, salle F117) — went really well.** Answered most jury questions confidently; good feedback on the report. Strong overall success. Graded phase of the internship complete.
+- Repo cleaned up for sharing: renamed to `wireguard-receive-path`, added README + banner + GPL-2.0 license + topics. Defense Q&A prep written (`admin/DEFENSE_QA_PREP_EN.md`).
+
+### June 8–9, 2026
+- ✅ Defense slides finalized and trimmed to 10 min: snake pipeline diagram (flow turns down into the `napi_schedule` box), three-engines overview diagram, arrow-glyph + typography consistency pass, pagination shows total, defense date on title slide. Committed + pushed.
 
 ### June 6, 2026 (Saturday)
 - Working from the library.

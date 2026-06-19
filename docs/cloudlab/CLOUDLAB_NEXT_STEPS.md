@@ -153,6 +153,93 @@ Read-out:
 
 Repo copy: `scripts/cloudlab/measure_cost.sh`.
 
+**RESULT (stock @8, 2026-06-19):** T_decrypt ~5–6µs; C_poll ~1.0µs; delivery setup
+~3.6µs; C_deliver ~1.66µs; batches bottom-heavy (most polls deliver 0–4). See log.
+
+---
+
+# ▶ Phase C finishers — clean C_poll + C_stack + Δ_complete
+
+Two more runs to complete the cost model (kept separate so probe overhead doesn't
+inflate the poll timings).
+
+## Create both probes (on dut)
+```bash
+cat > ~/measure_pollcost.sh <<'EOF'
+#!/bin/bash
+set -uo pipefail
+MOD=${1:?}; N=${2:?}; DUR=${3:-20}; STREAMS=${4:-4}; GEN=${5:-gen}
+KO="$HOME/wireguard_${MOD}.ko"
+ip link del wg0 2>/dev/null || true
+rmmod wireguard 2>/dev/null || true
+insmod "$KO"
+bash "$HOME/setup_dut_peers.sh" "$N" >/dev/null
+SRC=$(cat /sys/module/wireguard/srcversion)
+pkill -f 'iperf3 -s' 2>/dev/null
+sleep 1
+for i in $(seq 0 $((N-1))); do iperf3 -s -p $((5201+i)) -D; done
+ssh -o StrictHostKeyChecking=no "$GEN" "bash /tmp/genload.sh $N $DUR $STREAMS" &
+LOAD=$!
+DURP=$((DUR+3))
+bpftrace -e '
+kprobe:wg_packet_rx_poll   { @ps[tid] = nsecs; }
+kretprobe:wg_packet_rx_poll /@ps[tid]/ {
+    $d = nsecs - @ps[tid];
+    @poll_avg_ns[retval] = avg($d);
+    @poll_cnt[retval]    = count();
+    delete(@ps[tid]);
+}
+interval:s:'"$DURP"' { print(@poll_avg_ns); print(@poll_cnt); exit(); }'
+wait "$LOAD" 2>/dev/null
+pkill -f 'iperf3 -s' 2>/dev/null
+echo "RESULT pollcost module=$MOD src=$SRC N=$N"
+EOF
+
+cat > ~/measure_gro.sh <<'EOF'
+#!/bin/bash
+set -uo pipefail
+MOD=${1:?}; N=${2:?}; DUR=${3:-20}; STREAMS=${4:-4}; GEN=${5:-gen}
+KO="$HOME/wireguard_${MOD}.ko"
+ip link del wg0 2>/dev/null || true
+rmmod wireguard 2>/dev/null || true
+insmod "$KO"
+bash "$HOME/setup_dut_peers.sh" "$N" >/dev/null
+SRC=$(cat /sys/module/wireguard/srcversion)
+pkill -f 'iperf3 -s' 2>/dev/null
+sleep 1
+for i in $(seq 0 $((N-1))); do iperf3 -s -p $((5201+i)) -D; done
+ssh -o StrictHostKeyChecking=no "$GEN" "bash /tmp/genload.sh $N $DUR $STREAMS" &
+LOAD=$!
+DURP=$((DUR+3))
+bpftrace -e '
+kprobe:napi_gro_receive   { @gs[tid] = nsecs; }
+kretprobe:napi_gro_receive /@gs[tid]/ { @gro_ns = hist(nsecs - @gs[tid]); delete(@gs[tid]); }
+kretprobe:decrypt_packet {
+    if (@dl[cpu]) { @delta_ns = hist(nsecs - @dl[cpu]); }
+    @dl[cpu] = nsecs;
+}
+interval:s:'"$DURP"' { print(@gro_ns); print(@delta_ns); clear(@dl); exit(); }'
+wait "$LOAD" 2>/dev/null
+pkill -f 'iperf3 -s' 2>/dev/null
+echo "RESULT gro module=$MOD src=$SRC N=$N"
+EOF
+```
+
+## Run both (on dut)
+```bash
+sudo bash ~/measure_pollcost.sh stock 8
+sudo bash ~/measure_gro.sh stock 8
+```
+
+Read-out:
+- `measure_pollcost`: clean `@poll_avg_ns[0]` = **C_poll**, slope = **C_deliver**
+  (no decrypt-probe inflation).
+- `measure_gro`: `@gro_ns` = per-packet GRO/stack cost (**C_stack** component);
+  `@delta_ns` = per-core gap between decrypt completions (decrypt cadence → bounds the
+  delay a trigger could afford).
+
+Repo copies: `scripts/cloudlab/measure_pollcost.sh`, `measure_gro.sh`.
+
 ---
 
 # ▶ E0.5 — Multi-peer bring-up (verify at N=8)
