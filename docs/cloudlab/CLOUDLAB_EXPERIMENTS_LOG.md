@@ -115,6 +115,568 @@ Mean packets per GRO flush. M1 ref: 3.1→3.3 (1p), 8.7→9.6 (8p), 7.7→8.9 (3
 
 ---
 
+### 2026-06-24 — Mechanism VERIFIED — ★ wg_supp fires at 96% but waste regenerates as fresh wakes (in-module counters)
+
+Question (raised before changing the fix): in the parallel (sdfn) regime, is MISSED still
+the dominant wasted-poll cause, and does `wg_supp` actually fire / prevent the wasted
+calls? Added behaviour-preserving in-module counters (`wg_diag`, sysfs-readable) at the
+poll-completion point. Builds `C8808D9…` then `wireguard_trigger.ko` with diag.
+
+- **MISSED still dominant in parallel:** of stock wasted polls, **95%** are MISSED re-polls
+  (vs 99.7% single-core). Of reschedules: **54% UNCRYPTED-head, 46% empty-drain**
+  (empty_missed=735k, uncrypt_missed=865k). So my first guess (empty case dominates and the
+  fix misses it) was **REFUTED** — UNCRYPTED is the slight majority, the case the fix DOES
+  handle.
+- **The fix fires correctly:** `supp_cleared` = 800,855 of 830,601 catchable = **96%** of
+  UNCRYPTED-head reschedules cleared. Independent rerun 718,546/744,850 = 96.5%. NOT
+  defeated by concurrent re-set (`supp_reset_race`=906, negligible — that hypothesis also
+  REFUTED) nor recheck re-arm (37,657 = 4.5%).
+- **Sanity check (causality):** `supp_cleared` = 0 with wg_supp=0 (phases A & C), 718k with
+  wg_supp=1 (phase B); meanwhile fix-independent `uncrypt_missed` ≈ 745–773k in ALL phases
+  → counter is tied to the fix path; load + diag live and stable.
+- **So why does aggregate wasted barely drop (30→27%)?** Suppressing the MISSED re-poll
+  parks the NAPI; then the next non-head completion wakes a **fresh** poll that is ALSO
+  wasted (head still decrypting). **The waste regenerates as a fresh wake** — root cause
+  (out-of-order completion) untouched. `headwake` gates all wakes at the producer so it
+  stops the regeneration too (→16-20%), but still helps nothing and risks the stall.
+- **Method note:** the earlier `measure_missed` "92% still MISSED" used a cross-core
+  NAPI-state classifier that is racy in spread mode; the in-module counters sit at the
+  decision point and are authoritative. Trust the counters.
+- **Counters racy (plain ++ across cores)** → reliable for ratios/orders of magnitude
+  (800k vs 906 unambiguous), not exact totals.
+
+This CLOSES the mechanism question: the re-poll fix works exactly as designed (fires 96%),
+but it cannot help because the wasted polls regenerate and were never the bottleneck.
+
+---
+
+### 2026-06-24 — Design B — ★★ BREAKTHROUGH: spread RX across cores ⇒ 4.1 → 9.0 Gb/s (×2.2), single-core wall GONE
+
+`measure_spread.sh 8` — stock module, flip NIC `rx-flow-hash udp4` from `sd` (IP only)
+to `sdfn` (+L4 ports), measure throughput + per-core CPU each. Artifacts
+`data/cloudlab/cpu_sd_spread.csv` / `cpu_sdfn_spread.csv`, fig
+`docs/meetings/figures/fig_spread.png`.
+
+```
+hash    throughput   cores >50% busy
+sd      4.08-4.13    1   (cpu5 = 100% / 97.6% softirq)
+sdfn    8.99-8.99    8   (cpu29/7/26/27/1/28/3/9 ~50-60% each)
+```
+
+- **×2.2 throughput (4.1 → 9.0 Gb/s ≈ 10G line rate) from ONE ethtool command.** The 8
+  tunnels share src/dst IP but have distinct UDP source ports; adding the ports to the
+  hash fans them across 8 of the 40 RX queues → 8 cores. IRQ affinity was already one-per-
+  core (irq144→cpu5 etc.), so no extra tuning needed. **The single-core wall was the NIC
+  hash config, NOT WireGuard.**
+- **Now the cores have HEADROOM (~55%)** — this is the regime where the EoI fix can finally
+  matter: reclaimed wasted-poll cycles no longer convert to throughput (already near line
+  rate) but to **lower CPU% → more peers per box**. Note softirq is now a big share per
+  core (e.g. cpu29 38.5%), so per-core poll efficiency is back in play.
+- **Reverted hash to `sd` (default) after the run.** To enable: `sudo ethtool -N enp6s0f1
+  rx-flow-hash udp4 sdfn`.
+- **Connects to the bug's theme:** parallelism is both the *cause* of the EoI (parallel
+  decrypt → out-of-order → wasted polls) and the *cure* for throughput (spread RX).
+- **NEXT (the right experiment):** in `sdfn` mode, re-run the stock/move/batch/root A/B but
+  measure **CPU-per-byte at fixed ~9 Gb/s** (not throughput). If a fix lowers per-core CPU
+  at equal throughput, that is its real value. `measure_all.sh`-style but with the spread
+  hash + CPU sampling.
+
+---
+
+### 2026-06-24 — Latency under load — ★ identical across all 4 variants (~1.6 ms) ⇒ saturated core dominates latency too
+
+`measure_latency.sh 8 14` — ping through the tunnel (ns_c0 → 10.0.0.1) while the 8 flows
+saturate the core, 500 samples/condition. Artifact `data/cloudlab/lat_20260624.csv`, fig
+`docs/meetings/figures/fig_latence.png`.
+
+```
+cond        median   p90     p99
+stock       1.60 ms  2.06    2.34
+move        1.57 ms  2.01    2.33
+batch       1.62 ms  2.03    2.32
+root        1.60 ms  2.03    2.39
+```
+
+- **Latency is identical across all variants (~1.6 ms median, ~2.3 ms p99, ±2%).** Under
+  saturation it is dominated by queueing on the bottleneck core (~1.6 ms); the wake-policy
+  knobs are µs-scale (τ=5µs, C_poll=1µs) → invisible against 1.6 ms. Even the trigger's τ
+  (which I expected to hurt tail latency) doesn't show — it's ~300× smaller than the queue.
+- **Closes the latency avenue for THIS regime:** neither throughput NOR latency depends on
+  the wake policy when one core saturates — both are governed by per-packet delivery on
+  that core. The τ-latency cost would only appear at *light* load (short queue); not the
+  operating point here. Only remaining lever for either metric: spread RX across cores
+  (Design B). idle RTT (no load) was ~0.6 ms for reference.
+
+---
+
+### 2026-06-24 — Consolidated A/B + figures (for the supervisor point écrit)
+
+`measure_all.sh 8 5` — one binary, 4 conditions back-to-back, shuffled, 5 reps, same load
++ a per-core CPU snapshot. The canonical dataset for the report. Artifacts:
+`data/cloudlab/all_20260624.csv`, `cpu_20260624.txt`; figures
+`docs/meetings/figures/fig_wasted_vs_debit.png`, `fig_cpu_coeurs.png`
+(via `scripts/cloudlab/plot_results.py`).
+
+```
+condition   wasted%  débit(Gb/s)   (medians, 5 reps, CV<4%)
+stock        32.9      4.15
+move(supp)   27.7      4.15
+batch(k=8)   31.7      4.10
+root(head)   20.0      4.13     (clean this run — no stalls in 5/5)
+CPU: cpu5 = 100% busy / 96.9% softirq, all others <=22%
+```
+
+The one-glance story: wasted polls drop (33→28→32→20%) while throughput stays flat
+(~4.1) — and one core is saturated. Written up for Alain in
+`docs/meetings/POINT_ALAIN_2026-06-24_FR.md` (narrative + both figures + data table +
+commands + the two code hunks). Note: `root` ran stall-free across all 5 reps here, but
+the intermittent-stall caveat from the 2026-06-24 Phase E2 entry stands (it is a real
+lost-wakeup hazard, just not hit this run).
+
+---
+
+### 2026-06-24 — Phase E2 — ★ ROOT FIX (head-gated wake, `wg_headwake`): cuts wasted polls the MOST (33%→20%) but throughput FLAT and it intermittently STALLS
+
+Built the theoretically-correct fix: wake the RX poll ONLY when a decrypt completion makes
+the head deliverable. The poll publishes the head it parks on (`peer->rx_blocked_on`,
+NULL = empty ⇒ any arrival); producers wake the NAPI only when completing that exact skb
+(pointer compare, never deref). Knob `wg_headwake` on `wireguard_trigger.ko` (srcversion
+`EF01A40…`). Code: producer gate `build/wg515-trigger/queueing.h:228`, poll publish+recheck
+`build/wg515-trigger/receive.c:522`, field in `peer.h`. Timer-free.
+
+- **Result (3 clean reps agree — measure_headwake.sh):** hw0 (stock) wfrac ≈ 0.333, GBPS
+  ≈ 4.15; **hw1 (head-gated) wfrac ≈ 0.20, GBPS ≈ 4.13.** Wasted polls 33%→20% — the
+  **largest cut of any lever** (raw count ~halved: 360k→180k/run; vs wg_supp 28%, trigger
+  31%). **Throughput still flat (+0.3%).** Definitive: even waking ONLY on a ready head
+  does not move throughput → per-packet delivery is the wall, confirmed a 4th way.
+- **Concurrency:** needs Dekker double-barriers (worker `smp_mb` between set-CRYPTED and
+  reading rx_blocked_on; poll `smp_mb` between publishing and re-reading head state). The
+  first build (release/acquire only) stalled at tunnel setup; barriers fixed setup. The
+  fix is real — release/acquire alone is insufficient for the two-sided store-buffer race.
+- **★ Intermittent STALL (the important finding):** under sustained TCP load, `wg_headwake=1`
+  occasionally strands the flow (1 of 7 long runs showed GBPS≈0 though dut still did 1.09M
+  useful polls = partial stall, not a dead node; one run briefly made the mgmt SSH
+  unresponsive; node never oopsed/locked, recovered to load 0.01). `wg_headwake=0` never
+  does this. **Why it's fundamental, not sloppy:** moving the wake to the producer means a
+  single lost wakeup DEADLOCKS the flow — under TCP the stalled receiver stops ACKing →
+  sender stops → no new packet arrives to self-heal. So head-gating demands PERFECT
+  lost-wakeup avoidance, which is hard. **This explains WHY the kernel's "wasteful"
+  MISSED/re-poll design exists: the re-poll is the belt-and-suspenders that guarantees no
+  lost wakeup. The waste IS the safety.** You can trade it for efficiency but take on a
+  deadlock hazard — and here you get ZERO throughput for the risk.
+- **Decision:** headwake is NOT shipped as a robust fix (intermittent stall). It stands as
+  the experiment proving (a) wasted polls are maximally reducible at the root yet (b)
+  throughput is unmoved, and (c) the efficiency/correctness tradeoff behind the kernel's
+  design. A production-safe version would need a liveness backstop (periodic/timer wake) —
+  which reintroduces the very overhead the trigger showed is self-defeating here.
+
+---
+
+### 2026-06-23 — Phase E DIAGNOSTIC RESULT — ★ hot core stays 100% busy at k=8 ⇒ batching frees NOTHING; receive wall is per-packet softirq, not polls
+
+`measure_cpu_trigger.sh 8 "0 8"` — per-core busy%/softirq% under 22s load, k0 vs k8.
+
+```
+k=0:  cpu5 busy=100.0% softirq=96.5%  (every other core <=20.4%, ~0% softirq)   GBPS=4.179
+k=8:  cpu5 busy=100.0% softirq=97.0%  (every other core <=21.0%, ~1% softirq)   GBPS=4.141
+```
+
+- **The hot core is pinned at 100% / ~97% softirq at BOTH settings**, despite k=8 doing
+  −22% useful polls. Batching freed **zero** measurable CPU on the bottleneck core →
+  **outcome #1**: poll reduction is moot for throughput here. The other cores (~18–21%,
+  ~0% softirq) are padata decrypt + iperf servers — not the bottleneck.
+- **What cpu5's 97% softirq is actually spent on:** `wg_packet_rx_poll` → GRO +
+  `wg_packet_consume_data_done` → `napi_gro_receive` → IP/UDP/TCP stack, i.e. **per-packet
+  delivery up the stack**, which scales with *packets* not *polls*. Envelope: ~7.25M
+  pkts × ~1.64µs ≈ 12s of the 20s budget is delivery; that is the wall.
+- **Where the batching CPU saving went (hypothesis):** k=8 cut ~1.5s of poll-setup
+  (1.85M→1.44M useful × 3.7µs) yet busy% didn't drop and throughput didn't rise — the
+  `hrtimer` machinery (arm+cancel ~per batch, firing REL_SOFT on the SAME cpu5) plausibly
+  consumed ~the same ~1.5s. **The coalescing timer is self-defeating on a saturated core:
+  it runs on the very core it is trying to relieve.** Confirm with a timer-free K-only
+  test (set `wg_trig_tau_ns=0` ⇒ pure count, no timer): if throughput then rises, the
+  timer was the culprit; if cpu5 stays 100% / flat, per-packet delivery is the hard wall.
+- **Settled conclusion (3 measurements agree — wg_supp, wg_trig, per-core CPU):** under
+  single-core RSS funneling, the WireGuard receive path is **bound by per-packet delivery
+  softirq on one core**. The EoI wasted-poll inefficiency is real and suppressible but is
+  **not** the throughput bottleneck, and hrtimer coalescing cannot help because it loads
+  the saturated core. **Throughput-on-Design-A is the wrong metric for this fix.**
+- **Decision / fork:**
+  (a) cheap decider — timer-free K test (`wg_trig_tau_ns=0`) to nail timer-vs-wall;
+  (b) **Design B** — spread RX across cores (`ethtool -N enp6s0f1 rx-flow-hash udp4 sdfn`)
+      so no single core saturates; then the metric is **CPU-per-byte / peers-per-box**,
+      where reclaimed poll cycles can actually count;
+  (c) **latency** — measure how `wg_supp`/trigger shift delivery timing (note: τ likely
+      *hurts* latency under saturation; `wg_supp` is the timer-free, latency-friendly one).
+
+---
+
+### 2026-06-23 — Phase E RESULT — ★ trigger BATCHES (−22% useful polls) but throughput FLAT-to-DOWN ⇒ receive is per-packet-delivery bound, not poll bound
+
+`measure_trigger.sh 8 "0 8" 7` — wg_trig_k 0 vs 8, τ=5µs, same binary `4BD8E49…`, 7
+shuffled runs. Artifact `~/trigger_20260623_0735.csv`.
+
+```
+k          n  gbps_med gbps_cv%  wfrac_med wfrac_cv%
+k0         7     4.199      0.2     0.3288       0.3
+k8         7     4.163      0.3     0.3057       3.2
+k8 - k0:  dGbps=-0.036 (-0.9%)   dWastedFrac=-0.0231
+```
+
+Raw poll counts (the real story): k0 ≈ 1.85M useful + 910k wasted = 2.76M polls; k8 ≈
+1.44M useful + 640k wasted = 2.08M. **Useful polls −22%, total −25%** — the trigger
+batched exactly as designed (fewer polls deliver the same throughput ⇒ bigger batches).
+
+- **But throughput did not rise — it dipped 0.9%.** Back-of-envelope: batching saved
+  ~1.5s of per-poll setup (1.85M→1.44M useful × 3.7µs) over 20s ⇒ "should" be ~+9%
+  throughput. It didn't appear, and we lost a hair. So the saved cycles were NOT the
+  binding constraint, and/or the **hrtimer overhead** (REL_SOFT timer firing in softirq on
+  the SAME saturated core, armed ~hundreds of k times) + the τ=5µs added latency cancelled
+  the benefit.
+- **Unified conclusion across BOTH levers** (wg_supp −25% wasted → flat; wg_trig −22%
+  useful → flat-to-down): **reducing poll count does not raise throughput on a single
+  saturated core.** Receive throughput here is bound by **per-packet delivery** (C_deliver
+  1.64µs/pkt + GRO/stack, which scales with packets, not polls) — back-of-envelope ~12s of
+  the 20s core budget — NOT by per-poll setup or wasted polls. The EoI wasted-poll cost is
+  real and suppressible but is a **second-order overhead**, not the throughput bottleneck.
+- **Why the trigger is slightly worse than wg_supp at cutting waste** (30.6% vs 28.1%):
+  K=8 fires on the ready count and the τ timer fires regardless, so it still wakes into
+  some uncrypted heads; wg_supp's pure head-gated park is cleaner. And the trigger adds
+  timer cost wg_supp doesn't.
+- **Decision — this reframes the project (honestly):** throughput-on-Design-A is NOT the
+  metric that shows the fix's value, because poll overhead isn't throughput-binding when
+  one core saturates on per-packet delivery. The value, if any, lives in **(a) latency**
+  (wasted polls / batching change *when* packets are delivered, not how many) and **(b) the
+  multi-core / headroom regime** (Design B: spread RX across cores so freed poll cycles
+  become capacity/peers-per-box rather than being delivery-capped). Next: **diagnostic** —
+  per-core busy%/softirq% at k0 vs k8 to see whether batching actually freed the hot core
+  or the timer ate it (`measure_cpu_trigger.sh`); then decide latency-metric vs Design B.
+- **Caveat:** load is iperf3 (TCP); τ-added latency could nick TCP throughput
+  independently. A UDP-load cross-check would isolate that, but the per-core CPU read is
+  the more decisive next step.
+
+---
+
+### 2026-06-23 — Phase E0 RESULT — ★ suppression WORKS (−5.2pp wasted) but throughput FLAT ⇒ wasted polls were cheap
+
+`measure_supp.sh 8 7` — wg_supp 0 vs 1, coalescer off (wg_trig_k=0), 7 shuffled runs,
+same binary `4BD8E49…`. Artifact `~/supp_20260623_0720.csv`.
+
+```
+mode       n  gbps_med gbps_cv%  wfrac_med wfrac_cv%
+supp0      7     4.202      0.5     0.3333       1.9
+supp1      7     4.203      0.2     0.2813       1.5
+supp1 - supp0:  dGbps=+0.001 (+0.0%)   dWastedFrac=-0.0520
+```
+
+Two clean facts (CV<2%, so both solid):
+
+- **The fix works and is safe.** Wasted fraction 33.3% → 28.1% (−5.2pp, −15.6% rel). In
+  raw counts ~937k → ~703k wasted polls/run = **~234k fewer wasted polls (−25%)**; useful
+  polls also dropped ~79k (slightly bigger batches). **No stall** — GBPS held at 4.2, not
+  0, so the lost-wakeup corner case did NOT bite under continuous load. The consumer-side
+  MISSED suppression does exactly what it was designed to, unlike the null producer-side
+  first fix. **Mechanism confirmed.**
+- **Throughput did not move (+0.0%).** Wasted polls are cheap (`C_poll`≈1µs): removing
+  234k frees ~0.23s over 20s ≈ 1% of the bottleneck core; with the bigger useful batches
+  maybe ~2–3% total. On a core whose time is dominated by **delivery** (3.7µs setup +
+  1.64µs/pkt in the *useful* polls, unchanged here), that doesn't add delivery capacity.
+
+- **Interpretation:** the wasted re-poll is **suppressible but was never the throughput
+  bound**. The binding constraint is the per-packet delivery work in the useful polls (and
+  the in-order delivery/decrypt serialization behind it), not the wasted-poll count. This
+  is the "wasted polls were nearly free" outcome — now measured, not hypothesized. It also
+  explains residual 28% wasted: a non-head completion that wakes a fresh poll *before* the
+  head crypts is still wasted; suppression only kills the MISSED *cascade* after it, not
+  the first wake (producer can't know head state without a race or a delay).
+- **Decision / next:** keep `wg_supp` as the clean isolated proof that the MISSED re-poll
+  is suppressible (good report result on its own). For **throughput**, the lever is
+  batching the *useful* polls to amortize the 3.7µs setup (per-pkt 5.3µs@k1 → 1.9µs@k16) —
+  i.e. the count-or-timeout trigger `wg_trig_k` (Phase E). Run `measure_trigger.sh 8 "0 8"
+  7` next. Optionally stack `wg_supp=1` with `wg_trig_k=8` later to see if suppression +
+  batching beats batching alone.
+
+---
+
+### 2026-06-23 — Phase E0 — ★ simplest fix BUILT: consumer-side MISSED re-poll suppression (`wg_supp`)
+
+The original-fix idea, moved to the place the trace says it belongs. Added one knob
+`wg_supp` (module param) to `wireguard_trigger.ko` (srcversion now `4BD8E49…`).
+
+- **What it does:** in `wg_packet_rx_poll`, on the completion path (`work_done < budget`,
+  i.e. the loop stopped on an empty or UNCRYPTED head), if the head is UNCRYPTED it
+  `clear_bit(NAPI_STATE_MISSED)` before `napi_complete_done` so the kernel **parks the
+  NAPI instead of re-polling**. A non-head decrypt completion that set MISSED would
+  otherwise force an immediate re-poll re-finding the same UNCRYPTED head — the wasted
+  no-op that is 99.7% of all wasted polls (Phase D). The head's *own* completion later
+  `napi_schedule`s a fresh, productive poll. Re-checks the head after clearing
+  (`smp_mb__after_atomic`) to re-arm MISSED if a wake raced in.
+- **Why this differs from the null first fix:** that gated `napi_schedule` (producer
+  side) — null because the bell is ~63% already-ringing and producer-side can't see what
+  the poll consumes. This acts at the **consumer/poll completion**, where the head state
+  is read authoritatively (single consumer ⇒ race-free wrt the queue), and cancels only
+  the re-poll it can *see* will be wasted, keeping the 44% productive reschedules.
+- **Honest caveat (lost-wakeup):** narrow race — head becomes CRYPTED + MISSED set in the
+  gap between our clear and `napi_complete_done`'s cmpxchg. Self-heals under continuous
+  load (next packet re-wakes); only a true stall if traffic idles in that window. The
+  recheck closes most of it; a small hrtimer backstop would make it bulletproof for idle.
+  First experiment runs under continuous iperf, so test now, add backstop only if a stall
+  shows.
+- **Layering note:** poking `NAPI_STATE_MISSED` from a driver is a deliberate prototype
+  hack; a production form would propose a `napi_complete`-with-condition API.
+
+**Exact change** (vs pristine 5.15 `drivers/net/wireguard/`). Stock was two lines at the
+end of `wg_packet_rx_poll`:
+
+```c
+/* receive.c (stock) — wg_packet_rx_poll completion */
+	if (work_done < budget)
+		napi_complete_done(napi, work_done);
+```
+
+Patched to (`build/wg515-trigger/receive.c:514-544`):
+
+```c
+	if (work_done < budget) {
+		/* MISSED re-poll suppression (wg_supp): the loop stopped on an empty or
+		 * UNCRYPTED head. If the head is UNCRYPTED, a MISSED set by a non-head
+		 * decrypt completion would force a re-poll re-finding it -> wasted no-op
+		 * (Phase D: 99.7% of wasted polls). Clear MISSED to park the NAPI; the
+		 * head's own completion re-wakes a productive poll. Single consumer, so
+		 * reading the head here is race-free; re-check after clearing to not drop
+		 * a wake that raced in. */
+		if (wg_supp) {
+			struct sk_buff *head = wg_prev_queue_peek(&peer->rx_queue);
+
+			if (head &&
+			    atomic_read_acquire(&PACKET_CB(head)->state) ==
+				    PACKET_STATE_UNCRYPTED) {
+				clear_bit(NAPI_STATE_MISSED, &napi->state);
+				smp_mb__after_atomic();
+				head = wg_prev_queue_peek(&peer->rx_queue);
+				if (head &&
+				    atomic_read_acquire(&PACKET_CB(head)->state) !=
+					    PACKET_STATE_UNCRYPTED)
+					set_bit(NAPI_STATE_MISSED, &napi->state);
+			}
+		}
+		napi_complete_done(napi, work_done);
+	}
+```
+
+Plus the knob — `build/wg515-trigger/main.c:35-37`:
+
+```c
+unsigned long wg_supp;               /* 0 = off (default, stock) */
+module_param(wg_supp, ulong, 0644);
+MODULE_PARM_DESC(wg_supp, "Suppress wasted MISSED re-polls when head is UNCRYPTED (0=off)");
+```
+
+and its declaration `build/wg515-trigger/queueing.h:201`:
+`extern unsigned long wg_supp;`. No other files change for this fix (the `peer.h`/`peer.c`/
+`queueing.h`-enqueue edits belong to the separate `wg_trig_k` coalescer).
+
+- **Smoke test PASSED:** builds clean, all three knobs present (`wg_supp`, `wg_trig_k`,
+  `wg_trig_tau_ns`), loads, `wg_supp` 0→1 live, wg0 create/teardown + `rmmod` clean.
+- **Next:** `measure_supp.sh 8 7` — wg_supp 0 vs 1, coalescer off. Hypothesis: wasted_frac
+  drops below 33%, GBPS rises. This is the simplest thing that could move the headline;
+  the count-or-timeout trigger (`wg_trig_k`) is the fuller version if this leaves headroom.
+
+---
+
+### 2026-06-23 — Phase E — ★ trigger module BUILT (`wireguard_trigger.ko`), single-binary runtime knob
+
+Implemented `TRIGGER_DESIGN.md` as the count-or-timeout RX coalescer and built it.
+
+- **Single binary, runtime knob.** Module param `wg_trig_k` (0644): `0` ⇒ byte-identical
+  stock behaviour, `≥1` ⇒ trigger on; `wg_trig_tau_ns` (default 5000) is the coalesce
+  window. So the A/B is `k=0` vs `k=8` on the *same loaded module* — no base divergence,
+  no reload variance, the strongest possible comparison. Toggle via
+  `/sys/module/wireguard/parameters/wg_trig_k`.
+- **The change (5 files, vs pristine 5.15):** `peer.h` +`struct hrtimer
+  rx_coalesce_timer; atomic_t rx_timer_armed, rx_ready;`. `peer.c` hrtimer_init
+  (`CLOCK_MONOTONIC, REL_SOFT`) in create, `hrtimer_cancel` in `peer_remove_after_dead`
+  after the crypt_wq flushes (no decrypt worker can re-arm past there). `queueing.h`
+  rewrites `wg_queue_enqueue_per_peer_rx`: on CRYPTED completion `atomic_inc_return(rx_ready)`
+  — ≥K ⇒ cancel timer + `napi_schedule`; else `atomic_cmpxchg`-arm one timer (τ). DEAD/
+  error and k=0 keep the bare immediate wake. `receive.c` adds the timer callback
+  (`napi_schedule`, NORESTART) + resets `rx_ready` on poll entry. `main.c` defines the params.
+- **Design deviation (deliberate, safe):** readiness is the **counter** `rx_ready`, NOT a
+  `wg_prev_queue_peek` of the head. The peek is single-consumer (the poll); calling it
+  from the multi-core decrypt workers / timer would race the `peeked` pointer. Counter is
+  a safe proxy and is exactly the `ready` estimate the design's K fast-path already needs.
+  Timer is single-shot ⇒ τ is also the liveness bound (τ_max ≡ τ); the head-ready re-arm
+  variant is dropped for the same race reason.
+- **Build = clean-room.** dut's `~/linux-source-5.15.0` is contaminated (stale
+  `wg_trace`/`wg_dbg` in receive.c/main.c, no .orig backups) AND the repo's `linux-source/`
+  is a *newer* revision (uses `skb->headers`, `cpumask_nth`) that won't compile on 5.15.
+  So extracted a PRISTINE tree from `/usr/src/linux-source-5.15.0/...tar.bz2`, dropped the
+  5 modified files in, built against `5.15.0-177` headers. Patch kept in repo at
+  `build/wg515-trigger/`. srcversion `3076ED3…`.
+- **Smoke test PASSED:** compiles clean (only the pre-existing allowedips frame-size
+  warnings); loads with k=0; both params present + live-tunable (set k=8 OK);
+  `ip link add/del wg0` exercises hrtimer init + the teardown `hrtimer_cancel` with a
+  clean `rmmod` (an oops would have blocked unload).
+- **Next:** `measure_trigger.sh 8 "0 8" 7` — the k=0 vs k=8 A/B. Hypothesis: wasted_frac
+  drops, batch grows, and on the CPU-bound core GBPS rises — the headline the 6-line fix
+  never moved.
+
+---
+
+### 2026-06-22 — Low-variance sweep @8 peers — ★ M1 6-line fix confirmed NULL with tight error bars
+
+`run_sweep.sh "8" "stock patched" 7` — 14 runs, module order shuffled per round,
+auto-elevating scripts. Each run: insmod + 8 peers + iperf servers + gen load +
+bpftrace wasted/useful poll counts. Artifact: `~/sweep_20260622_0826.csv`.
+
+```
+mod      peers   n  gbps_med gbps_cv%  wfrac_med wfrac_cv%
+patched      8   7     4.155      0.3     0.3349       1.7
+stock        8   7     4.169      0.2     0.3306       1.4
+
+median(patched) − median(stock):  dGbps=-0.014  dWastedFrac=+0.0043
+```
+
+- **CV is tiny everywhere (0.2–1.7%, all ≪ 5%)** ⇒ 7 runs/module is more than enough;
+  the small-run worry is closed. These medians are solid.
+- **The patched−stock deltas are noise, and the sign is even slightly *wrong*:**
+  throughput −0.014 Gb/s (−0.3%, within CV), wasted fraction **+0.0043** (patched wastes
+  *more*, not less). The M1 6-line `napi_schedule` gate does **nothing measurable** on a
+  real 10 G NIC under saturation. This is the null we predicted, now with error bars
+  instead of a single run.
+- Wasted-poll fraction sits at **~33%** both modules — a third of `wg_packet_rx_poll`
+  invocations still find the head un-decrypted. That is the headroom a real trigger must
+  reclaim; the M1 gate leaves it entirely on the table.
+- **Decision / next:** baselines are locked. Proceed to Phase E — implement
+  `wireguard_trigger.ko` (hrtimer + atomic in `wg_peer`, τ≈5 µs / K≈8 count-or-timeout
+  gate, per `TRIGGER_DESIGN.md`) and re-run this exact sweep as `"stock patched trigger"`
+  to measure the delta the gate failed to deliver.
+
+---
+
+### 2026-06-22 — Saturation CONFIRMED — ★ one core at 100% softirq @4.2 Gb/s ⇒ CPU-bound, Design A locked
+
+`measure_sat.sh stock 8` (self-contained: insmod + peers + iperf servers + gen load +
+per-core busy% sample + throughput). 22 s window under live 8-peer load:
+
+- **CPU5 = 100.0% busy, 97.5% softirq**; every other core ≤ 23%. **GBPS = 4.200.**
+- → the receive path is **bottlenecked on a single core saturated in NET_RX softirq** —
+  that is where `wg_packet_rx_poll` (GRO + delivery + the wasted polls) runs. **Wasted
+  polls burn the bottleneck core's cycles.** The ~20% cores are decrypt (padata-spread)
+  + iperf servers → decrypt is NOT the ceiling; the single-core poll/GRO/delivery is.
+- Hot core is CPU5 here vs CPU3 in the `/proc/softirqs` checks — the queue-2 IRQ lands on
+  a different core across module reloads, but always exactly ONE core. Same phenomenon.
+- **DECISION — Design A locked:** keep the single-core CPU-bound regime as the primary
+  experiment. Zero headroom ⇒ any CPU the trigger reclaims converts directly to Gb/s;
+  throughput is now the clean headline metric (the one the M1 fix never moved). Do NOT
+  spread RX to 10G (Design B) — that's a later "it generalizes" run.
+- Next: low-variance sweep (`run_sweep.sh "1 8 16 32" "stock patched" 7`) for baselines
+  with error bars, then implement `wireguard_trigger.ko`.
+- Scripts now live on dut `~/` (pushed via scp): `measure_sat.sh`, `measure_run.sh`,
+  `run_sweep.sh`, `analyze_sweep.py`, `measure_repoll_gap.sh`, + the existing set.
+
+### 2026-06-22 — Saturation diagnosis — ★ receive softirq funneled to ONE core (the 4 Gb/s cause)
+
+Why ~4 Gb/s on a 10G NIC, and is the bottleneck core CPU-bound? `/proc/softirqs` NET_RX
+delta over 3 s (install-free; `mpstat` absent, sysstat not installed):
+
+- **CPU3 = 84.9% of all NET_RX**; every other CPU ≤ 1.8% (CPU20 1.8, CPU5/7/24 1.2…).
+  → the receive softirq is **funneled to a single core**. Confirms the suspicion: all 8
+  tunnels share dst port 51820 + gen's src IP, only the src UDP port varies, so an
+  IP-only RX flow-hash collapses them onto one queue/core. **Adding peers ≠ adding cores
+  → that is the 4 Gb/s ceiling.**
+- **ROOT CAUSE PROVEN (re-run under load):** CPU3 70.8% NET_RX, AND `ethtool -S enp6s0f1`
+  → `rx_queue_2 = 97,791,799` pkts vs every other queue 1–55 (one queue gets everything),
+  AND `ethtool -n enp6s0f1 rx-flow-hash udp4` = **`IP SA` + `IP DA` only — no L4 ports.**
+  So all tunnels (same src/dst IP) hash identically → queue 2 → CPU3. Definitive.
+  Spread fix (Design B, later): `sudo ethtool -N enp6s0f1 rx-flow-hash udp4 sdfn` + IRQ/RPS.
+- Caveat: absolute delta low (+287/3 s) → load likely idle during that exact snapshot;
+  the *distribution* is the signal, re-confirm under live load + per-core busy% (next).
+- **Decision (recorded):** embrace the single-core bottleneck as the experiment — do NOT
+  chase 10G. The funneled regime is where the trigger pays off: wasted polls burn the
+  *bottleneck* core's cycles, so reclaiming them = throughput. More peers add
+  parallel-decrypt disorder on the same core (the wasted-poll condition), not cores.
+  Design B (spread RX to 10G via `ethtool -N … rx-flow-hash udp4 sdfn` + IRQ/RPS) is a
+  later "it generalizes" run, not the contribution. Next: confirm CPU3 ~100% busy under
+  live load, then low-variance sweep (`run_sweep.sh`), then implement the trigger.
+
+**Commands (reproduce):**
+```bash
+# (1) which CPUs take NET_RX softirq, how concentrated (install-free; mpstat absent)
+python3 - <<'PY'
+import time
+def snap():
+    for l in open('/proc/softirqs'):
+        if l.strip().startswith('NET_RX:'): return list(map(int, l.split()[1:]))
+a=snap(); time.sleep(3); b=snap()
+d=sorted(((i,b[i]-a[i]) for i in range(len(a))), key=lambda x:-x[1]); t=sum(v for _,v in d) or 1
+for i,v in d[:12]: print(f"CPU{i:<3} NET_RX +{v:<10} {100*v/t:5.1f}%")
+PY
+# -> CPU3 70.8-84.9%
+
+# (2) per-RX-queue packet spread: is it one queue or many?
+ethtool -S enp6s0f1 | grep -E 'rx.*packets' | awk '$2+0>0' | sort -t_ -k3 -n | tail -20
+# -> rx_queue_2 = 97,791,799 ; all others 1-55  (one queue gets everything)
+
+# (3) the root cause: NIC UDP hash uses no L4 ports
+ethtool -n enp6s0f1 rx-flow-hash udp4
+# -> "IP SA / IP DA" only -> all same-IP tunnels collide on one queue
+
+# (4) is that bottleneck core actually SATURATED at 4 Gb/s? (busy% + softirq% under live load)
+# node-to-node ssh works only as ROOT -> use `sudo ssh` (plain `ssh gen` => publickey denied,
+# load never runs, busy% reads 0% everywhere). genload_json.sh must exist on gen first:
+#   sudo ssh gen 'cat > /tmp/genload_json.sh' < scripts/cloudlab/genload_json.sh
+sudo ssh -o StrictHostKeyChecking=no gen "bash /tmp/genload_json.sh 8 30 4" &
+python3 - <<'PY'
+import time
+def snap():
+    c={}
+    for l in open('/proc/stat'):
+        if l.startswith('cpu') and l[3:4].isdigit():
+            p=l.split(); t=sum(map(int,p[1:])); idle=int(p[4])+int(p[5]); soft=int(p[7])
+            c[p[0]]=(t,idle,soft)
+    return c
+a=snap(); time.sleep(10); b=snap()
+rows=[]
+for k in a:
+    dt=b[k][0]-a[k][0]
+    if dt>0: rows.append((k,100*(1-(b[k][1]-a[k][1])/dt),100*(b[k][2]-a[k][2])/dt))
+rows.sort(key=lambda x:-x[1])
+for k,busy,soft in rows[:12]: print(f"{k:6} busy={busy:5.1f}%  softirq={soft:5.1f}%")
+PY
+wait   # prints aggregate "GBPS <n>"
+
+# Design B spread fix (later): add L4 ports to the hash, then spread IRQs/RPS
+sudo ethtool -N enp6s0f1 rx-flow-hash udp4 sdfn
+```
+
+### 2026-06-22 — Phase D+ — RE-POLL GAP measured — ★ corrects the "sub-µs" claim, calibrates τ
+
+`measure_repoll_gap.sh stock 8` (gap-only, no decrypt probe). Gap = `entry(poll N+1) −
+return(poll N)` keyed by napi ptr; split by re-poll outcome, gated on prev poll having
+rescheduled via MISSED (`napi_complete_done`==0).
+
+- **Gap is ~1–2 µs, NOT sub-µs.** `@gap_all_ns` mode [1K,2K)=1.26M; mass in [1K,4K).
+  `@missed_repoll_WASTED_ns` median ≈ **1.6 µs** (mode [1K,2K)=595k, then [2K,4K)=113k).
+  So vs `T_decrypt≈5µs` the re-poll is **~3× too early** — the design doc's "sub-µs,
+  nothing can change" was an **overstatement** (corrected in `MISSED_REPOLL_PROOF.md`).
+- **Not "almost always wasted" — it's a coin flip that improves with the gap.** WASTED
+  and useful gap distributions are nearly superimposed at the mode. Useful-fraction by
+  bucket: <1µs 40% · **1–2µs 49%** · 2–4µs **67%** · 4–8µs 65% · 8–16µs 72%. Totals
+  ≈727k wasted / ≈822k useful (53% useful; ≈ trace build's 44%).
+- **τ calibration (the payoff):** useful% knee at ~2–4 µs, plateau ~72% by 8–16 µs ⇒
+  the right coalesce window is **τ ≈ 4–5 µs (≈ one T_decrypt)**, NOT the guessed 20 µs.
+  Updated `TRIGGER_DESIGN.md` defaults accordingly.
+- **Mechanism (refined):** at poll-end the head's decrypt has a *remaining* time spread
+  over ~[0,5µs]; the re-poll fires at ~1.6µs and catches ~half. Coalescing the wake to
+  ~one T_decrypt lets the head (and followers) finish → bigger batches, fewer wasted
+  polls. The lever is *when* the re-poll runs, exactly as designed.
+- Caveat: large natural gaps are confounded with light-load idle (head more likely
+  already done) → the useful% curve overstates the pure causal effect of waiting; the
+  clean number is the trigger A/B sweep (Phase E). Single run, N=8. Sanity: WASTED
+  count ≈727k ≈ trace build `wasted_after_resched` 898k (same order; different run/load).
+- Raw: histograms in session; `RESULT repoll_gap module=stock src=81233F6… N=8`.
+
 ### 2026-06-18 — E1 A/B at 1 peer — NO clear effect at 1 peer (expected), needs multi-peer + repeats
 
 - Same protocol both modules: 1 peer, `iperf3 -t15 -P8`, 20s `wg_packet_rx_poll` probe.
@@ -133,6 +695,47 @@ Mean packets per GRO flush. M1 ref: 3.1→3.3 (1p), 8.7→9.6 (8p), 7.7→8.9 (3
   parallel-decrypt disorder that comes with MANY peers. **Decisive test = E0.5
   multi-peer + ≥5 repeats with a normalized metric.** Do NOT draw conclusions from
   this single 1-peer run.
+
+### 2026-06-19 — Phase D confirm — trace build (is the wasted poll a MISSED re-poll?)
+
+Before designing, confirm the mechanism. `wireguard_trace.ko` = **stock** (restored
+`queueing.h.orig`) + 4 counters in `wg_packet_rx_poll`: `polls`, `wasted`
+(work_done==0), `resched` (napi_complete_done returned false = MISSED forced a
+reschedule), `wasted_after_resched` (wasted poll whose prev poll for the same napi —
+serialized, race-free — rescheduled; per-peer flag `dbg_prev_resched`).
+
+**Mechanism (traced in code):** peer NAPI is SCHED → completion's `napi_schedule` is a
+no-op that sets `NAPI_STATE_MISSED` → at poll end `napi_complete_done` sees MISSED,
+reschedules, returns false → re-poll → head now UNCRYPTED (crypted run already
+delivered) → work_done==0 wasted. Producer-side gating can't catch it: at wake time
+you can't know what the poll will have consumed by completion, and `queue->tail` is a
+stale racing read while a poll is peeking. Decision belongs on the consumer side.
+
+**RESULT (trace @8p) — CONFIRMED:**
+- polls = 2,819,690 · wasted = 900,812 (31.9%) · resched = 1,609,978 (57%) ·
+  wasted_after_resched = 897,901.
+- **wasted_after_resched / wasted = 99.7%** → wasted polls are (essentially all)
+  MISSED-driven re-polls. **Mechanism proven.**
+- resched / polls = 57% (NAPI kept alive by MISSED). wasted / resched = 56% → of the
+  reschedules, 56% are wasted, **44% (709k) are productive**.
+- Sanity: in-module wasted 900,812 ≈ bpftrace WASTED 889,857 ✓.
+- **Design consequence:** must suppress reschedules **selectively** (only when head
+  UNCRYPTED) to keep the 44% productive ones. Lever is the consumer/poll side, where
+  the head state is read authoritatively. Producer-side gating can't (racy tail read
+  during active poll; can't predict what the poll consumes by completion). Safety: a
+  naive MISSED-suppress risks lost wakeups → needs a timer backstop and/or head-recheck.
+
+### 2026-06-19 — Phase D — trigger DESIGN written (`TRIGGER_DESIGN.md`)
+
+- Lever identified: poll self-deschedules (`napi_complete_done` when work_done<budget),
+  so the completion-side wake controls the *next* poll → coalesce the re-wake.
+- Rule: count-or-timeout (K≈8–16, τ≈20µs, τ_max≈200µs), head-ready gated; defers the
+  wake to build bigger batches, never wakes into an UNCRYPTED head.
+- Grounded in costs: per-pkt cost flattens at K=8–16; ~4.7µs CPU saved per avoided
+  poll; CPU-bound receiver → expect **throughput** to rise (what the M1 fix never did).
+- Code map (5.15): hrtimer+atomic in `wg_peer`; gate in `wg_queue_enqueue_per_peer_rx`;
+  timer callback does head-check + napi_schedule; K/τ as module params. Race: single
+  timer owner via atomic_cmpxchg. Next: implement `wireguard_trigger.ko` (Phase E).
 
 ### 2026-06-19 — E3+E4+E5 cost model COMPLETE (stock @8p)
 

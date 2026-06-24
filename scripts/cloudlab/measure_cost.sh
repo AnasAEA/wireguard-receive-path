@@ -1,4 +1,5 @@
 #!/bin/bash
+[ "$(id -u)" -eq 0 ] || exec sudo bash "$0" "$@"
 # Cost-model probe on the DUT (Phase C). One run captures:
 #   E2  T_decrypt          -- decrypt_packet latency histogram
 #   E4  C_poll / C_deliver -- wg_packet_rx_poll average duration keyed by work_done

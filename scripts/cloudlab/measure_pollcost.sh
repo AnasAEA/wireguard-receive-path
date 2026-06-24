@@ -1,4 +1,5 @@
 #!/bin/bash
+[ "$(id -u)" -eq 0 ] || exec sudo bash "$0" "$@"
 # Clean C_poll / C_deliver (E4): probe ONLY wg_packet_rx_poll (no decrypt probe),
 # so poll durations aren't inflated by per-packet probe overhead.
 # Usage:  sudo bash measure_pollcost.sh <stock|patched|diag> <N> [DUR] [STREAMS] [GEN]

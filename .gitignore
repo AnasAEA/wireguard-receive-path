@@ -44,9 +44,14 @@ report/*.pdf
 *.csv
 !results/**/*.csv
 !results/**/*.log
+# committed raw data backing the CloudLab findings docs
+!data/cloudlab/*.csv
 results/
 scripts/keys/*_priv
 linux/
 scripts/keys/multipeer/*_priv
 scripts/__pycache__/
 notes/full_context_prompt.md
+
+# local plotting venv
+.venv-plot/

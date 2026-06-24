@@ -1,4 +1,5 @@
 #!/bin/bash
+[ "$(id -u)" -eq 0 ] || exec sudo bash "$0" "$@"
 # Measure the wasted-poll fraction for ONE (module, N) on the DUT.
 # Swaps the wireguard module, rebuilds wg0+peers, drives load from GEN, and runs
 # the bpftrace probe. Prints WASTED/USEFUL totals + the work_done histogram.

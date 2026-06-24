@@ -1,4 +1,5 @@
 #!/bin/bash
+[ "$(id -u)" -eq 0 ] || exec sudo bash "$0" "$@"
 # C_stack (E5) + Delta_complete (E3): napi_gro_receive cost + inter-completion gap.
 #   @gro_ns       -- napi_gro_receive duration (per-packet stack/GRO cost)
 #   @delta_ns     -- gap between consecutive decrypt completions, per CPU
