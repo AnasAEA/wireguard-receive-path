@@ -9,8 +9,8 @@
 # wg0 + peers. The 10G experiment NIC (enp6s0f0, 192.168.1.1 dut / .2 gen) and node-to-node
 # root SSH come pre-configured by the profile.
 set -euo pipefail
-DUT=${DUT:-anasait@c220g2-010630.wisc.cloudlab.us}
-GEN=${GEN:-anasait@c220g2-010628.wisc.cloudlab.us}
+DUT=${DUT:-anasait@c220g2-011314.wisc.cloudlab.us}
+GEN=${GEN:-anasait@c220g2-011319.wisc.cloudlab.us}
 N=${1:-8}
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
@@ -18,9 +18,9 @@ SSH="ssh -o StrictHostKeyChecking=no"
 
 echo "== [1/6] install packages =="
 $SSH "$DUT" 'sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-    iperf3 wireguard-tools linux-source-5.15.0 >/tmp/apt.log 2>&1; echo dut: iperf3=$(which iperf3) src=$(ls /usr/src/linux-source-*/*.tar.bz2 2>/dev/null)'
+    iperf3 wireguard-tools linux-source-5.15.0 netperf sockperf >/tmp/apt.log 2>&1; echo dut: iperf3=$(which iperf3) netperf=$(which netserver) sockperf=$(which sockperf) src=$(ls /usr/src/linux-source-*/*.tar.bz2 2>/dev/null)'
 $SSH "$GEN" 'sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-    iperf3 wireguard-tools >/tmp/apt.log 2>&1; echo gen: iperf3=$(which iperf3) wg=$(which wg)'
+    iperf3 wireguard-tools netperf sockperf >/tmp/apt.log 2>&1; echo gen: iperf3=$(which iperf3) netperf=$(which netperf) sockperf=$(which sockperf) wg=$(which wg)'
 
 echo "== [2/6] push scripts =="
 DUT="$DUT" GEN="$GEN" bash "$HERE/sync_to_dut.sh"
