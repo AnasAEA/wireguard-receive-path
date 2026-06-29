@@ -3,12 +3,61 @@
 > Hands-on walkthrough for the live testbed. Copy blocks from here.
 > Recipe: `CLOUDLAB_EXPERIMENTS_PLAN.md`. Results: `CLOUDLAB_EXPERIMENTS_LOG.md`.
 
-**Live nodes (instantiation #1, lease extended 2026-06-17):**
+**Live nodes (instantiation #3, re-instantiated 2026-06-26):**
 
 | Role | Node | SSH |
 |------|------|-----|
-| `dut` (instrumented receiver) | c220g2-011308 (Wisc) | `ssh anasait@c220g2-011308.wisc.cloudlab.us` |
-| `gen` (load generator) | c220g2-011310 (Wisc) | `ssh anasait@c220g2-011310.wisc.cloudlab.us` |
+| `dut` (instrumented receiver) | c220g2-010630 (Wisc) | `ssh anasait@c220g2-010630.wisc.cloudlab.us` |
+| `gen` (load generator) | c220g2-010628 (Wisc) | `ssh anasait@c220g2-010628.wisc.cloudlab.us` |
+
+> **Experiment 10G NIC is now `enp6s0f0`** (was `enp6s0f1` in instantiation #1), already
+> up with dut `192.168.1.1` / gen `192.168.1.2`. Node-to-node SSH works only as **root**
+> (`sudo ssh gen`). A fresh instantiation is a blank UBUNTU22 image: re-bootstrap with
+> `scripts/cloudlab/bootstrap_testbed.sh` (installs iperf3/wireguard-tools/linux-source,
+> pushes scripts, builds `wireguard_trigger.ko`, brings up wg0 + 8 peers). A fresh
+> instantiation regenerates the DUT key — the bootstrap reads the new pub and passes it to
+> `setup_gen_clients.sh` automatically. DUT pub for instantiation #3:
+> `z2HDdaydsU4sgYL5zMnL4dk3nJ8kWvyvDbDScnb35xo=`.
+
+---
+
+# ▶ RUN NOW — three experiments × peer-count sweep (Alain 2026-06-25)
+
+All on `dut`. Module `~/wireguard_trigger.ko` (srcversion `EA06EE82…`) has the two-sided
+fix composable (`wg_supp` + `wg_headwake`) and the decrypt-cost knob (`wg_decrypt_delay_ns`).
+Gen has 64 client namespaces pre-created, so any `N ≤ 64` works. Each script rebuilds dut
+peers for `N`, uses the sdfn spread, and reverts the NIC hash to `sd` at the end.
+
+```bash
+# 1) TWO-SIDED FIX A/B — wasted-poll reduction (stock / move / root / both). DONE + clean.
+#    'both' = wg_supp=1 wg_headwake=1 (producer gate + consumer suppress).
+#    NOTE: measure_missed.sh now warms up the tunnels before the loop — without it the FIRST
+#    condition (stock) was measured cold and reported a bogus polls=1 / 0% wasted.
+for N in 8 16 32 64; do sudo bash ~/measure_missed.sh "$N" 12; done
+#    Result (2026-06-26, data/cloudlab/twosided_peersweep_20260626.csv, fig_twosided_peers.png):
+#    stock ~27% -> move ~25% -> root ~15% -> both ~14% wasted polls, ~FLAT from 8 to 64 peers.
+#    'both' halves wasted polls; the fresh-wake regeneration drops from ~6% (move) to ~1% (both).
+#    The M1 "grows with peers" effect does NOT reproduce here.
+
+# 2) TAIL LATENCY at sub-saturation — NOISY, NOT YET RELIABLE.
+for N in 8 16 32 64; do sudo bash ~/measure_taillat.sh "$N" 2000 20; done
+#    off/both trade places run-to-run, 10-12ms outliers both sides, and 'off' loses ping
+#    samples (769-795 vs 2000) => percentiles untrustworthy. TODO before believing any number:
+#    more samples, a latency tunnel isolated from the load, fix the off-side sample loss.
+
+# 3) DECRYPT-COST SWEEP — knob works, METHODOLOGY BREAKS at high delay.
+for N in 8; do sudo bash ~/measure_decrypt_sweep.sh "$N" "0 5000 10000 20000 40000" 12; done
+#    Direction is right: stock wasted rises ~28% -> ~44% as decrypt slows, fix removes more.
+#    But past ~10-20us/packet the busy-wait collapses the pipeline (gbps -> 0.000/NA, wasted%
+#    meaningless). TODO: re-run at a CAPPED sub-line-rate load + fix the throughput capture.
+```
+
+To repeat a single cell for variance, just rerun that one line (e.g. `sudo bash
+~/measure_taillat.sh 32 2000 20`). CSVs land in `~` (`taillat_*.csv`, `decsweep_*.csv`);
+`measure_missed.sh` prints to stdout. Knob check while loaded: `cat
+/sys/module/wireguard/parameters/{wg_supp,wg_headwake,wg_decrypt_delay_ns}`.
+
+---
 
 **Done:** E0.1 instantiate · E0.2 verify HW/NIC/BTF · E0.6 symbols · E0.4 tunnel ·
 E0.3 build stock+patched modules · E1 stock pre-check (EoI reproduced, 35.8% wasted
@@ -780,11 +829,6 @@ echo "[dut] wg0 up with $(wg show wg0 peers | wc -l) peers; module srcversion $(
 EOF
 sudo bash ~/setup_dut_peers.sh 8
 ```
-
-the mafia is king and c is the police. The doctor is q, and the rest are citizens.
-
-to win the game you must be the last citizen alive.
-
 
 ## Step 4 — verify all 8 peers handshake
 ```bash

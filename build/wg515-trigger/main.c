@@ -44,6 +44,15 @@ unsigned long wg_headwake;           /* 0 = off (default, stock) */
 module_param(wg_headwake, ulong, 0644);
 MODULE_PARM_DESC(wg_headwake, "Wake the RX poll only when the completion makes the head ready (0=off)");
 
+/* Decrypt-cost sensitivity (Alain 2026-06-25): busy-wait this many ns per decrypted
+ * data packet, in the decrypt worker, to lengthen T_decrypt without touching the
+ * per-poll cost. Lets us sweep the decrypt:poll ratio and find where the EoI fix
+ * starts to pay. 0 = off (native hardware timing).
+ */
+unsigned long wg_decrypt_delay_ns;   /* 0 = off (default) */
+module_param(wg_decrypt_delay_ns, ulong, 0644);
+MODULE_PARM_DESC(wg_decrypt_delay_ns, "Busy-wait ns injected per decrypt to slow T_decrypt (0=off)");
+
 /* Diagnostic counters (wg_diag=1): at poll completion, classify head-state ×
  * whether MISSED is set. Read/reset via sysfs. Behaviour-preserving.
  */

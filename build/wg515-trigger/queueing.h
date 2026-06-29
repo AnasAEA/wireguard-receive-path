@@ -200,6 +200,7 @@ extern unsigned long wg_trig_k;       /* batch threshold; 0 => trigger OFF (stoc
 extern unsigned long wg_trig_tau_ns;  /* coalesce window in nanoseconds */
 extern unsigned long wg_supp;         /* 1 => suppress wasted MISSED re-polls (poll side) */
 extern unsigned long wg_headwake;     /* 1 => only wake when this completion makes the head ready */
+extern unsigned long wg_decrypt_delay_ns; /* busy-wait injected per decrypt to slow T_decrypt (0=off) */
 /* Diagnostic (wg_diag): classify head-state × MISSED at poll completion. */
 extern unsigned long wg_diag;
 extern unsigned long wg_diag_empty_missed, wg_diag_empty_nomiss;

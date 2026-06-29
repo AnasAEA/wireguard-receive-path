@@ -3,25 +3,34 @@
 > Synthesis of the CloudLab receive-path investigation. The lab notebook with raw runs
 > is `CLOUDLAB_EXPERIMENTS_LOG.md`; this is the polished, honest conclusion. Author: Anas
 > Ait El Hadj · Inria KrakOS (LIG). Testbed: CloudLab Wisconsin `c220g2`, 2× Xeon
-> E5-2660 v3 (40 threads), NIC `enp6s0f1` 10 GbE, kernel 5.15.0-177. Figures live in
-> `../meetings/figures/`.
+> E5-2660 v3 (40 threads), 10 GbE, kernel 5.15.0-177 (experiment NIC `enp6s0f1` on
+> instantiation #1, `enp6s0f0` on #2/#3). Figures live in `../meetings/figures/`.
+
+> **Update 2026-06-26 (after the point with Alain):** the framing below is corrected. The
+> fix *does* remove real work — the earlier "buys nothing / negative result" wording was
+> measuring it against the wrong yardstick (throughput, which is already saturated). What is
+> still open is whether that removed work converts into a *user-visible* gain (CPU-per-byte,
+> tail latency). See §2b for the two-sided result and §7 for the corrected reading.
 
 ## TL;DR — what we actually found (and what we did not)
 
-1. **The EoI fix does not improve real-world performance.** The Execution-order-Inversion
-   wasted-poll inefficiency is real and we can reduce it (by 20–50% depending on the
-   variant), but on real hardware that buys **nothing**: throughput, latency, and
-   CPU-per-byte are all unchanged. The wasted polls are simply too cheap (~1 µs each).
-2. **The one thing that did move throughput is parallelism, and it is a NIC config change,
-   not the fix.** The receiver was funnelled onto a single core by the NIC's IP-only flow
-   hash; switching the hash to include the UDP ports (`sdfn`) fans the tunnels across 8
-   cores and lifts throughput **4.1 → 9.0 Gb/s (×2.2)**, near line rate. This works with
-   *stock* WireGuard.
-3. **So the deliverable of this phase is a rigorous negative result + a corrected
-   hypothesis + identification of the real lever (parallelism).** Not a speedup. (Note:
-   on the earlier *M1 loopback* testbed — the graded/defended work — the fix *did* show a
-   benefit, e.g. tail latency ~halved at 64 peers; this phase shows that does **not**
-   generalise to real 10G hardware, and explains why.)
+1. **The EoI fix removes real wasted work; the open question is whether that shows up where
+   a user looks.** The wasted-poll inefficiency is real, and the **two-sided fix (producer
+   gate + consumer suppress together) halves it** — ~27% → ~14% of polls, flat from 8 to 64
+   peers (§2b). That is genuine CPU work removed (~1 µs/poll on the receive core). What it
+   does *not* do is move **throughput** — but throughput is the wrong yardstick here, it is
+   already at line rate. Whether the saved work shows up in **tail latency / CPU-per-byte**
+   is being measured and is **not yet conclusive** (latency noisy, decrypt-sweep methodology
+   still rough).
+2. **The throughput lever is parallelism, and it is a NIC config change, not the fix.** The
+   receiver was funnelled onto a single core by the NIC's IP-only flow hash; switching the
+   hash to include the UDP ports (`sdfn`) fans the tunnels across 8 cores and lifts
+   throughput **4.1 → 9.0 Gb/s (×2.2)**, near line rate, with *stock* WireGuard.
+3. **Deliverable so far: the real lever (parallelism) + a fix that demonstrably removes
+   ~half the wasted polls, with the user-visible payoff under active measurement.** (Note:
+   on the earlier *M1 loopback* testbed the fix's benefit *grew with peers*; on this real-HW
+   spread regime the wasted-poll reduction is **flat across peers** — it does not reproduce
+   the peer-count growth, but the reduction itself is solid.)
 
 The rest of this document is the evidence.
 
@@ -62,12 +71,44 @@ setting on the *same loaded module*. 8 peers, ≥5–7 shuffled runs, CV < 4%.
 (~4.1 Gb/s) everywhere. Medians, 5 reps.*
 
 The progression is itself the story: **the more completely you fix the EoI, the more
-wasted polls you remove — and it still changes nothing downstream**, while the most
-complete version (`headwake`) becomes *unsafe* (a single lost wakeup deadlocks the flow
-under TCP; this is why the kernel's "wasteful" MISSED re-poll exists — the waste is the
-safety).
+wasted polls you remove** — while the most complete version (`headwake`) carries a
+lost-wakeup risk (a single lost wakeup deadlocks the flow under TCP; this is why the
+kernel's "wasteful" MISSED re-poll exists — the waste is the safety; mitigated here with a
+Dekker publish-then-recheck, §2b).
 
-## 3. Why nothing helps the throughput (single core)
+## 2b. The two-sided fix (composable) and the peer sweep — the clean positive result
+
+After the point with Alain (2026-06-25), `wg_supp` (consumer) and `wg_headwake` (producer)
+were made **composable** (previously mutually exclusive; `receive.c` no longer returns early
+in the headwake branch). Rationale: the consumer-side suppress cancels the wasted re-poll,
+but the wake **regenerates** through the producer path (the next non-head completion calls
+`napi_schedule`); the producer gate intercepts that regeneration. Module srcversion
+`EA06EE82…`; `both` = `wg_supp=1 wg_headwake=1`.
+
+Peer sweep on instantiation #3 (sdfn spread, `measure_missed.sh`, warm-up added so the first
+condition isn't measured cold; `data/cloudlab/twosided_peersweep_20260626.csv`):
+
+![Wasted polls vs peer count](../meetings/figures/fig_twosided_peers.png)
+
+| peers | stock | move (supp) | root (headwake) | both |
+|---|---|---|---|---|
+| 8  | 27.0% | 25.8% | 15.4% | 14.8% |
+| 16 | 27.3% | 26.1% | 15.9% | 13.8% |
+| 32 | 26.8% | 25.1% | 15.0% | 13.1% |
+| 64 | 27.5% | 25.3% | 15.4% | 14.4% |
+
+Three readings: (1) **`both` halves wasted polls (~27 → ~14%)** and is additive — the
+consumer adds little alone (~2 pts), the producer does most, the two together edge below
+either. (2) The **regeneration is visible in the counters**: `move` alone raises the
+*fresh-wake* share of wasted polls from ~3% (stock) to ~6%, and adding the producer gate
+drops it to ~1% — direct evidence the two sides catch the waste the other leaks. (3) It is
+**flat from 8 to 64 peers**: the M1 loopback's peer-count growth does not reproduce on this
+real-HW spread regime, but the ~½ reduction holds at every N.
+
+This is the corrected positive result: a real, reproducible halving of wasted poll work. The
+remaining question (does it convert to a user-visible CPU/latency win) is §7's open item.
+
+## 3. Why throughput does not move (and why that is the wrong yardstick)
 
 Per-core CPU under load shows **one core pinned at 100% / 97% softirq**, every other core
 ≤ 22%, *regardless of which fix is on*. That core's time goes to **per-packet delivery up
@@ -149,28 +190,39 @@ regime:
 Of stock reschedules, **54% occur with an UNCRYPTED head, 46% with an empty (drained)
 queue** — both common in parallel mode.
 
-## 7. What this means for the project (honest)
+## 7. What this means for the project (honest, corrected 2026-06-26)
 
-- **Performance delivered by the EoI fix on real hardware: none.** It reduces the
-  wasted-poll *count* (20–50%), but that count does not bound throughput, latency, or CPU.
-- **Real throughput win: parallelism (×2.2), a NIC-config change, not the fix.**
-- **The contribution is knowledge, not a speedup:** a rigorous, reproducible, multi-regime
-  demonstration that a plausible kernel optimisation does not help on real 10G hardware,
-  *with the precise reason* (cheap polls; per-packet delivery is the wall; the kernel's
-  wasteful re-poll is the lost-wakeup safety net), plus the identification of the real
-  lever. This corrects the M1-loopback hypothesis with real-hardware evidence.
-- **Honest caveat / open question for future work:** we measured the spread regime at
-  *line-rate saturation*, where the fix can't help by construction. A fair remaining test
-  is a **non-saturated, multi-core operating point** (fixed sub-line-rate offered load,
-  many peers, distinct IPs) measuring peers-per-machine / CPU-per-byte with real headroom.
-  The cost model predicts no win there either (decrypt + per-packet delivery dominate),
-  but it is the one regime not yet directly measured.
+- **The fix removes real wasted work.** The two-sided version halves the wasted polls
+  (~27 → ~14%, §2b) — genuine CPU cycles (~1 µs/poll) reclaimed on the receive core. The
+  earlier "buys nothing" wording was wrong: it judged the fix by throughput, which is the
+  wrong yardstick (already at line rate, so it cannot rise).
+- **Throughput is unaffected, and that is expected.** The throughput lever is parallelism
+  (×2.2, a NIC-config change, §5), orthogonal to the fix.
+- **Open and under measurement: does the saved work show up where a user looks?** Two tests
+  in flight, neither conclusive yet:
+  - *Tail latency at sub-saturation* — currently too noisy to call (off/both trade places
+    run-to-run, outliers, uneven sample counts). Needs a tighter harness.
+  - *Decrypt-cost sensitivity* — the hypothesised direction holds (slower decrypt → stock
+    waste rises ~28 → ~44%, fix removes more), but the busy-wait collapses the pipeline at
+    high delay, so no clean curve yet. Needs a capped sub-line-rate re-run.
+  Earlier `measure_cpueff` at *line-rate saturation* showed no softirq-CPU drop — but that
+  is the regime where the fix cannot help by construction, so it does not settle the
+  question.
+- **Contribution so far:** the real throughput lever (parallelism) + a fix that
+  demonstrably and reproducibly removes ~half the wasted-poll work across 8–64 peers, with
+  the user-visible payoff being measured. This corrects, not discards, the M1 hypothesis:
+  the reduction is real but flat across peers here, not growing as on loopback.
 
 ## 8. Reproducibility
 
 - Module + patch: `build/wg515-trigger/` (vs pristine 5.15). Knobs (all `/sys/module/
-  wireguard/parameters/`): `wg_supp`, `wg_trig_k`, `wg_trig_tau_ns`, `wg_headwake`; plus
-  diagnostic counters under `wg_diag`. Build recipe in `CLOUDLAB_NEXT_STEPS.md`.
+  wireguard/parameters/`): `wg_supp`, `wg_headwake` (composable — set both for the two-sided
+  fix), `wg_trig_k`, `wg_trig_tau_ns`, `wg_decrypt_delay_ns` (decrypt-cost sensitivity);
+  plus diagnostic counters under `wg_diag`. Fresh-instantiation bootstrap + build recipe:
+  `scripts/cloudlab/bootstrap_testbed.sh`; details in `CLOUDLAB_NEXT_STEPS.md`.
+- New scripts (2026-06-26): `measure_taillat.sh` (sub-saturation tail latency),
+  `measure_decrypt_sweep.sh` (decrypt-cost sweep), `bootstrap_testbed.sh` (one-command
+  redeploy). `measure_missed.sh` gained the `both` condition + a warm-up burst.
 - Scripts (`scripts/cloudlab/`, run on `dut`): `measure_supp.sh`, `measure_trigger.sh`,
   `measure_headwake.sh`, `measure_cpu_trigger.sh`, `measure_all.sh` (4-way consolidated),
   `measure_latency.sh`, `measure_spread.sh` (parallelism), `measure_cpueff.sh`

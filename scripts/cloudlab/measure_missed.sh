@@ -11,11 +11,11 @@
 #       reschedules into parks and cut the MISSED re-polls?
 # Run per condition under load.  sudo bash ~/measure_missed.sh 8 15
 set -uo pipefail
-N=${1:-8}; DUR=${2:-15}; STREAMS=${3:-4}; GEN=${4:-gen}; NIC=${5:-enp6s0f1}
+N=${1:-8}; DUR=${2:-15}; STREAMS=${3:-4}; GEN=${4:-gen}; NIC=${5:-enp6s0f0}
 KO="$HOME/wireguard_trigger.ko"; GUARD=$((DUR+15))
 
 set_cond() { local s=0 k=0 h=0
-  case "$1" in move) s=1 ;; batch) k=8 ;; root) h=1 ;; esac
+  case "$1" in move) s=1 ;; batch) k=8 ;; root) h=1 ;; both) s=1; h=1 ;; esac
   echo $s >/sys/module/wireguard/parameters/wg_supp
   echo $k >/sys/module/wireguard/parameters/wg_trig_k
   echo $h >/sys/module/wireguard/parameters/wg_headwake; }
@@ -26,6 +26,9 @@ ethtool -N "$NIC" rx-flow-hash udp4 sdfn >/dev/null 2>&1
 bash "$HOME/setup_dut_peers.sh" "$N" >/dev/null
 pkill -f 'iperf3 -s' 2>/dev/null; sleep 1
 for i in $(seq 0 $((N-1))); do iperf3 -s -p $((5201+i)) -D; done
+# warm-up: handshake + ramp all tunnels so the FIRST condition isn't measured cold
+# (without this the stock cell catches a quiet tunnel and reports ~0 polls).
+timeout $((DUR+10)) ssh -o StrictHostKeyChecking=no "$GEN" "bash /tmp/genload_json.sh $N 6 4" >/dev/null 2>&1 || true
 
 read -r -d '' BT <<'BPF' || true
 kprobe:napi_complete_done { @ncd[cpu] = arg0; }
@@ -58,7 +61,7 @@ interval:s:DURSEC {
 BPF
 BT=${BT//DURSEC/$DUR}
 
-for cond in stock move root; do
+for cond in stock move root both; do
   set_cond "$cond"
   echo "================ cond=$cond (sdfn) ================"
   timeout "$GUARD" ssh -o StrictHostKeyChecking=no "$GEN" "bash /tmp/genload_json.sh $N $DUR $STREAMS" >/dev/null 2>&1 &

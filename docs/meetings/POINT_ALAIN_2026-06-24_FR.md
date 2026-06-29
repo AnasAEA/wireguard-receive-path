@@ -1,280 +1,208 @@
-# Point d'avancement — banc CloudLab et tests du patch (24 juin 2026)
+# Point d'avancement — CloudLab (màj 26 juin)
 
-> Pour Alain et André. Je raconte simplement : ce que j'ai monté, ce que j'ai
-> lancé, ce que j'ai observé — avec les graphes, les chiffres, les commandes et le
-> code. Détail technique complet : `docs/cloudlab/RECEIVE_PATH_FINDINGS.md`.
+> Pour Alain et André. Suite à notre point d'hier. Je remets le correctif à sa place (il
+> sert bien à quelque chose) et je détaille les mesures. Il y a pas mal de chiffres et un
+> peu de code cette fois. Le détail complet est dans `docs/cloudlab/RECEIVE_PATH_FINDINGS.md`.
 
-## En deux phrases
+## D'abord le débit : c'était la carte réseau, pas WireGuard
 
-J'ai porté l'expérience du M1 (qui tournait en loopback sur mon Mac) sur du **vrai
-matériel 10 Gb/s** à CloudLab, et j'ai testé plusieurs façons de corriger le problème
-des « polls gaspillés » de WireGuard. Deux résultats : **(1)** on sait maintenant réduire
-ces polls — jusqu'à les diviser par ~1,6 — **mais ça n'améliore ni le débit ni la
-latence**, car les deux sont bornés par un seul cœur saturé ; **(2)** j'ai trouvé le vrai
-levier du débit — **en étalant la réception sur tous les cœurs** (une option de la carte
-réseau, le **parallélisme**), **le débit passe de 4,1 à 9,0 Gb/s (×2,2)**, et c'est là, en
-régime non saturé, que le correctif pourrait enfin servir.
+J'ai galéré un moment à comprendre pourquoi je plafonnais à 4 Gb/s sur un lien à 10. En
+regardant les cœurs pendant un test, un seul tournait à 100 % et les autres ne faisaient
+rien. En fait la carte réseau envoyait tous mes tunnels sur une seule file de réception,
+donc un seul cœur : son hachage ne regarde que les adresses IP, et mes tunnels partagent
+tous la même IP, du coup ils retombent au même endroit. Je l'ai vu noir sur blanc dans
+`/proc/softirqs` : un seul CPU prenait ~85 % des interruptions NET_RX, les autres ~0.
 
-Ce résultat tient en une image :
-
-![Polls gaspillés vs débit](figures/fig_wasted_vs_debit.png)
-
-*À gauche : les quatre variantes réduisent les polls gaspillés (33 % → 20 %). À droite :
-le débit ne bouge pas (≈ 4,1 Gb/s partout). Médianes sur 5 répétitions, écart < 4 %.*
-
-## 1. Ce que j'ai monté (le banc)
-
-Sur M1, le trafic passait en loopback : la carte n'était jamais saturée, on ne voyait
-donc pas l'effet réel. Il me fallait du matériel réaliste, alors j'ai monté un banc sur
-CloudLab :
-
-- **deux vraies machines** (`c220g2`, bi-Xeon, 40 threads), reliées par un **lien privé
-  10 Gb/s** ;
-- `dut` = le **récepteur WireGuard** que j'instrumente ;
-- `gen` = le **générateur** : j'y crée **8 pairs** WireGuard (8 espaces de noms réseau)
-  qui poussent du trafic iperf3 dans le tunnel vers `dut`.
-
-Pour mesurer, sur `dut` :
-
-- **bpftrace** (sondes noyau) pour compter les polls *utiles* (livrent ≥ 1 paquet) vs
-  *gaspillés* (ne livrent rien) ;
-- **iperf3** pour le **débit** agrégé ;
-- `/proc/stat` pour l'**occupation CPU cœur par cœur** (voir *quel* cœur sature).
-
-Tout est rejouable : un seul module noyau avec les correctifs activables à chaud par
-paramètre, et des scripts qui font les A/B + médianes (commandes et code en fin de note).
-
-## 2. Le problème de départ (rappel d'une ligne)
-
-WireGuard déchiffre les paquets d'un pair **en parallèle sur plusieurs cœurs** → ils
-finissent **dans le désordre**, mais il faut les **livrer dans l'ordre**. La boucle de
-réception (« poll ») ne regarde que la **tête** : si elle n'est pas encore déchiffrée,
-le poll ne livre rien → **poll gaspillé**. Au départ, **~33 %** des polls sont gaspillés.
-
-## 3. Le modèle de coût (ce que coûte *chaque* étape)
-
-Avant de corriger quoi que ce soit, j'ai d'abord **mesuré le coût de chaque étape** de la
-réception (avec des sondes bpftrace sur le déchiffrement, le poll, la livraison). C'est le
-travail « tout mesurer » qu'on s'était fixé, et c'est lui qui explique tous les résultats
-qui suivent. Les coûts mesurés sur le banc (à 8 pairs) :
-
-| Étape | Coût mesuré | Rôle |
-|---|---|---|
-| `C_poll` — un poll **vide** (gaspillé) | **~1,0 µs** | un poll gaspillé est **bon marché** |
-| coût **fixe** de livraison (setup) | **~3,7 µs** | payé **une fois** dès qu'un poll livre ≥ 1 paquet |
-| `C_deliver` — par paquet livré | **~1,64 µs/paquet** | remontée dans la pile réseau |
-| `T_decrypt` — déchiffrement | **~5–6 µs/paquet** | sur cœurs séparés (en parallèle) |
-
-Deux conséquences directes, visibles sur la courbe ci-dessous :
-
-![Modèle de coût — coût par paquet vs taille du lot](figures/fig_cout_modele.png)
-
-*Coût CPU par paquet = 3,7/k + 1,64. Plus un poll livre de paquets d'un coup (k grand),
-plus le coût fixe de 3,7 µs est dilué : 5,3 µs/paquet à k=1 → ~1,9 µs à k=16. C'est
-exactement ce qui motivait l'idée d'« attente active » (regrouper pour viser k ≈ 8–16).*
-
-- **Un poll gaspillé coûte ~1 µs** → en supprimer beaucoup ne libère pas grand-chose.
-- **Le coût qui domine est par paquet** (`C_deliver` × nb de paquets), indépendant du
-  nombre de polls. Or sur le banc, la plupart des polls ne livrent que **≤ 4 paquets**
-  (distribution très « tassée vers le bas »), donc on paie le setup de 3,7 µs presque à
-  chaque poll, sans l'amortir.
-
-**C'est ce modèle de coût qui prédit tout le reste** : réduire/regrouper les polls touche
-des µs bon marché, alors que le débit est fixé par le coût *par paquet* — ce que les
-expériences suivantes confirment.
-
-## 4. Ce que j'ai lancé, et ce que j'ai vu
-
-**(a) Reproduit et confirmé le mécanisme.** 99,7 % des polls gaspillés viennent d'un
-re-réveil automatique (bit « MISSED ») déclenché par un paquet *qui n'est pas la tête*.
-
-**(b) Patch d'origine du M1 → aucun effet**, et j'ai compris pourquoi : sous charge,
-l'appel qu'il bloque est déjà sans effet ~63 % du temps. Mauvais endroit.
-
-**(c) Déplacé le patch au bon endroit** (à la *fin* du poll, là où on connaît vraiment
-l'état de la tête) → supprime **25 % des polls gaspillés** (33 → 28 %, barre bleue).
-**Mais le débit ne bouge pas.**
-
-**(d) Pourquoi ? J'ai regardé le CPU par cœur.** C'est le résultat important :
-
-![Un seul cœur saturé](figures/fig_cpu_coeurs.png)
-
-*Sous charge, **un seul cœur est à 100 %** (saturé en softirq réseau) ; tous les autres
-sont à ~20 %.* Ce cœur unique est le goulot, et il passe son temps à **livrer les
-paquets dans la pile réseau** (coût *par paquet*), pas à faire des polls. Supprimer des
-polls gaspillés (≈ 1 µs chacun, bon marché) ne libère donc presque rien.
-
-> Pourquoi un seul cœur : la carte répartit le trafic avec un hachage *qui ignore les
-> ports* ; mes 8 tunnels ayant la même IP, ils tombent tous sur **la même file → le même
-> cœur**. C'est le cas réaliste « un gros tunnel / site-à-site ».
-
-**(e) L'« attente active » dont on parlait** (attendre ~5 µs ou K paquets prêts avant de
-réveiller, pour livrer de plus gros lots) : **ça regroupe bien** (−22 % de polls), donc
-*ça fonctionne* au sens mécanique — **mais le débit ne bouge toujours pas**, et le
-minuteur **se pénalise lui-même** (il tourne sur le cœur déjà saturé).
-
-**(f) Attaqué la racine : ne réveiller que si la *tête* est prête.** Version la plus
-propre, sans minuteur → réduit le **plus** les polls gaspillés (33 → **20 %**, barre
-verte). **Mais elle bloque par intermittence** le tunnel sous TCP (un réveil perdu, et
-TCP n'a plus rien à renvoyer pour relancer). Pas proposée comme correctif robuste.
-
-## 5. Pourquoi je n'ai pas réussi à améliorer le débit
-
-C'est la question centrale. La chaîne de raisonnement, étayée par les mesures :
-
-1. **Le débit est limité par UN seul cœur**, pas par toute la machine (figure des cœurs :
-   un cœur à 100 %, les autres à ~20 %).
-2. **Ce cœur passe son temps à la livraison *par paquet***, pas aux polls. Le modèle de
-   coût le chiffre : `C_deliver ≈ 1,64 µs/paquet` × le nombre de paquets ≈ ~12 s sur les
-   20 s du budget du cœur. C'est ça, le mur.
-3. **Mes correctifs agissent sur les *polls***, qui coûtent des µs **bon marché**
-   (`C_poll ≈ 1 µs`). Que je supprime des polls gaspillés (déplacement) ou que je les
-   regroupe (attente active), je touche des µs bon marché — **jamais le coût par paquet**
-   qui, lui, est fixé par le débit de paquets et reste identique.
-4. **Donc le cœur reste à 100 % sur la livraison, quoi que je fasse côté polls** → le
-   débit ne bouge pas (~4,1 Gb/s). C'est exactement ce qu'on voit : les quatre variantes
-   réduisent les polls gaspillés mais laissent le débit plat.
-5. La cause du mono-cœur est la carte réseau (hachage *IP seulement* → les 8 tunnels sur
-   une file/un cœur). Ce n'est pas WireGuard, c'est la répartition matérielle.
-
-Autrement dit : **je m'attaquais à un coût de second ordre.** Pour gagner du débit il
-faudrait soit rendre la livraison par paquet moins chère (hors de mon périmètre), soit
-**l'étaler sur plusieurs cœurs** — la piste (a) ci-dessous.
-
-## 6. Et la latence ?
-
-Comme le débit ne bougeait pas, j'ai regardé la **latence** — c'est là que la politique
-de réveil (quand on livre les paquets) pourrait jouer. J'ai mesuré le temps aller-retour
-d'un `ping` **à travers le tunnel pendant que les 8 flux chargent**, 500 mesures par
-variante :
-
-![Latence sous charge](figures/fig_latence.png)
-
-| Variante | médiane | p99 |
-|---|---|---|
-| Stock | 1,60 ms | 2,34 ms |
-| Patch déplacé | 1,57 ms | 2,33 ms |
-| Attente active | 1,62 ms | 2,32 ms |
-| Réveil tête prête | 1,60 ms | 2,39 ms |
-
-**La latence est identique partout** (~1,6 ms médian, ~2,3 ms en p99, à ±2 %). Pourquoi :
-sous saturation, la latence est **dominée par la file d'attente sur le cœur saturé**
-(~1,6 ms) ; mes ajustements de réveil sont à l'échelle de la **µs** (`τ = 5 µs`,
-`C_poll = 1 µs`) → **invisibles** face à 1,6 ms. Même l'« attente active », que je
-craignais coûteuse en latence, ne se voit pas : son délai τ est ~300× plus petit que la
-file d'attente.
-
-> Nuance honnête : à **faible charge** (file d'attente courte), ce délai τ *se verrait*.
-> Mais ici, dans le régime saturé, **ni le débit ni la latence** ne dépendent de la
-> politique de réveil — les deux sont gouvernés par le cœur saturé.
-
-## 7. Casser le goulot : utiliser tous les cœurs (×2,2 le débit)
-
-Si le mur est « un seul cœur », la vraie question est : **peut-on le supprimer en
-utilisant tous les cœurs ?** Le diagnostic disait que le mono-cœur venait de la carte
-réseau (hachage *IP seulement* → 8 tunnels sur une file). J'ai vérifié la cause matérielle
-(IRQ déjà réparties une par cœur, donc le seul coupable est le hachage), puis j'ai **ajouté
-les ports au hachage** (`ethtool -N enp6s0f1 rx-flow-hash udp4 sdfn`). Une seule commande.
+Il a suffi d'une option de la carte (`rx-flow-hash udp4 sdfn`, qui ajoute les ports au
+hachage) pour que les tunnels se répartissent sur les cœurs. Je passe de 4 à 9 Gb/s, à peu
+près le débit ligne, sans rien changer à WireGuard.
 
 ![Avant / après : étaler sur les cœurs](figures/fig_spread.png)
 
-| Hachage carte | Débit | Cœurs en réception |
+| Hachage de la carte | Débit | Cœurs qui reçoivent |
 |---|---|---|
-| `sd` (IP seul — le funnel) | **4,1 Gb/s** | **1** (cpu5 à 100 %) |
-| `sdfn` (+ ports UDP) | **9,0 Gb/s** | **8** (~55 % chacun) |
+| par IP seule (le goulot) | 4,1 Gb/s | 1 (à 100 %) |
+| + ports (sdfn) | 9,0 Gb/s | 8 (~55 % chacun) |
 
-Les 8 tunnels (ports source distincts) se répartissent sur **8 cœurs** → le débit
-**passe de 4,1 à 9,0 Gb/s (×2,2)**, soit ~le débit ligne du lien 10 G (le reste, c'est
-l'overhead TCP). **Le mur mono-cœur n'était pas WireGuard, c'était la répartition
-matérielle.**
+Donc le vrai levier pour le débit, c'est le parallélisme. Ce qui est un peu ironique,
+parce que le parallélisme est aussi la cause du bug que j'étudie : c'est le déchiffrement
+en parallèle qui crée le désordre, et le désordre qui crée les polls gaspillés.
 
-Et le plus intéressant pour la suite : les 8 cœurs ne sont qu'à **~55 %** — il y a
-maintenant de la **marge**. C'est **précisément le régime où le correctif de l'EoI peut
-enfin compter** : récupérer les cycles des polls gaspillés ne se traduirait plus en débit
-(on est près de la ligne) mais en **CPU économisé → plus de pairs par machine**. C'est le
-prochain test.
+## Le correctif : il sert bien à quelque chose
 
-> Le fil rouge : **le parallélisme est à la fois la cause de notre bug** (le déchiffrement
-> en parallèle crée le désordre → polls gaspillés) **et la clé du débit** (étaler la
-> réception sur les cœurs). C'est la même idée des deux côtés.
+Je reviens dessus parce que dans la version précédente de ce point j'avais écrit qu'il « ne
+servait à rien ». Au point d'hier on a vu que c'est faux, et c'est juste : il supprime un
+vrai travail inutile, je le mesurais simplement avec le mauvais critère (le débit).
 
-## 8. L'enseignement
+Le problème en deux mots. Comme on déchiffre en parallèle, les paquets finissent dans le
+désordre, mais on doit les livrer dans l'ordre. Le poll de réception ne regarde que la tête
+de la file. Tant qu'elle n'est pas déchiffrée, il ne livre rien. Et le pire : il se relance
+tout seul. Quand un autre cœur finit un paquet *qui n'est pas la tête*, il « sonne la
+cloche » ; comme un poll tourne déjà, le noyau ne le relance pas tout de suite mais pose un
+drapeau (MISSED) qui veut dire « re-sonne en finissant ». À la fin du poll, il voit le
+drapeau et relance un poll, qui retombe sur la même tête pas encore prête. Gaspillé.
 
-Le re-poll « gaspilleur » du noyau **n'est pas une bêtise** : c'est le **filet de
-sécurité** qui garantit qu'aucun réveil n'est perdu. Dès qu'on déplace la décision de
-réveil pour être plus malin, on risque le **réveil perdu** qui bloque le flux. Autrement
-dit : **le gaspillage, c'est la sûreté.** On l'échange contre de l'efficacité au prix
-d'un risque de blocage — et ici **sans aucun gain de débit**.
+Comme on en avait parlé, j'ai mis le correctif des deux côtés :
 
-## 9. Conclusion et pistes
+- côté consommateur (`wg_supp`) : à la fin du poll, si la tête n'est toujours pas prête,
+  j'efface le drapeau MISSED. On ne relance pas un poll pour rien ; c'est la complétion de
+  la tête elle-même qui réveillera un poll utile.
+- côté producteur (`wg_headwake`) : le poll publie quel paquet il attend (la tête), et
+  seule la complétion de ce paquet-là le réveille. Les autres se taisent.
 
-- Sur ce banc, **ni le débit ni la latence** ne dépendent de la politique de réveil :
-  les deux sont **bornés par la livraison par paquet sur un cœur saturé**, pas par les
-  polls. Corriger les polls gaspillés est correct et faisable (le déplacement le prouve)
-  mais ne change ni l'un ni l'autre ici.
-- **Le goulot mono-cœur est levé** (§7) : hachage sur les ports → 8 cœurs → 9,0 Gb/s.
-  Reste le **prochain test, le bon** : dans ce régime à marge, refaire l'A/B des
-  correctifs en mesurant le **CPU par octet** (et non plus le débit, déjà près de la
-  ligne). Si un correctif baisse l'occupation CPU à débit égal, **c'est là sa vraie
-  valeur** : plus de pairs par machine. C'est ce que je lance ensuite.
-- À retenir : le travail a transformé une **hypothèse** (« corriger l'EoI améliore
-  WireGuard ») en **résultats mesurés** — l'EoI est de second ordre sur un cœur, mais le
-  **parallélisme double le débit** — avec, au passage, un modèle de coût réutilisable et
-  la compréhension de *pourquoi* le design « gaspilleur » du noyau est en fait le bon.
+L'idée de garder les deux, c'est exactement ton point d'hier : le consommateur annule bien
+le re-réveil, mais celui-ci revient par la voie normale (la complétion suivante re-sonne la
+cloche), et c'est le côté producteur qui le rattrape.
 
-## 10. Les chiffres (médianes, 5 répétitions, 8 pairs)
+### Ce que ça donne
 
-| Variante | Polls gaspillés | Débit (Gb/s) |
-|---|---|---|
-| Stock (rien) | 32,9 % | 4,15 |
-| Patch **déplacé** (`wg_supp`) | 27,7 % | 4,15 |
-| **Attente active** (`wg_trig_k=8`, τ≈5 µs) | 31,7 % | 4,10 |
-| **Réveil tête prête** (`wg_headwake`) | 20,0 % | 4,13 |
+J'ai mesuré les polls gaspillés (compteurs dans le module + sonde bpftrace) pour les quatre
+cas, de 8 à 64 pairs, en régime réparti :
 
-CPU sous charge (stock) : `cœur 5 = 100 % busy / 96,9 % softirq`, tous les autres ≤ 22 %.
-Données brutes : `data/cloudlab/all_20260624.csv`, `cpu_20260624.txt`.
+![Polls gaspillés selon le nombre de pairs](figures/fig_twosided_peers.png)
 
-## 11. Les commandes (sur `dut`)
+| Pairs | rien (stock) | consommateur seul | producteur seul | les deux |
+|---|---|---|---|---|
+| 8  | 27,0 % | 25,8 % | 15,4 % | 14,8 % |
+| 16 | 27,3 % | 26,1 % | 15,9 % | 13,8 % |
+| 32 | 26,8 % | 25,1 % | 15,0 % | 13,1 % |
+| 64 | 27,5 % | 25,3 % | 15,4 % | 14,4 % |
+
+Trois choses que je lis là-dessus :
+
+1. **Les deux côtés ensemble divisent par ~2 les polls gaspillés** (~27 % → ~14 %), et
+   c'est additif : le consommateur seul gratte peu (~2 points), le producteur fait le gros,
+   et les deux ensemble font un peu mieux que le producteur seul.
+2. **On voit la régénération dont on parlait.** Quand je regarde *de quel type* sont les
+   polls gaspillés : avec le consommateur seul, la part qui vient d'un réveil « frais »
+   (régénéré) monte (de ~3 % à ~6 % des gaspillés) — la preuve qu'annuler le re-réveil le
+   fait juste revenir par l'autre porte. Dès que j'ajoute le côté producteur, cette part
+   retombe à ~1 %. Les deux côtés se complètent vraiment.
+3. **C'est plat de 8 à 64 pairs.** Au M1 (banc loopback) le bénéfice *grandissait* avec le
+   nombre de pairs ; ici non, il est constant. C'est une info en soi : sur ce matériel et en
+   régime réparti, le correctif divise par ~2 les polls gaspillés quel que soit le nombre de
+   pairs.
+
+Pourquoi ça compte même si le débit ne bouge pas : au débit ligne le débit est déjà au max,
+donc forcément il ne monte pas. Mais chaque poll gaspillé en moins, c'est ~1 µs de CPU
+rendu sur le cœur de réception. En supprimer la moitié est une vraie économie (énergie, et
+« combien de pairs je peux mettre sur une machine »), juste pas visible sur le débit.
+
+### Le code (l'essentiel)
+
+Côté consommateur, à la fin du poll (`build/wg515-trigger/receive.c`) :
+
+```c
+/* la boucle s'est arrêtée parce que la tête n'est pas déchiffrée */
+if (wg_supp) {
+    struct sk_buff *head = wg_prev_queue_peek(&peer->rx_queue);
+    if (head && atomic_read_acquire(&PACKET_CB(head)->state) == PACKET_STATE_UNCRYPTED) {
+        clear_bit(NAPI_STATE_MISSED, &napi->state);   /* on ne relance pas un poll pour rien */
+        smp_mb__after_atomic();
+        head = wg_prev_queue_peek(&peer->rx_queue);    /* re-vérif : si la tête est devenue */
+        if (head && atomic_read_acquire(&PACKET_CB(head)->state) != PACKET_STATE_UNCRYPTED)
+            set_bit(NAPI_STATE_MISSED, &napi->state);  /* prête entre-temps, on relance */
+    }
+}
+```
+
+Côté producteur, quand un paquet finit d'être déchiffré (`queueing.h`) : on ne réveille que
+si c'est la tête attendue.
+
+```c
+if (wg_headwake && state == PACKET_STATE_CRYPTED) {
+    smp_mb();                                   /* barrière (paire avec la re-vérif du poll) */
+    b = READ_ONCE(peer->rx_blocked_on);         /* le paquet que le poll attend */
+    if (b == NULL || b == skb)
+        napi_schedule(&peer->napi);             /* sinon : on se tait */
+    ...
+}
+```
+
+La seule subtilité, c'est qu'il ne faut pas perdre un réveil (si je me tais au mauvais
+moment, le tunnel se bloque). Je gère ça avec une double barrière mémoire (le poll publie ce
+qu'il attend *puis* re-vérifie) ; ça marche, mais c'est le point que je surveille de près.
+
+## Le modèle de coût (pourquoi le gain est du CPU, pas du débit)
+
+J'ai mesuré le coût de chaque étape de la réception. Un poll gaspillé coûte ~1 µs. La
+livraison d'un paquet coûte ~1,64 µs (plus ~3,7 µs de coût fixe par poll), et un
+déchiffrement ~5–6 µs. Le poll gaspillé est donc bon marché par rapport au mur de livraison
+des paquets. C'est exactement pour ça que le gain du correctif est du CPU rendu et pas du
+débit : il enlève le µs de poll inutile, pas le travail de livraison qui sature le cœur.
+
+![Coût par paquet selon la taille du lot](figures/fig_cout_modele.png)
+
+Le modèle dit donc *où* chercher le gain (côté CPU et latence), pas qu'il n'y en a pas.
+
+## Ce que je suis encore en train de mesurer
+
+Le plan qu'on a arrêté, c'était de mesurer ce que j'économise plutôt que le débit. État
+honnête des trois axes :
+
+1. **Latence de queue à charge non saturée.** J'ai le banc (charge plafonnée pour laisser de
+   la marge sur les cœurs, puis je mesure les RTT). Mais pour l'instant c'est bruité : d'un
+   run à l'autre le correctif passe devant puis derrière, avec des valeurs aberrantes
+   isolées (10–12 ms) des deux côtés. Je dois resserrer la méthode (plus d'échantillons,
+   isoler le tunnel de mesure de la charge) avant de conclure quoi que ce soit. Pas de
+   chiffre fiable encore.
+2. **Sensibilité à la vitesse de déchiffrement.** J'ai ajouté un bouton qui ralentit le
+   déchiffrement exprès (sans toucher au coût du poll), pour tester l'idée « si le
+   déchiffrement est plus lent, le correctif sert plus ». La tendance va dans le bon sens :
+   en ralentissant, les polls gaspillés sans correctif montent (28 % → ~44 %) et le
+   correctif en enlève davantage. Mais si je ralentis trop, le pipeline s'effondre et la
+   mesure n'a plus de sens. Je dois refaire ça à charge plus basse pour avoir une courbe
+   propre. Encourageant, pas encore un résultat net.
+3. **Nombre de pairs.** Fait — c'est la figure plus haut. Le bénéfice est constant de 8 à 64
+   pairs (contrairement au M1). Celui-là est solide.
+
+## Où j'en suis
+
+Je suis concentré sur ce plan. Le correctif est en place des deux côtés dans un seul module,
+avec des boutons que j'active à chaud, donc je compare facilement avec/sans. Le banc
+CloudLab expire tous les jours, du coup j'ai scripté tout le redéploiement en une commande
+pour ne pas reperdre du temps à chaque fois (ça m'a déjà servi deux fois). Les expériences
+tournent sur 8 à 64 pairs.
+
+Je refais un point dans un jour ou deux. Dispo si vous voulez qu'on en parle.
+
+---
+
+## Annexe — chiffres, commandes, code
+
+Chiffres (régime réparti sdfn). Polls gaspillés selon le nombre de pairs : voir le tableau
+plus haut (stock ~27 %, consommateur ~25 %, producteur ~15 %, les deux ~14 %). Débit :
+4,1 Gb/s en mono-cœur, 9,0 Gb/s réparti. Coûts mesurés : poll gaspillé ~1 µs, livraison
+~1,64 µs/paquet (+ ~3,7 µs fixe/poll), déchiffrement ~5–6 µs.
+
+Les commandes que je lance (sur `dut`, un seul module, boutons à chaud) :
 
 ```bash
-# Un seul module, correctifs activables par paramètre (0 = stock) :
-#   wg_supp (patch déplacé) · wg_trig_k (attente active) · wg_headwake (racine)
-# Mesure consolidée des 4 variantes + snapshot CPU, A/B sur le même binaire :
-sudo bash ~/measure_all.sh 8 5            # 8 pairs, 5 répétitions -> all_*.csv, cpu_*.txt
-sudo bash ~/measure_latency.sh 8 14       # latence (ping sous charge) -> lat_*.csv
-sudo bash ~/measure_spread.sh 8           # mono-cœur vs tous-cœurs (hash sd vs sdfn)
-# Étaler la réception sur tous les cœurs (le levier du débit) :
-sudo ethtool -N enp6s0f1 rx-flow-hash udp4 sdfn   # (revenir au défaut : ... sd)
-# Graphes (en local) :
-python scripts/cloudlab/plot_results.py data/cloudlab/all_20260624.csv \
-       data/cloudlab/cpu_20260624.txt docs/meetings/figures
+# polls gaspillés : stock / consommateur / producteur / les deux, sur 8 à 64 pairs
+for N in 8 16 32 64; do sudo bash ~/measure_missed.sh "$N" 12; done
+# latence à charge non saturée (en cours de fiabilisation)
+for N in 8 16 32 64; do sudo bash ~/measure_taillat.sh "$N" 2000 20; done
+# effet de la vitesse de déchiffrement (bouton wg_decrypt_delay_ns)
+sudo bash ~/measure_decrypt_sweep.sh 8 "0 5000 10000 20000 40000" 12
+# le levier débit (mono-cœur vs tous-cœurs)
+sudo bash ~/measure_spread.sh 8
 ```
 
-## 12. Le code modifié (l'essentiel ; complet dans `build/wg515-trigger/`)
+Activer le correctif des deux côtés à chaud :
 
-**Patch déplacé** — à la fin du poll, si la tête n'est pas déchiffrée on *annule* le
-re-poll au lieu de le subir (la complétion de la tête réveillera) :
-
-```c
-// receive.c, fin de wg_packet_rx_poll  (stock = juste "napi_complete_done(...)")
-if (head_pas_déchiffrée)
-    clear_bit(NAPI_STATE_MISSED, &napi->state);   // <-- on endort au lieu de re-poller
-napi_complete_done(napi, work_done);
+```bash
+echo 1 > /sys/module/wireguard/parameters/wg_supp
+echo 1 > /sys/module/wireguard/parameters/wg_headwake
 ```
 
-**Réveil tête prête** — côté complétion, ne réveiller que si c'est bien la tête
-attendue (sinon le poll serait gaspillé) :
+Le bouton pour ralentir le déchiffrement (nanosecondes par paquet, 0 = matériel réel) :
 
-```c
-// queueing.h, wg_queue_enqueue_per_peer_rx  (stock = "napi_schedule(...)" inconditionnel)
-struct sk_buff *attendu = READ_ONCE(peer->rx_blocked_on);  // ce que le poll attend
-if (attendu == NULL || attendu == skb)        // file vide, ou c'est la tête
-    napi_schedule(&peer->napi);
-// sinon : complétion hors-tête -> pas de réveil  (le poll inutile est évité)
+```bash
+echo 20000 > /sys/module/wireguard/parameters/wg_decrypt_delay_ns
 ```
 
-*(Le code réel ajoute des barrières mémoire — c'est précisément ce détail de
-synchronisation qui rend la variante « racine » délicate, cf. §3f.)*
+Tout le code modifié est dans `build/wg515-trigger/` (5 fichiers, à partir de la source
+WireGuard 5.15 d'origine).
 
-Je poursuis avec un point écrit court tous les 1–2 jours. Dispo pour discuter avec Alain
-cet après-midi.
+
+

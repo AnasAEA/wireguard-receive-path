@@ -50,6 +50,139 @@ if we re-instantiate on different hardware, add a new block rather than overwrit
 > exact lines when patching the 5.15 WireGuard source (E0.3). Need headers for the
 > exact build: `linux-headers-5.15.0-177-generic`.
 
+### Instantiation #2 — re-instantiated 2026-06-25
+
+Instantiation #1 expired/was torn down; re-instantiated the `wg-recv-measure` profile.
+Same hardware class, **new node IDs**, and the experiment NIC moved to a different port.
+
+| Field | Value |
+|-------|-------|
+| Date instantiated | 2026-06-25 |
+| `dut` node ID | c220g2-011002 — `ssh anasait@c220g2-011002.wisc.cloudlab.us` |
+| `gen` node ID | c220g2-011003 — `ssh anasait@c220g2-011003.wisc.cloudlab.us` |
+| Kernel | 5.15.0-177-generic (unchanged) |
+| Experiment NIC | **`enp6s0f0`** (was `enp6s0f1` in #1), 10000 Mb/s, up, dut 192.168.1.1 / gen 192.168.1.2 |
+| Node-to-node SSH | root only (`sudo ssh gen`); user `anasait` → publickey denied |
+| DUT pub | `pROuK9O0wXZbxgLEux0BAk14YiT4pQHyyuzqYGIYSTs=` |
+| Module | `wireguard_trigger.ko` rebuilt from pristine 5.15 + our 5 files, srcversion `1291A7C836BD826F02BB419` |
+
+**Re-bootstrap (scripted in `scripts/cloudlab/bootstrap_testbed.sh`).** Fresh UBUNTU22
+image = blank: had to reinstall `iperf3` + `wireguard-tools` + `linux-source-5.15.0`,
+re-push scripts, rebuild the module, regenerate the dut key, recreate gen namespaces +
+dut peers. Gotcha logged: `insmod wireguard_trigger.ko` fails `Unknown symbol
+chacha20poly1305_decrypt / curve25519_base_arch / udp_tunnel_xmit_skb` — deps not loaded;
+fix is `modprobe wireguard; rmmod wireguard; insmod ours` (keeps the dep modules). Also:
+`iperf3 -s -D` daemons started in one ssh session die (SIGHUP) when that session closes —
+only matters for manual smoke tests; the measure scripts start servers + drive load in the
+same session, so they're fine. Result: **8/8 peers handshake**.
+
+**Spread result reconfirmed on the fresh hardware (`measure_spread.sh 8`):**
+
+| rx-flow-hash | Throughput | Cores >50% busy |
+|---|---|---|
+| `sd` (IP-only funnel) | 4.08–4.10 Gb/s | 1 (cpu9 @ 100%) |
+| `sdfn` (+ L4 ports) | 8.99 Gb/s | 8 (~52–55% each) |
+
+×2.2 holds — the headline parallelism win is not an artifact of instantiation #1.
+
+### Meeting with Alain — 2026-06-25 (new research directions)
+
+Day-to-day is André; this was a point with **Alain** (lead). Three directions came out of
+it, to be measured with the two-sided fix:
+
+1. **Keep the fix on BOTH sides — producer AND consumer.** Rationale (Alain): the
+   consumer-side suppress (`wg_supp`) cancels a wasted re-poll, but the wake *regenerates*
+   via the normal producer path (next non-head completion calls `napi_schedule`); a
+   producer-side gate (the original/`wg_headwake` idea) can *intercept that regenerated
+   wake too*. So the two compose — suppress the re-poll AND gate its regeneration. Action:
+   make `wg_supp` and `wg_headwake` composable (today they're mutually exclusive — headwake
+   returns early before the supp block) and A/B the combined mode.
+2. **Throughput/latency are the wrong yardstick; measure the CPU we actually save.** Even
+   with flat throughput, removing a wasted operation is a real CPU/energy saving. Focus on
+   **tail latency** (which should reflect the saved softirq work) and CPU-per-op, ideally at
+   a **non-saturated** operating point where the µs saving isn't drowned by queueing.
+   (Caveat from our own data: `measure_cpueff` at line-rate saturation showed NO softirq-CPU
+   drop — so the fair test is sub-saturation, not the saturated regime we already measured.)
+3. **The cost model is hardware-specific — test sensitivity to decryption speed.** CloudLab
+   Xeons decrypt fast (ChaCha20-Poly1305 with SIMD, `T_decrypt`≈5–6 µs), so the wasted poll
+   fires ~3× too early and the fix is null. If decrypt were *slower* relative to poll cost,
+   the head stays UNCRYPTED longer → more wasted re-polls → the fix may remove more and
+   matter more. Plan: a `wg_decrypt_delay_ns` knob (busy-wait injected in the decrypt path,
+   poll cost unchanged) to sweep `T_decrypt` and find the regime where the fix pays — turns
+   the null result into a parametric "where does this matter" finding. Cross-check by
+   forcing the generic (non-SIMD) crypto path. Don't take CloudLab's numbers at face value.
+
+**Result — two-sided fix A/B (`measure_missed.sh 8 15`, sdfn spread, single 15 s run/cond).**
+Made `wg_supp` + `wg_headwake` composable (`build/wg515-trigger/receive.c`: headwake no
+longer returns early; module srcversion `EA06EE82AFA1C813458F113`) and added a `both`
+condition. Wasted polls as a fraction of all polls:
+
+| cond | knobs | wasted % | wasted count | of wasted: MISSED re-poll / fresh-wake |
+|---|---|---|---|---|
+| stock | — | 30.4% | 693,747 | 95.4% / 3.9% |
+| move | `wg_supp=1` | 28.7% | 621,051 | 91.7% / 7.5% |
+| root | `wg_headwake=1` | 17.7% | 343,410 | 98.0% / 1.3% |
+| **both** | `wg_supp=1 wg_headwake=1` | **15.3%** | **283,894** | 97.9% / 1.3% |
+
+**Confirms Alain's compose rationale.** `move` alone leaves more *fresh-wake* regeneration
+(7.5% of its wasted vs 3.9% stock — the re-poll it cancels comes back as a fresh producer
+wake). Adding the producer gate (`headwake`) intercepts that regeneration; `both` removes
+the most overall: **30.4 → 15.3% (~50% fewer wasted polls)**, ~17% below headwake alone
+(283,894 vs 343,410). The two sides are additive. Single-run per cond (~2M polls each, so
+the ratio is stable); a few reps would firm the both-vs-root gap (15.3 vs 17.7). **Open:
+this is the wasted-poll *count* — whether it converts to a user-visible win is what the
+sub-saturation tail-latency (#2) and decrypt-cost-sweep (#3) experiments test next.**
+
+### Instantiation #3 — re-instantiated 2026-06-26
+
+Lease expired again. New nodes: `dut` c220g2-010630, `gen` c220g2-010628 (NIC `enp6s0f0`,
+same as #2, 10G, up; DUT pub `z2HDdaydsU4sgYL5zMnL4dk3nJ8kWvyvDbDScnb35xo=`). The
+`bootstrap_testbed.sh` written for #2 paid off: one command restored everything (packages,
+module build srcversion `EA06EE82…`, dut key, 8 peers handshaking, 64 gen namespaces
+pre-created for the peer sweep). Re-validated at 8.96 Gb/s in the sdfn spread.
+
+**Two-sided fix peer sweep (8 → 64 pairs) — the clean result.** Data:
+`data/cloudlab/twosided_peersweep_20260626.csv`, figure `docs/meetings/figures/
+fig_twosided_peers.png`. Wasted polls as % of all polls:
+
+| pairs | stock | move (supp) | root (headwake) | both |
+|---|---|---|---|---|
+| 8  | 27.0% | 25.8% | 15.4% | 14.8% |
+| 16 | 27.3% | 26.1% | 15.9% | 13.8% |
+| 32 | 26.8% | 25.1% | 15.0% | 13.1% |
+| 64 | 27.5% | 25.3% | 15.4% | 14.4% |
+
+Reads: (1) `both` ≈ halves wasted polls (~27 → ~14%) and is additive; (2) the regeneration
+shows in the counters — `move` alone pushes the *fresh-wake* share of wasted from ~3% (stock)
+to ~6%, and adding the producer gate drops it back to ~1%; (3) **flat from 8 to 64 pairs** —
+the M1 loopback's "benefit grows with peers" does NOT reproduce on this real-HW spread regime.
+
+**Measurement bug found + fixed.** First runs showed `polls=1` / `polls=0` for the *first*
+condition (stock) and intermittently root/both. Cause: the condition was measured before the
+tunnels re-handshaked/ramped after the module reload (cold start), not a real 0% or a headwake
+stall. Fix: a warm-up genload burst before the condition loop in `measure_missed.sh`. After
+the fix all cells capture ~1.8–2.2M polls and root/both run clean (no stall) — so the earlier
+root/both zeros were the same cold-start cascade, not the lost-wakeup deadlock I'd feared.
+
+**#2 tail latency — noisy, inconclusive.** Pulled 4 `taillat_*.csv` (8/16/32/64). `both`
+beats `off` at N=16, loses at N=8, ties at N=32, with isolated 10–12 ms outliers on both
+sides, and the `off` runs returned far fewer ping samples (769–795 vs 2000) — a methodology
+flaw. Yesterday's "p99 1.17 vs 1.25" single-run hint does NOT survive. Needs: more samples,
+a latency tunnel isolated from the load, and fixing the `off`-side sample loss before any
+claim.
+
+**#3 decrypt sweep — knob works, methodology breaks at high delay.** `wg_decrypt_delay_ns`
+does lengthen `T_decrypt` and stock wasted polls rise with it (≈28% → ≈44%), with the fix
+removing more — the hypothesised direction. But past ~10–20 µs/packet the busy-wait collapses
+the pipeline (throughput → 0, `gbps` capture returns 0.000/NA, wasted% goes meaningless).
+Needs a re-run at a capped sub-line-rate offered load so slowing decrypt doesn't implode the
+flow, plus a fix to the throughput capture.
+
+**Doc work.** Rewrote `docs/meetings/POINT_ALAIN_2026-06-24_FR.md`: corrected the framing
+(the fix removes real wasted CPU work — throughput was the wrong yardstick, per Alain), made
+the voice personal, and enriched it with the peer-sweep figure/table, the real two-sided code,
+the cost model, and an honest "still being measured" status for #2/#3.
+
 ---
 
 ## Cost-model summary (the headline table)

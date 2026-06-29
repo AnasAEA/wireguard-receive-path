@@ -9,7 +9,7 @@
 #   sudo bash ~/measure_cpubyte.sh 8 4
 # Writes ~/cpb_<ts>.csv : cond,rep,gbps,cores_equiv,cpu_per_gbps,wasted_frac
 set -uo pipefail
-N=${1:-8}; REPS=${2:-4}; DUR=${3:-15}; STREAMS=${4:-4}; GEN=${5:-gen}; NIC=${6:-enp6s0f1}
+N=${1:-8}; REPS=${2:-4}; DUR=${3:-15}; STREAMS=${4:-4}; GEN=${5:-gen}; NIC=${6:-enp6s0f0}
 KO="$HOME/wireguard_trigger.ko"; TS=$(date +%Y%m%d_%H%M); CSV="$HOME/cpb_$TS.csv"
 GUARD=$((DUR+15)); DURP=$((DUR+3))
 

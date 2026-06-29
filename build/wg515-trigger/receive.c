@@ -295,6 +295,21 @@ static bool decrypt_packet(struct sk_buff *skb, struct noise_keypair *keypair)
 		return false;
 	skb_pull(skb, offset);
 
+	/* Decrypt-cost sensitivity knob (wg_decrypt_delay_ns, Alain 2026-06-25).
+	 * CloudLab Xeons decrypt ChaCha20-Poly1305 fast (~5-6 us with SIMD), so the
+	 * head clears quickly and the EoI fix has little to suppress. To test whether
+	 * the fix pays off on slower-crypto hardware, inject a calibrated busy-wait
+	 * here (in the decrypt worker, NOT the poll), lengthening T_decrypt while
+	 * leaving the per-poll cost untouched. Sweeping this knob maps the fix's payoff
+	 * vs the decrypt:poll cost ratio. 0 = off (real hardware timing).
+	 */
+	if (unlikely(wg_decrypt_delay_ns)) {
+		u64 deadline = ktime_get_ns() + wg_decrypt_delay_ns;
+
+		while (ktime_get_ns() < deadline)
+			cpu_relax();
+	}
+
 	return true;
 }
 
@@ -533,12 +548,23 @@ next:
 				else      wg_diag_uncrypt_nomiss++;
 			}
 		}
-		/* Head-gated wake (wg_headwake) — the root fix. The loop stopped on an
-		 * empty or UNCRYPTED head. Publish that head (NULL = empty ⇒ any arrival
-		 * is the next head) so producers wake the NAPI ONLY for the packet that
-		 * unblocks delivery. Then re-check: if the head became deliverable in the
-		 * publish gap, force a re-poll via MISSED so we never sleep on a ready
-		 * head. (publish-then-recheck closes the lost-wakeup race.)
+		/* Head-gated wake (wg_headwake) — the producer-side root fix, completion
+		 * half. The loop stopped on an empty or UNCRYPTED head. Publish that head
+		 * (NULL = empty ⇒ any arrival is the next head) so producers wake the NAPI
+		 * ONLY for the packet that unblocks delivery. Then re-check: if the head
+		 * became deliverable in the publish gap, force a re-poll via MISSED so we
+		 * never sleep on a ready head. (publish-then-recheck closes the lost-wakeup
+		 * race.)
+		 *
+		 * NOTE (Alain 2026-06-25, two-sided fix): this no longer returns early, so
+		 * wg_headwake and wg_supp COMPOSE. With both set, the producer gate above
+		 * (queueing.h) silences non-head wakes AND the suppress below clears any
+		 * MISSED that regenerated through the normal path — the producer and
+		 * consumer sides catch the wasted re-poll together. The two MISSED actions
+		 * are on mutually exclusive head states (headwake sets it only when the head
+		 * is deliverable; supp clears it only when the head is UNCRYPTED), so they
+		 * never fight. Single-knob behaviour is unchanged (the other block is a
+		 * no-op when its knob is 0), so prior A/B results still reproduce.
 		 */
 		if (wg_headwake) {
 			struct sk_buff *head = wg_prev_queue_peek(&peer->rx_queue);
@@ -556,8 +582,6 @@ next:
 			    atomic_read_acquire(&PACKET_CB(head)->state) !=
 				    PACKET_STATE_UNCRYPTED)
 				set_bit(NAPI_STATE_MISSED, &napi->state);
-			napi_complete_done(napi, work_done);
-			return work_done;
 		}
 		/* MISSED re-poll suppression (wg_supp). The loop above stopped either
 		 * because the rx_queue is empty or because the head is still UNCRYPTED.

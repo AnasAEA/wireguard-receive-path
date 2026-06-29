@@ -10,7 +10,7 @@
 #   sudo bash ~/measure_cpueff.sh 8 8
 # CSV: cond,rep,gbps,tot_ce,soft_ce,wasted_frac
 set -uo pipefail
-N=${1:-8}; REPS=${2:-8}; DUR=${3:-20}; STREAMS=${4:-4}; GEN=${5:-gen}; NIC=${6:-enp6s0f1}
+N=${1:-8}; REPS=${2:-8}; DUR=${3:-20}; STREAMS=${4:-4}; GEN=${5:-gen}; NIC=${6:-enp6s0f0}
 KO="$HOME/wireguard_trigger.ko"; TS=$(date +%Y%m%d_%H%M); CSV="$HOME/cpueff_$TS.csv"
 GUARD=$((DUR+15)); DURP=$((DUR+3))
 

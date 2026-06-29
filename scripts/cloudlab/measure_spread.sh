@@ -8,7 +8,7 @@
 #   sudo bash ~/measure_spread.sh 8
 # Writes ~/spread_<ts>.txt (summary) + ~/cpu_sd_<ts>.csv / ~/cpu_sdfn_<ts>.csv (per-core).
 set -uo pipefail
-N=${1:-8}; DUR=${2:-15}; STREAMS=${3:-4}; GEN=${4:-gen}; NIC=${5:-enp6s0f1}
+N=${1:-8}; DUR=${2:-15}; STREAMS=${3:-4}; GEN=${4:-gen}; NIC=${5:-enp6s0f0}
 KO="$HOME/wireguard_trigger.ko"; TS=$(date +%Y%m%d_%H%M)
 GUARD=$((DUR+15))
 
