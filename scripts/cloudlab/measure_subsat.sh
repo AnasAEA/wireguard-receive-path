@@ -30,6 +30,13 @@ TS=$(date +%Y%m%d_%H%M); CSV="$HOME/subsat_$TS.csv"; PLACE="$HOME/subsat_$TS.pla
 SRC=$(cat /sys/module/wireguard/srcversion 2>/dev/null || echo NA)
 HOST=$(hostname -s); HZ=$(getconf CLK_TCK); LPORT=11111
 
+cleanup(){ local p
+  for p in wg_supp wg_headwake wg_trig_k wg_decrypt_delay_ns; do
+    echo 0 > /sys/module/wireguard/parameters/$p 2>/dev/null || true; done
+  ethtool -N "$NIC" rx-flow-hash udp4 sd >/dev/null 2>&1 || true
+  pkill -f 'iperf3 -s' 2>/dev/null || true; pkill sockperf 2>/dev/null || true; }
+trap cleanup EXIT INT TERM
+
 set_cond(){ local s=0 h=0; case "$1" in supp) s=1;; root) h=1;; both) s=1; h=1;; esac
   echo $s >/sys/module/wireguard/parameters/wg_supp
   echo 0  >/sys/module/wireguard/parameters/wg_trig_k

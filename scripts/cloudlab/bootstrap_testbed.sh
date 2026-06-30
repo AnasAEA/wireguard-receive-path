@@ -16,6 +16,12 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
 SSH="ssh -o StrictHostKeyChecking=no"
 
+echo ">> Using DUT=$DUT"
+echo ">>       GEN=$GEN"
+echo ">> A fresh CloudLab instantiation gets NEW node IDs — if these are wrong, re-run as:"
+echo ">>   DUT=anasait@<dut>.cloudlab.us GEN=anasait@<gen>.cloudlab.us bash $0 ${1:-8}"
+sleep 2
+
 echo "== [1/6] install packages =="
 $SSH "$DUT" 'sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
     iperf3 wireguard-tools linux-source-5.15.0 netperf sockperf >/tmp/apt.log 2>&1; echo dut: iperf3=$(which iperf3) netperf=$(which netserver) sockperf=$(which sockperf) src=$(ls /usr/src/linux-source-*/*.tar.bz2 2>/dev/null)'

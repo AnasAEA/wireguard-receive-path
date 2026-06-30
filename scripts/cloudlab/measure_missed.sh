@@ -14,6 +14,13 @@ set -uo pipefail
 N=${1:-8}; DUR=${2:-15}; STREAMS=${3:-4}; GEN=${4:-gen}; NIC=${5:-enp6s0f0}
 KO="$HOME/wireguard_trigger.ko"; GUARD=$((DUR+15))
 
+cleanup(){ local p
+  for p in wg_supp wg_headwake wg_trig_k wg_decrypt_delay_ns; do
+    echo 0 > /sys/module/wireguard/parameters/$p 2>/dev/null || true; done
+  ethtool -N "$NIC" rx-flow-hash udp4 sd >/dev/null 2>&1 || true
+  pkill -f 'iperf3 -s' 2>/dev/null || true; }
+trap cleanup EXIT INT TERM
+
 set_cond() { local s=0 k=0 h=0
   case "$1" in move) s=1 ;; batch) k=8 ;; root) h=1 ;; both) s=1; h=1 ;; esac
   echo $s >/sys/module/wireguard/parameters/wg_supp
@@ -61,7 +68,7 @@ interval:s:DURSEC {
 BPF
 BT=${BT//DURSEC/$DUR}
 
-for cond in stock move root both; do
+for cond in $(printf '%s\n' stock move root both | shuf); do
   set_cond "$cond"
   echo "================ cond=$cond (sdfn) ================"
   timeout "$GUARD" ssh -o StrictHostKeyChecking=no "$GEN" "bash /tmp/genload_json.sh $N $DUR $STREAMS" >/dev/null 2>&1 &

@@ -1,5 +1,8 @@
 #!/bin/bash
 [ "$(id -u)" -eq 0 ] || exec sudo bash "$0" "$@"
+# SUPERSEDED by measure_subsat.sh — this prototype runs the ping latency on ns_c0 WHILE that
+# same tunnel also carries bulk load, so the latency self-interferes. measure_subsat.sh fixes
+# this (peer 0 = latency only, bulk on peers 1..N-1) and adds CPU + sockperf p99.9. Kept for ref.
 # TAIL LATENCY at a NON-SATURATED operating point (Alain 2026-06-25). Under saturation
 # latency is queue-dominated (~1.6 ms) and the µs-scale fix is invisible. Here we hold a
 # FIXED sub-line-rate offered load (so the cores have headroom) on the sdfn spread, and ask
@@ -15,6 +18,13 @@ PINGS=${6:-2000}; PINT=${7:-0.005}
 CONDS=${CONDS:-"off both"}
 KO="$HOME/wireguard_trigger.ko"; TS=$(date +%Y%m%d_%H%M); CSV="$HOME/taillat_$TS.csv"
 GUARD=$((DUR+20)); PERT=$(( TOTAL_MBIT / N )); [ "$PERT" -lt 1 ] && PERT=1
+
+cleanup(){ local p
+  for p in wg_supp wg_headwake wg_trig_k wg_decrypt_delay_ns; do
+    echo 0 > /sys/module/wireguard/parameters/$p 2>/dev/null || true; done
+  ethtool -N "$NIC" rx-flow-hash udp4 sd >/dev/null 2>&1 || true
+  pkill -f 'iperf3 -s' 2>/dev/null || true; }
+trap cleanup EXIT INT TERM
 
 set_cond() { local s=0 h=0; case "$1" in move) s=1 ;; root) h=1 ;; both) s=1; h=1 ;; esac
   echo $s > /sys/module/wireguard/parameters/wg_supp
