@@ -1,0 +1,30 @@
+host=dut srcversion=EA06EE82AFA1C813458F113 date=2026-07-01T06:09:26-05:00 kernel=5.15.0-177-generic
+--- rx-flow-hash udp4 ---
+UDP over IPV4 flows use these fields for computing Hash flow key:
+IP SA
+IP DA
+L4 bytes 0 & 1 [TCP/UDP src port]
+L4 bytes 2 & 3 [TCP/UDP dst port]
+
+--- ethtool -l ---
+Channel parameters for enp6s0f0:
+Pre-set maximums:
+RX:		n/a
+TX:		n/a
+Other:		1
+Combined:	40
+Current hardware settings:
+RX:		n/a
+TX:		n/a
+Other:		1
+Combined:	40
+--- NIC IRQ smp_affinity_list ---
+--- governor ---
+schedutil
+--- numa ---
+Model name:                              Intel(R) Xeon(R) CPU E5-2660 v3 @ 2.60GHz
+Core(s) per socket:                      10
+Socket(s):                               2
+NUMA node(s):                            2
+NUMA node0 CPU(s):                       0-9,20-29
+NUMA node1 CPU(s):                       10-19,30-39

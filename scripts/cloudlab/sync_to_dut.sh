@@ -5,8 +5,8 @@
 # Run from the repo (on the Mac). Override hosts via env if the lease changes:
 #   DUT=anasait@<dut>.cloudlab.us GEN=anasait@<gen>.cloudlab.us bash sync_to_dut.sh
 set -euo pipefail
-DUT=${DUT:-anasait@c220g2-011314.wisc.cloudlab.us}
-GEN=${GEN:-anasait@c220g2-011319.wisc.cloudlab.us}
+DUT=${DUT:-anasait@c220g2-011319.wisc.cloudlab.us}
+GEN=${GEN:-anasait@c220g2-011315.wisc.cloudlab.us}
 HERE="$(cd "$(dirname "$0")" && pwd)"
 cd "$HERE"
 

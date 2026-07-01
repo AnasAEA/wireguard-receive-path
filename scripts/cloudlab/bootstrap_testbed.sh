@@ -9,8 +9,8 @@
 # wg0 + peers. The 10G experiment NIC (enp6s0f0, 192.168.1.1 dut / .2 gen) and node-to-node
 # root SSH come pre-configured by the profile.
 set -euo pipefail
-DUT=${DUT:-anasait@c220g2-011314.wisc.cloudlab.us}
-GEN=${GEN:-anasait@c220g2-011319.wisc.cloudlab.us}
+DUT=${DUT:-anasait@c220g2-011319.wisc.cloudlab.us}
+GEN=${GEN:-anasait@c220g2-011315.wisc.cloudlab.us}
 N=${1:-8}
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
