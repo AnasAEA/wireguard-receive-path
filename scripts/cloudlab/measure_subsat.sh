@@ -27,15 +27,17 @@ REJECT_DEV=${REJECT_DEV:-0.40}    # flag a run only if |actual-target|/target ex
                                   # see the same generation => same actual => valid comparison.
 KO="$HOME/wireguard_trigger.ko"
 TS=$(date +%Y%m%d_%H%M); CSV="$HOME/subsat_$TS.csv"; PLACE="$HOME/subsat_$TS.placement.txt"
-SRC=$(cat /sys/module/wireguard/srcversion 2>/dev/null || echo NA)
 HOST=$(hostname -s); HZ=$(getconf CLK_TCK); LPORT=11111
+SRC=NA   # set after insmod below, so it reflects the module actually under test
 
 cleanup(){ local p
   for p in wg_supp wg_headwake wg_trig_k wg_decrypt_delay_ns; do
     echo 0 > /sys/module/wireguard/parameters/$p 2>/dev/null || true; done
   ethtool -N "$NIC" rx-flow-hash udp4 sd >/dev/null 2>&1 || true
   pkill -f 'iperf3 -s' 2>/dev/null || true; pkill sockperf 2>/dev/null || true; }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
 
 set_cond(){ local s=0 h=0; case "$1" in supp) s=1;; root) h=1;; both) s=1; h=1;; esac
   echo $s >/sys/module/wireguard/parameters/wg_supp
@@ -50,6 +52,7 @@ cpu_snap(){ awk '/^cpu[0-9]/{u=$2;n=$3;s=$4;id=$5;io=$6;irq=$7;sq=$8;st=$9;
 # --- one-time setup ---
 ip link del wg0 2>/dev/null||true; rmmod wireguard 2>/dev/null||true
 insmod "$KO"
+SRC=$(cat /sys/module/wireguard/srcversion 2>/dev/null || echo NA)
 ethtool -N "$NIC" rx-flow-hash udp4 sdfn >/dev/null 2>&1
 bash "$HOME/setup_dut_peers.sh" "$N" >/dev/null
 pkill -f 'iperf3 -s' 2>/dev/null; pkill sockperf 2>/dev/null; sleep 1

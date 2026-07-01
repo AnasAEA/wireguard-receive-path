@@ -24,7 +24,9 @@ cleanup(){ local p
     echo 0 > /sys/module/wireguard/parameters/$p 2>/dev/null || true; done
   ethtool -N "$NIC" rx-flow-hash udp4 sd >/dev/null 2>&1 || true
   pkill -f 'iperf3 -s' 2>/dev/null || true; }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
 
 set_cond() { local s=0 h=0; case "$1" in move) s=1 ;; root) h=1 ;; both) s=1; h=1 ;; esac
   echo $s > /sys/module/wireguard/parameters/wg_supp
