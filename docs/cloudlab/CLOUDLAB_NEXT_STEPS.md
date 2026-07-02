@@ -45,12 +45,44 @@ for N in 8 16 32 64; do sudo bash ~/measure_taillat.sh "$N" 2000 20; done
 #    samples (769-795 vs 2000) => percentiles untrustworthy. TODO before believing any number:
 #    more samples, a latency tunnel isolated from the load, fix the off-side sample loss.
 
-# 3) DECRYPT-COST SWEEP — knob works, METHODOLOGY BREAKS at high delay.
-for N in 8; do sudo bash ~/measure_decrypt_sweep.sh "$N" "0 5000 10000 20000 40000" 12; done
-#    Direction is right: stock wasted rises ~28% -> ~44% as decrypt slows, fix removes more.
-#    But past ~10-20us/packet the busy-wait collapses the pipeline (gbps -> 0.000/NA, wasted%
-#    meaningless). TODO: re-run at a CAPPED sub-line-rate load + fix the throughput capture.
+# 3) DECRYPT-COST SWEEP — knob works, METHODOLOGY BREAKS at high delay.  [SUPERSEDED]
+#    The 2026-06-26 run used uncapped load + two disjoint windows; past ~10-20us/packet the
+#    busy-wait collapsed the pipeline (gbps -> 0.000/NA, wasted% meaningless). Direction was
+#    right (stock wasted ~28% -> ~44% as decrypt slows). Script REWRITTEN 2026-07-02 to the
+#    measure_subsat.sh design — see "RUN NEXT — Phase B" below.
 ```
+
+---
+
+# ▶ RUN NEXT — Phase B decrypt-cost sweep (rewritten script, 2026-07-02)
+
+`measure_decrypt_sweep.sh` now implements `CLOUDLAB_PLAN_phase2.md` Phase B properly:
+capped bulk load on peers 1..N-1 (default 2 Gb/s total, below the decrypt knee), sockperf
+latency on dedicated peer 0, and per run ONE window measuring latency + CPU CE + verified
+actual throughput + wasted polls together. Pipeline collapse is recorded as
+`status=collapse` and the row is KEPT (it locates the knee). Latency numbers are
+probe-perturbed (bpftrace runs in-window) — fair off-vs-both, NOT comparable to Phase A
+absolutes.
+
+```bash
+# 0) fresh instantiation: bootstrap from the Mac (sync_to_dut.sh pushes all measure scripts),
+#    then verify the REWRITTEN sweep landed on dut
+DUT=anasait@<dut>.cloudlab.us GEN=anasait@<gen>.cloudlab.us bash scripts/cloudlab/bootstrap_testbed.sh
+ssh anasait@<dut> 'grep -q "REWRITTEN 2026-07-02" ~/measure_decrypt_sweep.sh && echo SCRIPT_OK || echo STALE_SCRIPT'
+
+# 1) the sweep — delays 0/1/2/5/10us, off vs both, 5 reps, 30s windows (~35 min), on dut
+sudo bash ~/measure_decrypt_sweep.sh 8
+
+# extend upward only if the knee hasn't appeared by 10us:
+sudo bash ~/measure_decrypt_sweep.sh 8 "0 2000 5000 10000 20000" 30
+
+# 2) fetch results (CSV + placement sidecar) back to the repo
+scp "anasait@<dut>:~/decsweep_*.csv" "anasait@<dut>:~/decsweep_*.placement.txt" data/cloudlab/
+```
+
+Read the result with the plan's knee framing: safe / transition / collapse regions; only
+`status=ok` rows are evidence. The question the sweep answers: at what decrypt:poll ratio
+(if any) does `both` start saving CPU CE or tail latency vs `off`?
 
 To repeat a single cell for variance, just rerun that one line (e.g. `sudo bash
 ~/measure_taillat.sh 32 2000 20`). CSVs land in `~` (`taillat_*.csv`, `decsweep_*.csv`);
