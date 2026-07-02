@@ -1,5 +1,5 @@
 # Internship Tracker — io_uring / WireGuard Performance Research
-# Inria KrakOS Team (LIG), Grenoble — Last updated: June 12, 2026
+# Inria KrakOS Team (LIG), Grenoble — Last updated: July 2, 2026
 
 ---
 
@@ -56,12 +56,33 @@
 | 5. Report | Final report (Moodle 295) | June 5 | ✅ Submitted |
 | — | Defense presentation & slides | June 8 | ✅ Done — trimmed to 10 min (9 main + 7 appendix) |
 | — | **Defense (salle F117)** | **June 10** | ✅ **Done — went really well** |
-| 6. Improve | Instrument receive path (per-step costs) → design batching-aware trigger | June–July 2026 | ⬜ CloudLab account approved; plan w/ Alain June 15 |
-| 7. CloudLab | Benchmark the improved solution on real NIC; combine with paper's fix | July 2026 | ⬜ Deferred until solution is improved |
+| 6. Improve | Instrument receive path (per-step costs) → design batching-aware trigger | June–July 2026 | ✅ Done — cost model measured on CloudLab (C_poll≈1µs, C_deliver≈1.64µs, T_decrypt≈5–6µs); trigger built, tested, self-defeating on the hot core |
+| 7. CloudLab | Benchmark the improved solution on real NIC; combine with paper's fix | July 2026 | 🔄 In progress — two-sided fix halves wasted polls (~27→~14%); sdfn parallelism ×2.2; Phase A CPU null; Phase B (decrypt sweep) next. **Paper-fix combination: scope to confirm with Alain/André** |
 
 ---
 
-## Current — June 12 (post-defense)
+## Current — July 2 (CloudLab campaign, 4 weeks to July 31)
+
+**Where the science stands** (full synthesis: `docs/cloudlab/RECEIVE_PATH_FINDINGS.md`):
+
+- **Mechanism proven** on real 10G hardware: ~27–33% of NAPI polls wasted, 95–99.7% of them
+  MISSED-driven re-polls on an UNCRYPTED head.
+- **Two-sided fix (wg_supp + wg_headwake) halves wasted polls** ~27% → ~14%, flat 8–64 peers.
+- **Throughput lever is parallelism, not the fix**: `sdfn` NIC hash spreads receive over 8
+  cores, 4.1 → 9.0 Gb/s (×2.2) with stock WireGuard.
+- **Phase A (sub-saturation, 64 runs): clean CPU null on c220g2**; latency trend favorable
+  but noisy + power-state-confounded — not claimed.
+- **Phase B next**: decrypt-cost sweep (`measure_decrypt_sweep.sh`, rewritten 2026-07-02 to
+  capped-load single-window design) — the remaining place a user-visible win could live.
+  Then optional governor=performance latency re-test, and the headwake reliability soak.
+
+**Open scope question for Alain/André:** is the "paper's `gro_wq` fix + combined fix"
+comparison (configurations 3–4 below) still a required July 31 deliverable, or is the
+remaining time focused on Phase B + soak + write-up?
+
+---
+
+## June 12 (post-defense)
 
 ### Done (June 8–10) — graded phase complete ✅
 - ✅ **Defense slides finalized & trimmed to 10 min:** merged the 3 component slides into one "three kernel engines" diagram; redrew the pipeline as a snake (flow turns DOWN into the red `napi_schedule` box); arrow-glyph + typography cleanup; pagination shows total; defense date on title. 9 main + 7 appendix slides. Committed + pushed.
@@ -127,6 +148,23 @@ Alain's guidance: do **not** rush to benchmark the current 6-line fix as if it w
 ---
 
 ## Progress log
+
+### June 17 – July 2, 2026 — CloudLab campaign (summary; full log in `docs/cloudlab/CLOUDLAB_EXPERIMENTS_LOG.md`)
+
+- **June 17–18:** testbed live (Wisconsin c220g2, dut+gen, kernel 5.15.0-177); EoI reproduced
+  on real hardware (35.8% wasted polls, 1 peer); M1 patch applies unchanged; 8-peer multipeer up.
+- **June 19–24:** cost model measured (C_poll≈1µs, delivery setup≈3.7µs, C_deliver≈1.64µs/pkt,
+  T_decrypt≈5–6µs); MISSED re-poll mechanism proven (99.7% of wasted polls); four interventions
+  A/B'd — all cut wasted polls, none move throughput; **sdfn parallelism win found (4.1→9.0 Gb/s)**.
+- **June 25 (point with Alain):** reframe — throughput is the wrong yardstick; make the fix
+  two-sided (producer gate + consumer suppress, composable) and measure CPU/latency instead.
+- **June 26:** two-sided fix built (srcversion `EA06EE82…`); peer sweep 8–64: **wasted polls
+  halved ~27%→~14%, flat across peers**.
+- **July 1:** Phase A sub-saturation campaign (off vs both × 0/2/4/6 Gb/s × 8 reps, 64 runs,
+  latency peer + capped bulk, `subsat_20260701_0609.csv`).
+- **July 2:** Phase A analyzed — **clean CPU null on c220g2**, latency inconclusive
+  (power-state-confounded). Phase B decrypt sweep reprioritized; `measure_decrypt_sweep.sh`
+  rewritten to the capped-load single-window design before any new CloudLab session.
 
 ### June 12, 2026 (Friday) — post-defense direction set
 - ✅ **CloudLab account approved** (project "WG"). Hardware available.

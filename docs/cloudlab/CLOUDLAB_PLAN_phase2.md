@@ -11,17 +11,19 @@
 
 Ran the campaign (off vs both × loads 0/2/4/6 × 8 reps) and analyzed it
 (`scripts/cloudlab/analyze_subsat.py`; figures `fig_subsat_cpu.png`,
-`fig_subsat_latency.png`). Binned by `load_actual`, off-vs-both with median/IQR + an
-approximate Mann–Whitney p.
+`fig_subsat_latency.png`). Grouped by **target** load (off vs both at one target see the
+same generation ⇒ matched actuals), plotted against pooled actual load; off-vs-both with
+median/IQR + an approximate Mann–Whitney p.
 
-- **Fairness: clean.** off vs both actual load matches within ≤3.4% (≤1% at 4/6 Gb/s). The
+- **Fairness: clean.** off vs both actual load matches within ≤3.4% (≤1.2% at 4/6 Gb/s). The
   comparison is fair — and `both` does not throttle throughput.
 - **CPU: clean null.** `softirq_ce` / `system_ce` / `total_busy_ce` are indistinguishable
   off vs both at every load (deltas −4.7%…+1.6%, all p≈0.4–1.0). The fix does not reduce
   receive CPU at sub-saturation on c220g2.
 - **Latency: inconclusive + confounded.** `both` trends ~7–8% lower on p99 at 2 and 4 Gb/s,
   but not significant (p≈0.37–0.71, IQRs overlap), and the tail is *worst at the lowest
-  load* (~1.5–1.7 ms @1.1 Gb/s, better @3.1 Gb/s) — the wrong direction for queueing. That
+  nonzero bulk load* (~1.5–1.7 ms @1.1 Gb/s, better @3.1 Gb/s; the 0-load p99 floor is
+  ~370 µs) — the wrong direction for queueing. That
   is a CPU **C-state/frequency** artifact (`schedutil`), not a wasted-poll effect. So the
   small gap is within power-state noise.
 

@@ -190,14 +190,20 @@ sockperf latency only, peers 1..7 = capped bulk, sdfn), off vs both × loads 0/2
 = 64 runs, `data/cloudlab/subsat_20260701_0609.csv`. Analyzed with
 `scripts/cloudlab/analyze_subsat.py` (figures `fig_subsat_cpu.png`, `fig_subsat_latency.png`).
 
-- **Fairness clean:** off vs both actual load matches ≤3.4% (≤1% at 4/6) — fair comparison,
+- **Fairness clean:** off vs both actual load matches ≤3.4% (≤1.2% at 4/6) — fair comparison,
   and `both` does not throttle throughput.
 - **CPU: clean null.** softirq/system/total CE indistinguishable off vs both at every load
   (deltas −4.7%…+1.6%, all p≈0.4–1.0). No CPU saving at sub-saturation on c220g2.
 - **Latency: inconclusive + confounded.** both ~7–8% lower p99 at 2 and 4 Gb/s but not
-  significant (p≈0.37–0.71, IQR overlap); the tail is *worst at the lowest load* (~1.5–1.7 ms
-  @1.1 Gb/s vs ~1.0 ms @3.1) — a CPU C-state/frequency artifact (schedutil), not a poll
-  effect. So the gap is within power-state noise.
+  significant (p≈0.37–0.71, IQR overlap); the tail is *worst at the lowest nonzero bulk load*
+  (~1.5–1.7 ms @1.1 Gb/s vs ~1.0 ms @3.1; 0-load p99 floor ~370 µs) — a CPU C-state/frequency
+  artifact (schedutil), not a poll effect. So the gap is within power-state noise.
+
+Provenance of the two partial CSVs from the same session: `subsat_20260701_0400.csv` is the
+first (aborted) start — its 4-Gb/s rows carry `REJECT_load_dev` ≈0.44/0.55, the observation
+that led to treating targets as nominal and verifying actual load per run;
+`subsat_20260701_0605.csv` is a 3-row false start minutes before the real campaign (`_0609`).
+Kept as methodology provenance, not analyzed.
 
 **Verdict: clean c220g2 null** (matches the cost model — a ~1 µs wasted poll can't move a
 ms-scale, C-state-dominated tail). Next: decrypt-cost sweep (where a win could appear on

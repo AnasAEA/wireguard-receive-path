@@ -205,7 +205,8 @@ queue** — both common in parallel mode.
   softirq/system/total CPU-CE are indistinguishable off vs both at every load (deltas
   −4.7%…+1.6%, p≈0.4–1.0), with off/both actual loads matched ≤3.4%. Tail latency is
   **inconclusive and confounded**: `both` trends ~7–8% lower on p99 at 2/4 Gb/s but not
-  significantly (p≈0.37–0.71, IQRs overlap), and the tail is *worst at the lowest load* — a
+  significantly (p≈0.37–0.71, IQRs overlap), and the tail is *worst at the lowest nonzero
+  bulk load* (the 0-load floor is ~370 µs) — a
   CPU C-state/frequency artifact (`schedutil`), not a wasted-poll effect. This matches the
   cost model: a ~1 µs wasted poll cannot move a ms-scale, C-state-dominated tail.
 - **Still open (where a positive result could still live):**

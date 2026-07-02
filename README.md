@@ -60,7 +60,33 @@ The worst case is a stale read that skips one wake, which NAPI's internal
 The reduction grows with peer count — exactly what the *1/N* model predicts —
 and rising batch size confirms the mechanism: GRO is woken less often but
 delivers more each time. Throughput is flat on loopback (the softirq never
-saturates); validating throughput on a real 25 G NIC is the next step.
+saturates). **These loopback results motivated, and are partly corrected by, the
+real-hardware validation below.**
+
+## Status — CloudLab validation on real 10G hardware (June–July 2026)
+
+The M1 story above was re-tested on CloudLab `c220g2` nodes (2× Xeon E5-2660 v3,
+10 GbE, kernel 5.15). The full, honest synthesis is
+[`docs/cloudlab/RECEIVE_PATH_FINDINGS.md`](docs/cloudlab/RECEIVE_PATH_FINDINGS.md);
+the headline corrections:
+
+- **Saturated throughput is controlled by receive-side parallelism, not by the
+  EoI fix.** The NIC's IP-only flow hash funnels all tunnels onto one core;
+  adding the UDP ports to the hash (`ethtool … rx-flow-hash udp4 sdfn`) spreads
+  receive across 8 cores and lifts stock WireGuard **4.1 → 9.0 Gb/s (×2.2)**.
+- **The original six-line producer-side fix alone is a null on real hardware.**
+  The working version is the **two-sided fix** (producer gate `wg_headwake` +
+  consumer suppress `wg_supp`), which **halves wasted polls, ~27% → ~14%**, flat
+  from 8 to 64 peers — real removed work, but the M1 "grows with peer count"
+  effect does not reproduce here.
+- **Phase A sub-saturation campaign: a clean CPU null on c220g2.** The saved
+  work does not show up as measurable CPU reduction (softirq/system/total,
+  deltas −4.7%…+1.6%, p≈0.4–1.0) at 0/2/4/6 Gb/s.
+- **Tail latency shows only a weak, noisy favorable trend** (~7–8% lower p99 for
+  the fix at mid loads, not significant, power-state-confounded) — not claimed.
+- **Phase B (in progress) tests whether the fix matters when decrypt is slower**
+  (`wg_decrypt_delay_ns` sweep): the remaining place a user-visible win could
+  live, per the cost model (~1 µs/poll saved vs ~5–6 µs decrypt on these Xeons).
 
 ## Repository layout
 
