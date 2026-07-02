@@ -1,0 +1,5 @@
+date,commit,host,condition,peers,load_target_gbps,load_actual_gbps,latency_tool,lat_samples,p50_us,p99_us,p999_us,softirq_ce,system_ce,total_busy_ce,wasted_poll_pct,fresh_wake_pct,retransmits,drops,nic_irq_count,sdfn_state,notes
+2026-07-01T04:01:17-05:00,EA06EE82AFA1C813458F113,dut,off,8,0,0.0000,sockperf,21150,347.152,370.263,376.389,0.006,0.114,0.119,NA,NA,0,NA,0,sdfn,src=EA06EE82AFA1C813458F113;gov=schedutil
+2026-07-01T04:02:10-05:00,EA06EE82AFA1C813458F113,dut,off,8,4,2.2579,sockperf,18272,339.168,981.000,1108.195,0.991,5.468,5.516,NA,NA,3620,NA,0,sdfn,src=EA06EE82AFA1C813458F113;gov=schedutil;REJECT_load_dev=0.436
+2026-07-01T04:03:11-05:00,EA06EE82AFA1C813458F113,dut,both,8,4,1.8044,sockperf,18584,321.305,1093.209,1229.811,0.914,5.137,5.191,NA,NA,6233,NA,0,sdfn,src=EA06EE82AFA1C813458F113;gov=schedutil;REJECT_load_dev=0.549
+2026-07-01T04:03:29-05:00,EA06EE82AFA1C813458F113,dut,both,8,0,0.0000,sockperf,21165,345.490,370.235,376.724,0.019,0.130,0.135,NA,NA,0,NA,0,sdfn,src=EA06EE82AFA1C813458F113;gov=schedutil
