@@ -7,6 +7,38 @@
 > The harness must produce a result that is interpretable *either way* — a clean win or a
 > defensible null. Author: Anas Ait El Hadj · Inria KrakOS.
 
+## Phase 0 — RESULT (analyzed 2026-07-02, `subsat_20260701_0609.csv`, 64 runs)
+
+Ran the campaign (off vs both × loads 0/2/4/6 × 8 reps) and analyzed it
+(`scripts/cloudlab/analyze_subsat.py`; figures `fig_subsat_cpu.png`,
+`fig_subsat_latency.png`). Binned by `load_actual`, off-vs-both with median/IQR + an
+approximate Mann–Whitney p.
+
+- **Fairness: clean.** off vs both actual load matches within ≤3.4% (≤1% at 4/6 Gb/s). The
+  comparison is fair — and `both` does not throttle throughput.
+- **CPU: clean null.** `softirq_ce` / `system_ce` / `total_busy_ce` are indistinguishable
+  off vs both at every load (deltas −4.7%…+1.6%, all p≈0.4–1.0). The fix does not reduce
+  receive CPU at sub-saturation on c220g2.
+- **Latency: inconclusive + confounded.** `both` trends ~7–8% lower on p99 at 2 and 4 Gb/s,
+  but not significant (p≈0.37–0.71, IQRs overlap), and the tail is *worst at the lowest
+  load* (~1.5–1.7 ms @1.1 Gb/s, better @3.1 Gb/s) — the wrong direction for queueing. That
+  is a CPU **C-state/frequency** artifact (`schedutil`), not a wasted-poll effect. So the
+  small gap is within power-state noise.
+
+**Verdict: a clean c220g2 null** (decision-table Case 3, with a confounded latency lean) —
+consistent with the cost model (a ~1 µs wasted poll cannot move a ms-scale, C-state-dominated
+tail). Honest headline: *the two-sided fix removes real wasted work, but on this fast hardware
+the saved work is below the CPU/latency noise floor.* The remaining places a positive result
+could live: (a) slower crypto (Phase B), or (b) a C-state-controlled latency re-test.
+
+**Reprioritized next steps (supersedes the "Order" section below):**
+1. **Phase B — decrypt-cost sweep** (now the primary place a win could appear): capped
+   sub-line-rate load, fixed throughput capture, sweep `wg_decrypt_delay_ns`, find the knee.
+2. **(optional) latency re-test with the confound removed** — `governor=performance` +
+   isolate the latency probe from iperf-server cores + more reps — only if we want to convert
+   the ~7% p99 lean into a real number.
+3. **Phase C — headwake reliability soak** before recommending `both`.
+
 ## The central risk
 
 The danger is not a weak idea; it is an **ambiguous null** ("we removed wasted polls but

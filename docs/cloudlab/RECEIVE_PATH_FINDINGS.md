@@ -198,16 +198,23 @@ queue** — both common in parallel mode.
   wrong yardstick (already at line rate, so it cannot rise).
 - **Throughput is unaffected, and that is expected.** The throughput lever is parallelism
   (×2.2, a NIC-config change, §5), orthogonal to the fix.
-- **Open and under measurement: does the saved work show up where a user looks?** Two tests
-  in flight, neither conclusive yet:
-  - *Tail latency at sub-saturation* — currently too noisy to call (off/both trade places
-    run-to-run, outliers, uneven sample counts). Needs a tighter harness.
-  - *Decrypt-cost sensitivity* — the hypothesised direction holds (slower decrypt → stock
-    waste rises ~28 → ~44%, fix removes more), but the busy-wait collapses the pipeline at
-    high delay, so no clean curve yet. Needs a capped sub-line-rate re-run.
-  Earlier `measure_cpueff` at *line-rate saturation* showed no softirq-CPU drop — but that
-  is the regime where the fix cannot help by construction, so it does not settle the
-  question.
+- **Does the saved work show up where a user looks? On c220g2, no (measured 2026-07-02).**
+  The clean Phase A sub-saturation campaign (`measure_subsat.sh`: dedicated latency peer,
+  capped bulk on the rest, off vs both × loads 0/2/4/6 × 8 reps, `subsat_20260701_0609.csv`,
+  figs `fig_subsat_cpu.png`/`fig_subsat_latency.png`) gives a **clean CPU null**:
+  softirq/system/total CPU-CE are indistinguishable off vs both at every load (deltas
+  −4.7%…+1.6%, p≈0.4–1.0), with off/both actual loads matched ≤3.4%. Tail latency is
+  **inconclusive and confounded**: `both` trends ~7–8% lower on p99 at 2/4 Gb/s but not
+  significantly (p≈0.37–0.71, IQRs overlap), and the tail is *worst at the lowest load* — a
+  CPU C-state/frequency artifact (`schedutil`), not a wasted-poll effect. This matches the
+  cost model: a ~1 µs wasted poll cannot move a ms-scale, C-state-dominated tail.
+- **Still open (where a positive result could still live):**
+  - *Decrypt-cost sensitivity* — direction holds (slower decrypt → stock waste ~28 → ~44%,
+    fix removes more), but the busy-wait collapses the pipeline at high delay; needs a capped
+    sub-line-rate re-run + a fixed throughput capture to draw the curve.
+  - *A C-state-controlled latency re-test* (`governor=performance`, latency probe isolated
+    from the iperf-server cores, more reps) — only worthwhile to convert the ~7% p99 lean
+    into a real number.
 - **Contribution so far:** the real throughput lever (parallelism) + a fix that
   demonstrably and reproducibly removes ~half the wasted-poll work across 8–64 peers, with
   the user-visible payoff being measured. This corrects, not discards, the M1 hypothesis:

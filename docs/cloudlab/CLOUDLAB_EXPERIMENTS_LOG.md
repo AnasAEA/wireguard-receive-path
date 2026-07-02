@@ -183,6 +183,27 @@ flow, plus a fix to the throughput capture.
 the voice personal, and enriched it with the peer-sweep figure/table, the real two-sided code,
 the cost model, and an honest "still being measured" status for #2/#3.
 
+### Phase A result — sub-saturation latency + CPU (analyzed 2026-07-02)
+
+Instantiation #5 (dut c220g2-011319 / gen 011315). Ran `measure_subsat.sh` (peer 0 =
+sockperf latency only, peers 1..7 = capped bulk, sdfn), off vs both × loads 0/2/4/6 × 8 reps
+= 64 runs, `data/cloudlab/subsat_20260701_0609.csv`. Analyzed with
+`scripts/cloudlab/analyze_subsat.py` (figures `fig_subsat_cpu.png`, `fig_subsat_latency.png`).
+
+- **Fairness clean:** off vs both actual load matches ≤3.4% (≤1% at 4/6) — fair comparison,
+  and `both` does not throttle throughput.
+- **CPU: clean null.** softirq/system/total CE indistinguishable off vs both at every load
+  (deltas −4.7%…+1.6%, all p≈0.4–1.0). No CPU saving at sub-saturation on c220g2.
+- **Latency: inconclusive + confounded.** both ~7–8% lower p99 at 2 and 4 Gb/s but not
+  significant (p≈0.37–0.71, IQR overlap); the tail is *worst at the lowest load* (~1.5–1.7 ms
+  @1.1 Gb/s vs ~1.0 ms @3.1) — a CPU C-state/frequency artifact (schedutil), not a poll
+  effect. So the gap is within power-state noise.
+
+**Verdict: clean c220g2 null** (matches the cost model — a ~1 µs wasted poll can't move a
+ms-scale, C-state-dominated tail). Next: decrypt-cost sweep (where a win could appear on
+slower crypto), an optional governor=performance latency re-test to resolve the 7% lean, and
+the headwake soak. See `CLOUDLAB_PLAN_phase2.md` Phase 0 result + reprioritized steps.
+
 ---
 
 ## Cost-model summary (the headline table)
