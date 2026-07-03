@@ -183,6 +183,23 @@ flow, plus a fix to the throughput capture.
 the voice personal, and enriched it with the peer-sweep figure/table, the real two-sided code,
 the cost model, and an honest "still being measured" status for #2/#3.
 
+### Instantiation #6 — re-instantiated 2026-07-02 (Phase B decrypt sweep)
+
+New nodes: `dut` c220g2-011118, `gen` c220g2-011131 (NIC `enp6s0f0`, 10G, kernel
+5.15.0-177 — same class as #2–#5). `bootstrap_testbed.sh` one-command restore: packages,
+module build srcversion `EA06EE82…` (the two-sided composable build), 8/8 handshakes.
+DUT pub `WYO3nNhAYhkR4vnT2ZojroU00FDqwzDIZuqBxe2LsQk=`. Verified the REWRITTEN
+`measure_decrypt_sweep.sh` (2026-07-02, capped-load single-window design) was the version
+on the dut before running.
+
+**Phase B sweep ran 2026-07-02** (delays 0/1/2/5/10 µs × off/both × 5 reps, capped 2 Gb/s
+bulk, latency peer 0) and completed successfully. **Data-retrieval incident (2026-07-03):**
+the instantiation expired before `decsweep_*.csv` + placement sidecar were pulled off the
+dut; both nodes now refuse SSH. Whether a copy exists elsewhere is being checked — if not,
+the sweep must be re-run on a fresh instantiation (~45 min total; the harness itself
+validated cleanly). Lesson repeated from #1: **scp artifacts off the dut in the same
+session that produces them** — the daily lease reset makes anything left in `~` volatile.
+
 ### Phase A result — sub-saturation latency + CPU (analyzed 2026-07-02)
 
 Instantiation #5 (dut c220g2-011319 / gen 011315). Ran `measure_subsat.sh` (peer 0 =

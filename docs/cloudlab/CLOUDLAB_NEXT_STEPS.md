@@ -3,12 +3,12 @@
 > Hands-on walkthrough for the live testbed. Copy blocks from here.
 > Recipe: `CLOUDLAB_EXPERIMENTS_PLAN.md`. Results: `CLOUDLAB_EXPERIMENTS_LOG.md`.
 
-**Live nodes (instantiation #3, re-instantiated 2026-06-26):**
+**Live nodes (instantiation #6, re-instantiated 2026-07-02):**
 
 | Role | Node | SSH |
 |------|------|-----|
-| `dut` (instrumented receiver) | c220g2-010630 (Wisc) | `ssh anasait@c220g2-010630.wisc.cloudlab.us` |
-| `gen` (load generator) | c220g2-010628 (Wisc) | `ssh anasait@c220g2-010628.wisc.cloudlab.us` |
+| `dut` (instrumented receiver) | c220g2-011118 (Wisc) | `ssh anasait@c220g2-011118.wisc.cloudlab.us` |
+| `gen` (load generator) | c220g2-011131 (Wisc) | `ssh anasait@c220g2-011131.wisc.cloudlab.us` |
 
 > **Experiment 10G NIC is now `enp6s0f0`** (was `enp6s0f1` in instantiation #1), already
 > up with dut `192.168.1.1` / gen `192.168.1.2`. Node-to-node SSH works only as **root**
@@ -66,18 +66,25 @@ absolutes.
 
 ```bash
 # 0) fresh instantiation: bootstrap from the Mac (sync_to_dut.sh pushes all measure scripts),
-#    then verify the REWRITTEN sweep landed on dut
-DUT=anasait@<dut>.cloudlab.us GEN=anasait@<gen>.cloudlab.us bash scripts/cloudlab/bootstrap_testbed.sh
-ssh anasait@<dut> 'grep -q "REWRITTEN 2026-07-02" ~/measure_decrypt_sweep.sh && echo SCRIPT_OK || echo STALE_SCRIPT'
+#    then verify the REWRITTEN sweep landed on dut. Instantiation #6 (2026-07-02):
+#    dut c220g2-011118 / gen c220g2-011131. DONE for #6 (srcversion EA06EE82, 8/8 handshakes).
+DUT=anasait@c220g2-011118.wisc.cloudlab.us GEN=anasait@c220g2-011131.wisc.cloudlab.us \
+  bash scripts/cloudlab/bootstrap_testbed.sh 8
+ssh anasait@c220g2-011118.wisc.cloudlab.us \
+  'grep -q "REWRITTEN 2026-07-02" ~/measure_decrypt_sweep.sh && echo SCRIPT_OK || echo STALE_SCRIPT'
 
-# 1) the sweep — delays 0/1/2/5/10us, off vs both, 5 reps, 30s windows (~35 min), on dut
-sudo bash ~/measure_decrypt_sweep.sh 8
+# 1) the sweep — delays 0/1/2/5/10us, off vs both, 5 reps, 30s windows (~35 min), ON DUT.
+#    nohup so an ssh drop doesn't kill the run mid-campaign (trap cleanup would fire):
+ssh anasait@c220g2-011118.wisc.cloudlab.us
+sudo -v && nohup sudo bash ~/measure_decrypt_sweep.sh 8 > ~/decsweep_run.log 2>&1 &
+tail -f ~/decsweep_run.log        # progress: one line per run; watch for [COLLAPSE]
 
 # extend upward only if the knee hasn't appeared by 10us:
 sudo bash ~/measure_decrypt_sweep.sh 8 "0 2000 5000 10000 20000" 30
 
-# 2) fetch results (CSV + placement sidecar) back to the repo
-scp "anasait@<dut>:~/decsweep_*.csv" "anasait@<dut>:~/decsweep_*.placement.txt" data/cloudlab/
+# 2) fetch results (CSV + placement sidecar) back to the repo, from the Mac
+scp "anasait@c220g2-011118.wisc.cloudlab.us:~/decsweep_*.csv" \
+    "anasait@c220g2-011118.wisc.cloudlab.us:~/decsweep_*.placement.txt" data/cloudlab/
 ```
 
 Read the result with the plan's knee framing: safe / transition / collapse regions; only
