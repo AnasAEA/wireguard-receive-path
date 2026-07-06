@@ -1,0 +1,8 @@
+srcversion=EA06EE82AFA1C813458F113 date=2026-07-06T06:13:31-05:00 kernel=5.15.0-177-generic
+gov=schedutil
+UDP over IPV4 flows use these fields for computing Hash flow key:
+IP SA
+IP DA
+L4 bytes 0 & 1 [TCP/UDP src port]
+L4 bytes 2 & 3 [TCP/UDP dst port]
+

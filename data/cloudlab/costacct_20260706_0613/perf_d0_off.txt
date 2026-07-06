@@ -1,0 +1,2 @@
+     0.40%  swapper          [kernel.kallsyms]                 [k] net_rx_action
+     0.02%  kworker/36:2-mm  [kernel.kallsyms]                 [k] wg_packet_decrypt_worker
