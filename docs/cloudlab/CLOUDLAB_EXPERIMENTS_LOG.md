@@ -199,6 +199,50 @@ dut; both nodes now refuse SSH. Whether a copy exists elsewhere is being checked
 the sweep must be re-run on a fresh instantiation (~45 min total; the harness itself
 validated cleanly). Lesson repeated from #1: **scp artifacts off the dut in the same
 session that produces them** — the daily lease reset makes anything left in `~` volatile.
+*(Resolution: no copy survived; re-run on instantiation #7 below.)*
+
+### Instantiation #7 + Phase B RESULT — decrypt-cost sweep (2026-07-06)
+
+New nodes: `dut` c220g2-011118 (same ID as #6), `gen` c220g2-011119. Bootstrap clean
+(srcversion `EA06EE82…`, 8/8 handshakes), rewritten sweep verified on dut before launch.
+
+**Incident first: a double launch produced 40 min of garbage.** The sweep was accidentally
+started twice (~02:15 and ~02:54); each instance's setup does `rmmod` + `pkill
+iperf3/sockperf`, so they destroyed each other's tunnel and measurement servers — every row
+had `p50=NA`, `act=0.0000` while dut-local counters (wasted%, CPU) looked alive. Diagnosed
+live (manual bulk test + a single mini-run were healthy), both instances killed, garbage
+CSVs deleted. Hardening committed: **flock single-instance guard** (a second launch now
+fails loudly) and `REJECT_DEV` 0.40→0.60 (iperf3 pacing undershoots ~45–50 % at
+2G/7peers/4streams — Phase A's own target-2 actual was ~1.1 — so 0.40 would mislabel
+healthy runs as collapse).
+
+**The clean sweep**: delays 0/1/2/5/10 µs × off/both × 5 reps, capped 2 Gb/s bulk, single
+window per run (latency + CPU CE + verified load + wasted polls). 50/50 runs `status=ok`,
+actual load matched off-vs-both at every delay (~0.96–1.05 Gb/s). Data
+`data/cloudlab/decsweep_20260706_0321.csv`; analysis `scripts/cloudlab/analyze_decsweep.py`;
+figures `fig_decsweep_wasted.png`, `fig_decsweep_cpu.png`.
+
+- **The headline: fix efficacy is dose-responsive in decrypt cost.** `off` stays flat at
+  ~33–35 % wasted at *every* delay (under capped load the pipeline never collapses — the
+  June-26 "28→44 %" rise was partly a collapse artifact). `both` falls monotonically:
+  **15.2 → 12.8 → 12.0 → 7.5 → 3.8 %** (tight IQRs). The fix removes **56 % of the waste at
+  delay 0 and 89 % at 10 µs** — the slower the crypto, the better the two-sided gate works,
+  exactly the mechanism's prediction (head stays UNCRYPTED longer ⇒ more gateable wakes).
+- **CPU: still a null, even at decrypt:poll ≈ 10:1.** softirq deltas −4.6/+1.7/−13.6/−0.8/
+  −0.2 %, busy deltas mixed signs, all inside the large rep-to-rep spread (busy CE ranges
+  ~4.8–9.2 within cells). Quantitatively consistent: ~0.4–0.5 M polls removed × ~1 µs over
+  30 s ≈ **0.015 CE saved** — two orders below the ±2 CE noise floor.
+- **Latency: null.** p99 deltas −1.7/0/+9.0/+5.3/−0.5 % — mixed, inside noise.
+- **Suggestive, not claimed:** `off` retransmit medians rise with delay (95→648→393) while
+  `both` stays low (86→39→12) — 10–30× fewer retransmits with the fix at 5–10 µs. High
+  variance, n=5; worth a targeted re-measure if TCP-behaviour effects become a claim.
+
+**Verdict: the "A null, B finds a win" scenario did NOT materialize for CPU/latency; B
+instead sharpened the mechanism story.** The fix's *relative* efficacy grows with decrypt
+cost (56→89 % of waste removed) but the *absolute* saving stays micro on this hardware.
+Honest headline: *mechanically correct, dose-responsive, and below the noise floor of
+c220g2 at these loads.* Remaining: headwake soak (Phase C), optional governor-controlled
+latency re-test, write-up.
 
 ### Phase A result — sub-saturation latency + CPU (analyzed 2026-07-02)
 

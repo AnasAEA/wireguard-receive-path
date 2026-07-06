@@ -209,13 +209,20 @@ queue** — both common in parallel mode.
   bulk load* (the 0-load floor is ~370 µs) — a
   CPU C-state/frequency artifact (`schedutil`), not a wasted-poll effect. This matches the
   cost model: a ~1 µs wasted poll cannot move a ms-scale, C-state-dominated tail.
-- **Still open (where a positive result could still live):**
-  - *Decrypt-cost sensitivity* — direction holds (slower decrypt → stock waste ~28 → ~44%,
-    fix removes more), but the busy-wait collapses the pipeline at high delay; needs a capped
-    sub-line-rate re-run + a fixed throughput capture to draw the curve.
+- **Decrypt-cost sensitivity — answered (2026-07-06, `decsweep_20260706_0321.csv`,
+  figs `fig_decsweep_wasted.png`/`fig_decsweep_cpu.png`).** The capped-load re-run
+  (2 Gb/s, single window, 0/1/2/5/10 µs × off/both × 5 reps) shows the fix is
+  **dose-responsive in decrypt cost**: stock stays flat ~33–35 % wasted while `both`
+  falls 15.2 → 3.8 % — the fix removes 56 % of the waste on fast crypto and **89 % at
+  10 µs/packet**. But the payoff stays null: CPU deltas mixed-sign at every delay
+  (saved ≈0.015 CE vs ±2 CE noise), p99 mixed. Even where the fix works *best*, the
+  removed work is not first-order on c220g2. (Suggestive only: 10–30× fewer TCP
+  retransmits with the fix at 5–10 µs; n=5, not claimed.)
+- **Still open:**
   - *A C-state-controlled latency re-test* (`governor=performance`, latency probe isolated
     from the iperf-server cores, more reps) — only worthwhile to convert the ~7% p99 lean
     into a real number.
+  - *Headwake reliability soak* (Phase C) — the gate before recommending `both`.
 - **Contribution so far:** the real throughput lever (parallelism) + a fix that
   demonstrably and reproducibly removes ~half the wasted-poll work across 8–64 peers, with
   the user-visible payoff being measured. This corrects, not discards, the M1 hypothesis:

@@ -113,13 +113,25 @@ CONDS="off supp root both" REPS=8 sudo bash ~/measure_subsat.sh 8 "0 4"
 3. **Single-tunnel TCP ceiling.** Per-peer RX is one NAPI; a tunnel tops out ~1 Gb/s for one
    stream. Hence multiple streams per bulk tunnel, and bin by actual.
 
-## Phase B — decrypt-cost sweep (sensitivity, not the main claim)
-`measure_decrypt_sweep.sh`, fixed: run at a **capped sub-line-rate load** so slowing decrypt
-doesn't implode the pipeline; fix the throughput capture. Sweep `wg_decrypt_delay_ns` =
-0/1/2/5/10 µs. Per point: actual throughput, wasted%, CPU CE, p50/p99/p999, retransmits.
-Identify the **knee** (safe / transition / collapse); only the safe+transition region is
-evidence. Answers "under what decrypt:poll ratio does the fix become visible," explaining why
-it may be invisible on fast crypto.
+## Phase B — decrypt-cost sweep — RESULT (run 2026-07-06, `decsweep_20260706_0321.csv`)
+
+Ran as designed (rewritten harness: capped 2 Gb/s, single window, delays 0/1/2/5/10 µs ×
+off/both × 5 reps, 50/50 runs ok). Analysis `analyze_decsweep.py`, figures
+`fig_decsweep_wasted.png` / `fig_decsweep_cpu.png`.
+
+- **Mechanism: dose-responsive, the strongest mechanistic result of the project.** `off`
+  flat ~33–35 % wasted at every delay; `both` falls 15.2 → 3.8 % monotonically — the fix
+  removes **56 % of the waste at 0 µs and 89 % at 10 µs**.
+- **User-visible payoff: still null.** CPU deltas mixed-sign at every delay (saved work
+  ≈0.015 CE vs a ±2 CE noise floor — two orders below); p99 deltas mixed. Even at
+  decrypt:poll ≈ 10:1 the absolute saving is micro on c220g2.
+- **Suggestive only:** `both` shows 10–30× fewer TCP retransmits at 5–10 µs (n=5, high
+  variance — not claimed).
+
+**So the outcome is the "A and B null" branch below, with a sharper mechanism story**: the
+fix works better exactly where the hypothesis said it would (slow crypto), but on this
+hardware the removed work is never first-order. No knee was found because under capped load
+the pipeline never collapses — the June-26 collapse was an uncapped-load artifact.
 
 ## Phase C — `headwake` reliability soak (gate before recommending `both`)
 Sustained load with `wg_headwake=1` for 15–30 min at moderate **and** near-line-rate load;
