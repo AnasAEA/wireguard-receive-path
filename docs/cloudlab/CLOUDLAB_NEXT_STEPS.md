@@ -142,6 +142,16 @@ decrypt delay → real next-stage direction with evidence behind it.
 hard off→both, but is <1% of total busy cycles in both conditions → the CPU null becomes
 *measured*, not just explained. If it doesn't match, we found the hidden cost.
 
+> **DONE 2026-07-06** (`data/cloudlab/costacct_20260706_{0539,0613}`, two runs, combined
+> coverage complete). **E10: cost model CONFIRMED** — C_poll 1.14–1.36 µs, reclaimable
+> ≈ 0.02 CE vs ±2 CE noise (100× below), perf: poll machinery < 0.7 % of busy cycles.
+> **E11: steering bound PROMISING** — median stall ~50–100 µs ≈ 10–20× T_decrypt and
+> delay-insensitive (the head waits on worker scheduling, not on decrypt); conservative
+> excess typical ~30–90 µs, tail 200–800 µs. Above the drop band, tail beyond the go
+> threshold, but head-vs-empty classification unresolved. **Next concrete step: the
+> ~20-line wg_diag per-episode classifier (head-state + duration), NOT steering itself.**
+> Full numbers: `CLOUDLAB_EXPERIMENTS_LOG.md` E10/E11 entry.
+
 # ▶ OPTIONAL — E12: hardware as a parameter space (not a contradiction of the null)
 
 Phrase the c220g2 result as: *the fix matters when `wasted_poll_rate × C_poll` becomes

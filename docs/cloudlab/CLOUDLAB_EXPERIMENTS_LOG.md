@@ -201,6 +201,57 @@ validated cleanly). Lesson repeated from #1: **scp artifacts off the dut in the 
 session that produces them** — the daily lease reset makes anything left in `~` volatile.
 *(Resolution: no copy survived; re-run on instantiation #7 below.)*
 
+### E10/E11 RESULT — cost model MEASURED; steering bound promising (2026-07-06)
+
+Same instantiation #7, `measure_cost_accounting.sh`, two runs (run 1 `costacct_20260706_0539`
+had one cold window + empty E11s from a bpftrace-0.14 END-block quirk; run 2
+`costacct_20260706_0613` fills the gaps — combined, every cell is covered). Windows
+validated by their own poll counts; absolute poll/stall *counts* vary between windows with
+achieved load (spurious load restarts from a too-tight precheck, since fixed) — fractions,
+per-poll costs and distributions are consistent and are what we use.
+
+**E10 — the CPU null is now measured, not derived:**
+- **C_poll (wasted) = 1.14–1.36 µs** across every valid cell (Phase C's ~1.0 µs holds
+  in-regime; kretprobe overhead inflates it slightly, so treat as an upper bound).
+- **Total wasted-poll CPU: `off` ≈ 0.022 CE at both delay 0 and 10 µs** (657/694 ms per
+  30 s window); `both` cuts it to 0.005/0.001 CE. **Reclaimable ≈ 0.017–0.022 CE against
+  a ±2 CE noise floor — 100× below.** Even eliminating 100 % of the waste is invisible.
+- **perf agrees independently**: `wg_packet_rx_poll` self (incl. its *useful* delivery
+  work) + `napi_complete_done` + `__napi_schedule` < **0.7 % of all busy cycles** in every
+  condition. (perf for the d0/off cell cold in both runs — first-window warm-up overlap;
+  bpf covers that cell, perf covered by the other three.)
+- Bonus: `both` runs *fewer, longer* polls (avg 15 → 23 µs at 10 µs delay) — suppressing
+  waste consolidates delivery into bigger batches (the M1 GRO-batch story on real HW).
+
+**E11 — stall-episode gaps (delivery blocked, `off`), the steering upper bound:**
+
+| delay | episodes/30s | p50 (µs) | p90 (µs) | sub-ms pop. p99 (µs) |
+|---|---|---|---|---|
+| 0 | 244k | 48–96 | ~770 | ~770 |
+| 2 µs | 52k | ~48 | ~96 | ~380 |
+| 5 µs | 280k | ~48 | ~380 | ~770 |
+| 10 µs | 35k | ~48 | ~3000 | ~190 |
+
+- **The key mechanistic finding: the median stall (~50–100 µs) is 10–20× T_decrypt and
+  does NOT grow with injected decrypt delay.** The head is not slow to *decrypt* — it is
+  slow to *get decrypted* (kworker scheduling / queued behind other packets on its worker
+  CPU; matches the bimodal Δ_complete ~5 µs/~100 µs from the cost model). This directly
+  supports the decrypt-order-steering premise.
+- Correction chain (agreed wording): raw gap = upper bound on delivery-blocked time; ~54 %
+  of wasted polls are UNCRYPTED-head (wg_diag) so roughly half the episodes are relevant;
+  minus the decrypt floor (5–16 µs) → **conservative recoverable excess: typical ~30–90 µs,
+  sub-ms tail population reaching 200–800 µs**. The ms-scale tail (~6 % of episodes) is
+  empty-queue idle between traffic bursts, excluded.
+- **Against the decision rule (5–20 µs → drop; 100+ µs → go): the bound lands above the
+  drop band, with a tail beyond the go threshold — but per-episode head-vs-empty
+  classification is the unresolved contamination.** Verdict: does NOT yet justify
+  implementing steering; DOES justify the ~20-line behaviour-preserving module classifier
+  (per-episode head-state + duration) as the next concrete step.
+
+Incidents logged: bpftrace 0.14 rejects scripts with an `END` block ("Could not resolve
+symbol: END_trigger"); the first ensure_load precheck (bpftrace-based, 8 s timeout) starved
+on BTF parse and false-alarmed on healthy windows — replaced with an rx_bytes delta check.
+
 ### Instantiation #7 + Phase B RESULT — decrypt-cost sweep (2026-07-06)
 
 New nodes: `dut` c220g2-011118 (same ID as #6), `gen` c220g2-011119. Bootstrap clean

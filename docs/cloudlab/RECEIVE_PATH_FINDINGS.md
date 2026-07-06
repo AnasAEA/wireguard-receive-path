@@ -218,6 +218,23 @@ queue** — both common in parallel mode.
   (saved ≈0.015 CE vs ±2 CE noise), p99 mixed. Even where the fix works *best*, the
   removed work is not first-order on c220g2. (Suggestive only: 10–30× fewer TCP
   retransmits with the fix at 5–10 µs; n=5, not claimed.)
+- **The CPU null is measured, not derived (E10, 2026-07-06,
+  `data/cloudlab/costacct_20260706_*`).** Direct accounting under the Phase B load:
+  wasted-poll cost 1.14–1.36 µs each; total wasted-poll CPU ≈ **0.022 CE** for stock at
+  both delay 0 and 10 µs, vs a ±2 CE run-to-run noise floor — eliminating *all* of it is
+  invisible by construction. perf cycle attribution agrees: the whole poll+wake machinery
+  is < 0.7 % of busy cycles in every condition.
+- **Future work with evidence behind it — decrypt-order steering (E11).** Stall-episode
+  measurement (first wasted poll → next productive poll) shows the median delivery-blocked
+  gap is **~50–100 µs ≈ 10–20× T_decrypt, and does not grow with injected decrypt delay**:
+  the head is not slow to decrypt, it is slow to *get* decrypted (worker-queue/scheduling).
+  A head-priority scheme (steer the current head to the next free CPU instead of FIFO on
+  its assigned worker) targets exactly this — unlike the wake-side fixes, it could deliver
+  packets *earlier*. Conservative recoverable excess: typical ~30–90 µs, tail population
+  200–800 µs — above the "not worth it" band (5–20 µs), tail beyond the "go" threshold
+  (100 µs), but contaminated by unclassifiable empty-queue episodes (~46 %). Gate before
+  designing anything: a ~20-line behaviour-preserving module classifier (per-episode
+  head-state + duration).
 - **Still open:**
   - *A C-state-controlled latency re-test* (`governor=performance`, latency probe isolated
     from the iperf-server cores, more reps) — only worthwhile to convert the ~7% p99 lean
