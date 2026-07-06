@@ -42,6 +42,17 @@ set_cond(){ local s=0 h=0; [ "$1" = both ] && { s=1; h=1; }
 start_load(){ ssh -n -o StrictHostKeyChecking=no "$GEN" \
   "bash /tmp/genload_bulk.sh $N $1 $PERT $STREAMS" >/dev/null 2>&1 & }
 
+# the first orchestrator run (2026-07-06) had one silently cold window (80 polls/30s =
+# keepalives only) — every window now verifies traffic first and restarts the load once.
+ensure_load(){ local dur=$1 tries=0 c
+  while [ $tries -lt 2 ]; do
+    c=$(timeout 8 bpftrace -e 'kretprobe:wg_packet_rx_poll { @c=count(); } interval:s:3 { exit(); }' 2>/dev/null | awk -F": " "/^@c/{print \$2}")
+    [ "${c:-0}" -ge 500 ] && return 0
+    echo "WARN: load cold (polls=${c:-0}), restarting bulk" >&2
+    start_load "$dur"; sleep 6; tries=$((tries+1))
+  done
+  echo "WARN: load still cold after retry — window may be invalid" >&2; return 1; }
+
 cat > /tmp/e10b.bt <<'BT'
 kprobe:wg_packet_rx_poll { @t[tid]=nsecs; }
 kretprobe:wg_packet_rx_poll /@t[tid]/ {
@@ -67,8 +78,9 @@ kretprobe:wg_packet_rx_poll /@t[tid]/ {
   }
 }
 interval:s:30 { exit(); }
-END { clear(@ep); clear(@n); clear(@t); }
 BT
+# NB no END block: bpftrace 0.14 fails with "Could not resolve symbol: END_trigger" when
+# one is present (seen 2026-07-06) — the residual @t/@n/@ep map dumps are filtered in analysis.
 
 ethtool -N "$NIC" rx-flow-hash udp4 sdfn >/dev/null 2>&1
 pkill -f 'iperf3 -s' 2>/dev/null; sleep 1
@@ -85,14 +97,14 @@ for D in $E10_DELAYS; do
   for C in off both; do
     set_cond "$C"
     # E10a — perf window
-    start_load $((PERF_DUR + 12)); sleep 5
+    start_load $((PERF_DUR + 20)); sleep 5; ensure_load $((PERF_DUR + 15))
     perf record -a -F 499 -o "$OUT/perf_d${D}_${C}.data" -- sleep $PERF_DUR >/dev/null 2>&1
     perf report -i "$OUT/perf_d${D}_${C}.data" --stdio --percent-limit 0.001 2>/dev/null \
       | grep -E 'wg_packet_rx_poll|napi_complete_done|__napi_schedule|net_rx_action|wg_packet_decrypt_worker|chacha|poly1305' \
       > "$OUT/perf_d${D}_${C}.txt"
     sleep 8
     # E10b — bpftrace window
-    start_load $((BPF_DUR + 12)); sleep 5
+    start_load $((BPF_DUR + 20)); sleep 5; ensure_load $((BPF_DUR + 15))
     timeout $((BPF_DUR + 15)) bpftrace /tmp/e10b.bt > "$OUT/bpf_d${D}_${C}.txt" 2>/dev/null
     sleep 8
     echo "E10 delay=$D cond=$C done" >&2
@@ -102,7 +114,7 @@ done
 set_cond off
 for D in $E11_DELAYS; do
   echo "$D" > /sys/module/wireguard/parameters/wg_decrypt_delay_ns
-  start_load $((BPF_DUR + 12)); sleep 5
+  start_load $((BPF_DUR + 20)); sleep 5; ensure_load $((BPF_DUR + 15))
   timeout $((BPF_DUR + 15)) bpftrace /tmp/e11.bt > "$OUT/stall_d${D}_off.txt" 2>/dev/null
   sleep 8
   echo "E11 delay=$D done" >&2
