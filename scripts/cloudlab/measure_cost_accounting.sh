@@ -44,11 +44,14 @@ start_load(){ ssh -n -o StrictHostKeyChecking=no "$GEN" \
 
 # the first orchestrator run (2026-07-06) had one silently cold window (80 polls/30s =
 # keepalives only) — every window now verifies traffic first and restarts the load once.
-ensure_load(){ local dur=$1 tries=0 c
+# The check reads wg0 rx_bytes (instant, no bpftrace: BTF parse alone can eat an 8s
+# timeout and made the first version of this guard report polls=0 on healthy windows).
+ensure_load(){ local dur=$1 tries=0 b0 b1
   while [ $tries -lt 2 ]; do
-    c=$(timeout 8 bpftrace -e 'kretprobe:wg_packet_rx_poll { @c=count(); } interval:s:3 { exit(); }' 2>/dev/null | awk -F": " "/^@c/{print \$2}")
-    [ "${c:-0}" -ge 500 ] && return 0
-    echo "WARN: load cold (polls=${c:-0}), restarting bulk" >&2
+    b0=$(cat /sys/class/net/wg0/statistics/rx_bytes 2>/dev/null || echo 0); sleep 2
+    b1=$(cat /sys/class/net/wg0/statistics/rx_bytes 2>/dev/null || echo 0)
+    [ $((b1 - b0)) -ge 1000000 ] && return 0   # >=0.5 MB/s through the tunnel
+    echo "WARN: load cold (rx_delta=$((b1-b0))B/2s), restarting bulk" >&2
     start_load "$dur"; sleep 6; tries=$((tries+1))
   done
   echo "WARN: load still cold after retry — window may be invalid" >&2; return 1; }
