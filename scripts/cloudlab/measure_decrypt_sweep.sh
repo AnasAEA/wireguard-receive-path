@@ -28,6 +28,10 @@
 #   LOAD=2 REPS=5 CONDS="off both" sudo bash ~/measure_decrypt_sweep.sh 8
 # Runtime: delays x conds x reps x ~(DUR+10)s — defaults 5x2x5x~40s ~ 35 min.
 set -uo pipefail
+# single-instance guard: two concurrent sweeps rip each other's tunnel/servers apart
+# (each setup does rmmod + pkill) and silently produce all-NA rows — seen 2026-07-06.
+exec 9>/tmp/decsweep.lock
+flock -n 9 || { echo "FATAL: another measure_decrypt_sweep.sh is already running (lock /tmp/decsweep.lock)" >&2; exit 1; }
 N=${1:-8}
 DELAYS=${2:-"0 1000 2000 5000 10000"}   # wg_decrypt_delay_ns values (ns)
 DUR=${3:-30}
@@ -37,7 +41,11 @@ LOAD=${LOAD:-2}                   # target TOTAL bulk Gb/s over peers 1..N-1 (su
 CONDS=${CONDS:-"off both"}        # subset of: off supp root both
 REPS=${REPS:-5}
 STREAMS=${STREAMS:-4}             # TCP streams per bulk tunnel
-REJECT_DEV=${REJECT_DEV:-0.40}    # |actual-target|/target beyond this => status=collapse
+REJECT_DEV=${REJECT_DEV:-0.60}    # |actual-target|/target beyond this => status=collapse.
+                                  # NB iperf3 -b pacing undershoots ~40-45% at 2G/7peers/4streams
+                                  # (Phase A: target 2 -> actual ~1.1), so 0.40 would mislabel
+                                  # healthy runs; the real knee is located in analysis as the drop
+                                  # of load_actual vs the delay=0 baseline, not by this flag.
 KO="$HOME/wireguard_trigger.ko"
 TS=$(date +%Y%m%d_%H%M); CSV="$HOME/decsweep_$TS.csv"; PLACE="$HOME/decsweep_$TS.placement.txt"
 HOST=$(hostname -s); HZ=$(getconf CLK_TCK); LPORT=11111
