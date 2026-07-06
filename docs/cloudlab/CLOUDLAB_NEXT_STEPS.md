@@ -91,6 +91,75 @@ Read the result with the plan's knee framing: safe / transition / collapse regio
 `status=ok` rows are evidence. The question the sweep answers: at what decrypt:poll ratio
 (if any) does `both` start saving CPU CE or tail latency vs `off`?
 
+> **DONE 2026-07-06** (`data/cloudlab/decsweep_20260706_0321.csv`): dose-responsive
+> mechanism (waste removal 56%→89% as delay 0→10 µs), CPU/latency payoff still null.
+> Follow-up below: confirm the cost model is a *measured* null, not a derived one.
+
+---
+
+# ▶ RUN NEXT — E10/E11: cost-model confirmation + steering bound (2026-07-06)
+
+Two bounds to measure before designing anything further (agreed with Alain's framing):
+**cost bound** (E10 — are the wasted polls really too cheap to matter?) and **latency
+bound** (E11 — how much delivery time is lost to a blocked UNCRYPTED head? = the ceiling
+any head-priority/decrypt-steering scheme could recover).
+
+One orchestrator runs both: `scripts/cloudlab/measure_cost_accounting.sh` (on dut, ~10 min).
+E10 runs off vs both at delay 0 and 10 µs, same capped 2 Gb/s load as Phase B, with
+**separate probe windows** (perf and bpftrace never run together — they'd perturb each
+other): E10a = perf cycle attribution on all cores (`wg_packet_rx_poll`,
+`napi_complete_done`, `__napi_schedule`, decrypt symbols); E10b = bpftrace duration *sums*
+for polls returning 0 → wasted CPU-time in seconds/CE, not counts. E11 = stall-episode
+gaps under `off` at delays 0/2/5/10 µs: first `retval==0` poll after a productive poll
+starts an episode; the next productive poll on the same NAPI ends it.
+
+```bash
+# 0) perf is NOT in the bootstrap package set — install once per instantiation:
+ssh anasait@c220g2-011118.wisc.cloudlab.us 'sudo apt-get install -y -qq linux-tools-$(uname -r) linux-tools-generic >/dev/null; perf --version'
+
+# 1) push + run the orchestrator (from the Mac)
+scp scripts/cloudlab/measure_cost_accounting.sh anasait@c220g2-011118.wisc.cloudlab.us:~/
+ssh anasait@c220g2-011118.wisc.cloudlab.us 'nohup sudo bash ~/measure_cost_accounting.sh > ~/costacct_run.log 2>&1 & tail -f ~/costacct_run.log'
+
+# 2) fetch the whole artifact dir IMMEDIATELY (lesson from instantiation #6)
+scp -r "anasait@c220g2-011118.wisc.cloudlab.us:~/costacct_*" data/cloudlab/
+```
+
+**How to read E11 (wording agreed — do not overclaim):**
+```text
+raw stall gap                                = upper bound on delivery-blocked time
+× UNCRYPTED-head fraction (~54%, wg_diag)    = upper bound on relevant head stalls
+− decrypt floor (T_decrypt_effective)        = conservative estimate of the recoverable
+                                               steering excess (conservative because the
+                                               failed poll may land mid-decrypt, so the
+                                               true recoverable part may be larger)
+```
+**Decision rule:** corrected excess p99 ≈ 5–20 µs → head-priority/decrypt-order steering
+is future-work only, not worth implementing this internship. 100+ µs and growing with
+decrypt delay → real next-stage direction with evidence behind it.
+
+**E10 expected result** (if the cost model is right): wasted-poll symbol/time share drops
+hard off→both, but is <1% of total busy cycles in both conditions → the CPU null becomes
+*measured*, not just explained. If it doesn't match, we found the hidden cost.
+
+# ▶ OPTIONAL — E12: hardware as a parameter space (not a contradiction of the null)
+
+Phrase the c220g2 result as: *the fix matters when `wasted_poll_rate × C_poll` becomes
+non-negligible relative to total receive-path CPU / latency noise.* Phase B swept the
+decrypt axis; the poll/wakeup-cost axis is untested. Candidates where the ratio shifts:
+VMs (expensive wakeups/IPIs), no-SIMD crypto, in-order embedded cores. Note the
+invariance hypothesis: *uniformly* slower hardware scales C_poll and per-packet costs
+together, so the waste share may be invariant — the free test on this dut:
+
+```bash
+# clamp all cores to the E5-2660v3 floor (1.2 GHz), re-run E10b + measure_missed.sh 8,
+# then restore. If the waste share is invariant under uniform slowdown, the parametric
+# claim holds; asymmetric platforms remain the interesting axis.
+for c in /sys/devices/system/cpu/cpu*/cpufreq/scaling_max_freq; do echo 1200000 | sudo tee $c >/dev/null; done
+# ... measure ...
+for c in /sys/devices/system/cpu/cpu*/cpufreq/scaling_max_freq; do cat ${c%max_freq}cpuinfo_max_freq | sudo tee $c >/dev/null; done
+```
+
 To repeat a single cell for variance, just rerun that one line (e.g. `sudo bash
 ~/measure_taillat.sh 32 2000 20`). CSVs land in `~` (`taillat_*.csv`, `decsweep_*.csv`);
 `measure_missed.sh` prints to stdout. Knob check while loaded: `cat
