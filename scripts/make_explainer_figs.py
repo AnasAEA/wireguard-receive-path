@@ -231,7 +231,140 @@ def fig_stall_en():
     ax.grid(axis="y", alpha=0.25, lw=0.6); ax.set_axisbelow(True)
     fig.tight_layout(); fig.savefig(f"{OUT}/fig_e11_stall_en.png", dpi=140)
 
+
+
+# ============ FR variants of the four conceptual figures ============
+def fig_timeline_fr():
+    fig, ax = plt.subplots(figsize=(9.2, 4.6))
+    fig.patch.set_facecolor(SURF); ax.set_facecolor(SURF)
+    ax.set_xlim(0, 100); ax.set_ylim(-1.2, 6.6); ax.axis("off")
+    lanes = {"P4 (CPU 3)": 4.6, "P3 (CPU 2)": 3.7, "P2 (CPU 1)": 2.8, "P1 (CPU 0)": 1.9}
+    spans = {"P2 (CPU 1)": (8, 14), "P3 (CPU 2)": (8, 10), "P4 (CPU 3)": (8, 17),
+             "P1 (CPU 0)": (46, 14)}
+    for lane, y in lanes.items():
+        s, d = spans[lane]
+        ax.text(6.5, y, lane, ha="right", va="center", fontsize=9, color=INK2)
+        color = RED if lane.startswith("P1") else BLUE
+        if lane.startswith("P1"):
+            ax.barh(y, 46-8, left=8, height=0.52, color=MUT, alpha=0.35)
+            ax.text(27, y, "en file derrière d'autres paquets sur le CPU 0", ha="center",
+                    va="center", fontsize=8, color=INK2, style="italic")
+        ax.barh(y, d, left=s, height=0.52, color=color)
+        ax.text(s + d/2, y, "déchiffre", ha="center", va="center", fontsize=8,
+                color="white", fontweight="bold")
+        ax.plot(s + d, y, marker="o", ms=5, color=INK)
+    ax.text(8, 5.45, "les paquets arrivent dans l'ordre P1 P2 P3 P4 — le déchiffrement est parallèle",
+            fontsize=9.5, color=INK)
+    yD = 0.9
+    ax.text(6.5, yD, "livraison", ha="right", va="center", fontsize=9, color=INK2)
+    ax.barh(yD, 60-8, left=8, height=0.52, color=RED, alpha=0.25)
+    ax.text(34, yD, "bloquée — la tête P1 n'est pas prête", ha="center", va="center",
+            fontsize=8.5, color=RED, fontweight="bold")
+    ax.barh(yD, 14, left=60, height=0.52, color=AQUA)
+    ax.text(67, yD, "P1 P2 P3 P4", ha="center", va="center", fontsize=8.5,
+            color="white", fontweight="bold")
+    yP = 0.0
+    ax.text(6.5, yP, "polls", ha="right", va="center", fontsize=9, color=INK2)
+    for x in (19.5, 26, 33, 39.5, 47, 53.5):
+        ax.plot(x, yP, marker="x", ms=7, mew=2.2, color=RED)
+    ax.plot(60.5, yP, marker="o", ms=7, color=AQUA)
+    ax.text(33, -0.85, "chaque fin non-tête sonne la cloche → le poll trouve P1 chiffré → gaspillé",
+            fontsize=8.5, color=RED, ha="center")
+    ax.text(63, -0.85, "poll utile", fontsize=8.5, color=AQUA, ha="left")
+    ax.annotate("P2–P4 finis, déchiffrés,\nen attente dans la file ordonnée",
+                xy=(25, 3.7), xytext=(58, 4.4), fontsize=8.5, color=INK2,
+                arrowprops=dict(arrowstyle="->", color=INK2, lw=1))
+    ax.set_title("L'EoI en une image : la livraison attend la tête ; les polls brûlent pendant ce temps",
+                 fontsize=12, color=INK, pad=10)
+    fig.tight_layout(); fig.savefig(f"{OUT}/fig_eoi_timeline_fr.png", dpi=150)
+
+def fig_pipeline_fr():
+    fig, ax = canvas(9.6, 4.3)
+    box(ax, 2, 24, 13, 12, "NIC\npaquets\nchiffrés", MUT)
+    for lbl, y in [("worker CPU1 — P2", 42), ("worker CPU2 — P3", 30),
+                   ("worker CPU3 — P4", 18), ("worker CPU0 — P1", 6)]:
+        c = RED if "P1" in lbl else BLUE
+        box(ax, 24, y, 20, 8, f"déchiffrement\n{lbl}", c, fs=8.5)
+        arrow(ax, 15, 30, 24, y+4)
+    ax.text(34, 53, "déchiffrement parallèle → finit DANS LE DÉSORDRE", fontsize=9.5,
+            color=INK, ha="center", fontweight="bold")
+    qx, qy = 54, 24
+    ax.text(qx+10.5, qy+15, "file ORDONNÉE par pair", fontsize=9.5, color=INK,
+            ha="center", fontweight="bold")
+    cells = [("P1", RED, "encore\nchiffré"), ("P2", AQUA, "prêt"),
+             ("P3", AQUA, "prêt"), ("P4", AQUA, "prêt")]
+    for i, (p, c, note) in enumerate(cells):
+        box(ax, qx + i*5.4, qy, 4.6, 9, p, c, fs=9)
+        ax.text(qx + i*5.4 + 2.3, qy-3.4, note, fontsize=7,
+                color=c if c==RED else INK2, ha="center")
+    ax.text(qx+2.3, qy+11.5, "TÊTE", fontsize=8, color=RED, ha="center", fontweight="bold")
+    for y in (46, 34, 22, 10):
+        arrow(ax, 44, y, 53, qy+5, con="arc3,rad=0.12")
+    box(ax, 82, 23, 15, 11, "poll NAPI\nlivre depuis la\ntête seulement", INK2)
+    arrow(ax, 76, 28.5, 82, 28.5)
+    arrow(ax, 44, 46, 84, 36, color=RED, lw=1.8, con="arc3,rad=-0.25")
+    ax.text(72, 51, "CHAQUE fin de déchiffrement sonne la cloche (napi_schedule) —\ntête chiffrée ⇒ le poll tourne pour rien : POLL GASPILLÉ",
+            fontsize=9, color=RED, ha="center", fontweight="bold")
+    ax.set_title("Le chemin de réception WireGuard : d'où viennent les polls gaspillés",
+                 fontsize=12, color=INK, pad=8)
+    fig.tight_layout(); fig.savefig(f"{OUT}/fig_eoi_pipeline_fr.png", dpi=150)
+
+def fig_twosided_fr():
+    fig, ax = canvas(9.6, 4.4)
+    box(ax, 3, 38, 22, 10, "fin de déchiffrement\n(généralement PAS la tête)", BLUE, fs=9)
+    box(ax, 34, 38, 20, 10, "napi_schedule\n(« sonner la cloche »)", MUT, fs=9)
+    box(ax, 66, 38, 28, 10, "le poll tourne, tête chiffrée\n→ POLL GASPILLÉ", RED, fs=9)
+    arrow(ax, 25, 43, 30.5, 43); arrow(ax, 54, 43, 66, 43)
+    box(ax, 20, 25, 27, 8, "wg_headwake (barrière producteur) :\nsonner SEULEMENT si la tête est prête", AQUA, fs=8.2)
+    arrow(ax, 40, 33.5, 42, 37.5, color=AQUA, lw=2)
+    arrow(ax, 92, 37.5, 92, 20, color=RED, lw=1.8, con="arc3,rad=-0.35")
+    box(ax, 62, 12, 32, 8, "MISSED posé pendant le poll\n→ le noyau force un RE-POLL immédiat", RED, fs=8.2)
+    arrow(ax, 62, 16, 80, 37.5, color=RED, lw=1.8, con="arc3,rad=-0.3")
+    box(ax, 24.5, 8, 30, 8.5, "wg_supp (suppression consommateur) :\ntête encore chiffrée en fin de poll\n→ effacer MISSED, se garer", AQUA, fs=8.2)
+    arrow(ax, 54.5, 12.5, 61.5, 14.5, color=AQUA, lw=2)
+    ax.text(50, 55, "un seul côté fuit — supprime le re-poll et la fin suivante sonne une cloche NEUVE ;\nbarre le producteur et les re-polls MISSED en vol partent quand même.  Ensemble : 27 % → 14 % gaspillés.",
+            fontsize=9.5, color=INK, ha="center")
+    ax.set_title("Le fix deux-côtés : barrer la cloche (producteur) + supprimer le re-poll (consommateur)",
+                 fontsize=12, color=INK, pad=8)
+    fig.tight_layout(); fig.savefig(f"{OUT}/fig_twosided_fr.png", dpi=150)
+
+def fig_steering_fr():
+    fig, axes = plt.subplots(2, 1, figsize=(9.2, 4.8), sharex=True)
+    fig.patch.set_facecolor(SURF)
+    T0, T1 = 46, 60
+    for ax, title in zip(axes, ["aujourd'hui (même AVEC le fix deux-côtés)",
+                                "l'idée steering (travail futur)"]):
+        ax.set_facecolor(SURF); ax.set_xlim(0, 100); ax.set_ylim(0, 3); ax.axis("off")
+        ax.set_title(title, fontsize=10.5, color=INK, loc="left", pad=4)
+    ax = axes[0]
+    ax.barh(2, 38, left=8, height=0.5, color=MUT, alpha=0.35)
+    ax.text(27, 2, "P1 attend son tour (~50–100 µs mesurés)", ha="center", va="center",
+            fontsize=8.5, color=INK2)
+    ax.barh(2, 14, left=T0, height=0.5, color=RED)
+    ax.text(T0+7, 2, "déchiffre", ha="center", va="center", fontsize=8, color="white", fontweight="bold")
+    ax.barh(1, 10, left=T1, height=0.5, color=AQUA)
+    ax.text(T1+5, 1, "livraison", ha="center", va="center", fontsize=8, color="white", fontweight="bold")
+    ax.text(8, 0.35, "le fix a supprimé les polls gaspillés — mais la livraison démarre au même instant",
+            fontsize=8.5, color=INK2)
+    ax = axes[1]
+    S0 = 12
+    ax.barh(2, 14, left=S0, height=0.5, color=BLUE)
+    ax.text(S0+7, 2, "déchiffre", ha="center", va="center", fontsize=8, color="white", fontweight="bold")
+    ax.text(S0+16, 2, "← le prochain CPU LIBRE prend la tête en premier", fontsize=8.5,
+            color=BLUE, va="center")
+    ax.barh(1, 10, left=S0+14, height=0.5, color=AQUA)
+    ax.text(S0+19, 1, "livraison", ha="center", va="center", fontsize=8, color="white", fontweight="bold")
+    ax.annotate("", xy=(S0+14, 0.5), xytext=(T1, 0.5),
+                arrowprops=dict(arrowstyle="<->", color=AQUA, lw=1.6))
+    ax.text((S0+14+T1)/2, 0.18, "récupérable : ~30–90 µs typiques, queue 200–800 µs (borne E11, en attente du classifieur)",
+            ha="center", fontsize=8.5, color=AQUA, fontweight="bold")
+    fig.suptitle("Pourquoi le fix côté réveil ne peut pas bouger la latence — et ce qui pourrait",
+                 fontsize=12, color=INK, y=0.99)
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    fig.savefig(f"{OUT}/fig_fix_vs_steering_fr.png", dpi=150)
+
 if __name__ == "__main__":
     fig_timeline(); fig_pipeline(); fig_twosided(); fig_steering()
     fig_budget_en(); fig_stall_en()
-    print("wrote 6 figures to", OUT)
+    fig_timeline_fr(); fig_pipeline_fr(); fig_twosided_fr(); fig_steering_fr()
+    print("wrote 10 figures to", OUT)
