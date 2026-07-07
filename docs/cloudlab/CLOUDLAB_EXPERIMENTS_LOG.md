@@ -30,72 +30,153 @@ The CloudLab campaign answered the main question.
   it queues behind other packets / waits for worker scheduling. This motivates a future
   **head-priority / decrypt-order steering** idea, pending one more measurement.
 
+The surprising part is that the negative result is now one of the strongest results: we
+know *why* the fix does not improve CPU. It is not because the fix is broken — it fires,
+verifiably, and removes exactly what it targets. It is because the thing it removes is
+extremely cheap on this hardware.
+
 Remaining work: (1) the ~20-line `wg_diag` per-episode classifier to separate real
 head-blocked stalls from empty-queue gaps, then re-run E11; (2) the `headwake`
 reliability soak; (3) confirm with Alain/André whether the paper's `gro_wq` combined-fix
 deliverable is still required; (4) final write-up.
 
-## 1. The story in one paragraph
+**Reader map.**
+- *2 minutes:* this section + the budget figure in Finding 5.
+- *The mechanism:* §2 (mental model) + Finding 2.
+- *The final verdict:* Findings 3–5.
+- *Future work:* Finding 6.
 
-We brought the M1-loopback EoI finding to real 10G hardware expecting to validate a
-throughput fix, and instead learned — in order — that throughput was never the fix's to
-give (the NIC's IP-only flow hash funnelled everything onto one core; fixing *that*
-gave ×2.2), that the original one-sided fix does nothing on a real NIC but a two-sided
-version (suppress the wasted re-poll *and* gate its regeneration) reliably halves wasted
-polls, that this saved work is invisible to users because the whole waste budget is a
-hundredth of the measurement noise (measured at the cycle level, twice, with independent
-instruments), and finally that the latency cost of the EoI lives somewhere the wake-side
-fix cannot reach: the head packet waiting tens of microseconds for its *turn* to be
-decrypted — which is a scheduling problem, and the evidence-backed candidate for the
-next-stage fix.
+## 1. What I was trying to answer
 
-## 2. Glossary
+The question I brought to CloudLab was simple: the M1 loopback experiments showed that
+WireGuard sometimes wakes its receive path even though no packet can be delivered yet.
+If I avoid those wasted polls, do I get a real benefit on 10G hardware?
+
+The answer turned out to be more nuanced. The fix is real — it removes the wasted
+polls, and Phase B shows it becomes stronger exactly when the model predicts it should.
+But on c220g2, the saved work is too small to show up as CPU or latency. So the useful
+result is not "WireGuard became faster." It is: we know precisely where this waste sits
+in the receive path, what it costs, and why it stays invisible on this hardware.
+
+That also changed the direction of the project. The wake-side fix avoids useless
+checks, but it does not make the head packet finish earlier. E11 suggests the next real
+latency opportunity is different: the head packet spends tens of microseconds waiting
+*before it even gets decrypted*. That points toward head-priority / decrypt-order
+steering as future work.
+
+## 2. Mental model: why WireGuard wastes polls
+
+### 2.1 The normal receive path
+
+```text
+encrypted packets arrive (NIC)
+        ↓
+parallel decrypt workers (one workqueue item per packet, spread over CPUs)
+        ↓
+packets FINISH OUT OF ORDER
+        ↓
+per-peer ORDERED queue (delivery must respect wire order)
+        ↓
+NAPI poll delivers from the HEAD of the queue
+        ↓
+if the head is still encrypted → poll delivers nothing → WASTED POLL
+```
+
+Three things to hold onto: parallel decrypt is what gives multi-core throughput (good);
+ordered delivery is a protocol requirement (non-negotiable); wasted polls are the
+friction *between* the two — the delivery engine keeps checking a head that isn't ready.
+
+### 2.2 Where the EoI appears
+
+```text
+packet order on the wire:   P1   P2   P3   P4
+decrypt finishes:           P3   P4   P2   ............ P1  (out of order)
+delivery:                   ─────── blocked waiting for P1 ───────▶ P1 P2 P3 P4
+polls meanwhile:            poll(×) poll(×) poll(×)   ← each finds P1 not ready
+```
+
+Every time a *non-head* packet (P2/P3/P4) finishes, it rings the delivery bell
+(`napi_schedule`). The bell-ringing while P1 is still decrypting is what produces the
+~27–34% wasted polls. Worse, a bell rung *during* a poll sets a MISSED flag that forces
+an immediate re-poll — and 95–99.7% of the wasted polls are exactly these MISSED
+re-polls.
+
+### 2.3 What the two-sided fix does
+
+```text
+consumer side (wg_supp):        at poll end, head still encrypted?
+                                → clear MISSED → no immediate re-poll
+
+producer side (wg_headwake):    a decrypt just finished — is it the HEAD?
+                                → only then ring the bell
+
+both together:                  suppress the old wasted re-poll
+                                AND prevent the freshly regenerated wake
+```
+
+One side alone leaks: suppress only the re-poll, and the next non-head completion rings
+a *fresh* bell (the waste "regenerates"); gate only the producer, and the MISSED
+re-polls already in flight still fire. That is Alain's composition argument, and the
+counters confirm it (Finding 2).
+
+### 2.4 What the fix cannot do — by construction
+
+The fix decides *when to check* the queue. It never touches *when P1 finishes
+decrypting* — so it can never deliver any packet earlier. Its only possible user-visible
+benefit is the CPU it frees. Keep this in mind for Findings 3–5: the latency null is not
+an accident, it is structural. (What *could* deliver earlier is Finding 6.)
+
+### 2.5 Vocabulary
 
 | Term | Meaning |
 |---|---|
-| **EoI** | Execution Order Inversion: packets decrypt in parallel and finish out of order, but delivery must be in order, so the delivery poll often finds the queue head not ready. |
-| **wasted poll** | A NAPI poll (`wg_packet_rx_poll`) that delivers zero packets (`retval==0`) — it ran, found the head not deliverable, and exited. |
-| **MISSED re-poll** | The kernel's self-rescheduled poll: a wake arriving *during* a poll sets a MISSED flag that forces another poll right after — the main source of wasted polls (95–99.7%). |
-| **fresh wake** | A wasted poll started by a brand-new `napi_schedule` (not a MISSED re-poll) — how waste "regenerates" when only one side of the fix is on. |
-| **`off`** | Baseline WireGuard behavior (also called *stock* in old entries; all knobs 0). |
-| **`wg_supp`** | Consumer-side suppression: at poll end, if the head is still encrypted, clear MISSED so the kernel parks instead of re-polling. (Old name: `move`.) |
-| **`wg_headwake`** | Producer-side gate: a decrypt completion only calls `napi_schedule` if the *head* is ready. (Old name: `root`.) |
-| **`both` / two-sided fix** | `wg_supp` + `wg_headwake` together — each side catches the waste the other leaks. |
-| **`sdfn`** | NIC receive-hash setting that adds UDP ports to the flow hash, spreading tunnels across RX queues/cores (default hashes IPs only → one core). |
-| **CE (cores-equivalent)** | CPU time normalized by wall time: 0.5 CE = half a core busy continuously during the window; 8 CE = eight full cores. |
-| **p99 / tail latency** | The 99th-percentile round-trip time of a request/response probe — the "worst moments" a user feels. |
-| **`wg_decrypt_delay_ns`** | A knob injecting a busy-wait into each decrypt, emulating slower crypto without touching poll cost. |
-| **stall episode** | The interval from the first wasted poll after a productive one to the next productive poll on the same NAPI — how long delivery stayed blocked. |
-| **Phase A / Phase B** | The sub-saturation CPU+latency campaign / the decrypt-delay sensitivity sweep. |
-| **E10 / E11** | Direct cost accounting (cycles and durations) / stall-gap steering-bound measurement. |
-| **srcversion** | The kernel module build fingerprint recorded in every CSV row (`EA06EE82…` = the two-sided composable build). |
+| **EoI** | Execution Order Inversion: parallel decrypt finishes out of order, but delivery must be in order. |
+| **wasted poll** | A NAPI poll (`wg_packet_rx_poll`) that delivers zero packets — ran, found the head not ready, exited. |
+| **MISSED re-poll** | The kernel's self-rescheduled poll: a wake arriving during a poll forces another poll right after. |
+| **fresh wake** | A wasted poll started by a brand-new `napi_schedule` — how waste regenerates with a one-sided fix. |
+| **`off`** | Baseline WireGuard (called *stock* in old entries; all knobs 0). |
+| **`wg_supp` / `wg_headwake` / `both`** | Consumer suppression / producer gate / the two-sided fix (old names: `move` / `root`). |
+| **`sdfn`** | NIC hash setting adding UDP ports to the flow hash → tunnels spread across cores (default: IPs only → one core). |
+| **CE (cores-equivalent)** | CPU normalized by wall time: 0.5 CE = half a core busy continuously; 8 CE = eight full cores. |
+| **p99 / tail latency** | 99th-percentile round-trip time — the "worst moments" a user feels. |
+| **`wg_decrypt_delay_ns`** | Knob injecting a busy-wait per decrypt — emulates slower crypto, poll cost untouched. |
+| **stall episode** | First wasted poll after a productive one → next productive poll on the same NAPI: how long delivery stayed blocked. |
+| **Phase A / Phase B / E10 / E11** | Sub-saturation CPU+latency campaign / decrypt-delay sweep / direct cost accounting / stall-gap measurement. |
+| **srcversion** | Module build fingerprint recorded in every CSV row (`EA06EE82…` = the two-sided composable build). |
 
-## 3. Main results, by research question
+## 3. Main findings
 
-### Q1 — What limited throughput on c220g2? (Answer: NIC flow placement, not WireGuard)
+### Finding 1 — Throughput was a parallelism problem, not a fix problem
 
-The first CloudLab surprise was that the fix was never going to move throughput: the
-receiver was capped at ~4.1 Gb/s with **one core at 100% (97% softirq) and 39 cores
-idle**. The NIC's default flow hash uses only IP addresses; all tunnels to the same
-endpoint IP land on one RX queue, hence one core. Adding the UDP ports to the hash is a
-single `ethtool` command:
+At this point the main bottleneck was not WireGuard logic at all. The NIC was simply
+sending all tunnels to the same receive core: its default flow hash looks only at IP
+addresses, and all tunnels share the endpoint IP.
+
+```text
+default hash (sd):    8 tunnels → same RX queue → 1 core at 100% → 4.1 Gb/s
+with ports (sdfn):    8 tunnels → 8 RX queues  → 8 cores ~55%   → 9.0 Gb/s
+```
 
 | NIC hash | Throughput | Cores receiving |
 |---|---|---|
 | `sd` (IPs only — the funnel) | 4.1 Gb/s | 1 (at 100%) |
 | `sdfn` (+ UDP ports) | **9.0 Gb/s (×2.2)** | 8 (~55% each) |
 
-Reverified on three separate instantiations. **Consequence: saturated throughput is the
-wrong yardstick for judging the EoI fix**, and all subsequent campaigns run in the
-`sdfn` spread regime. *(Fil rouge: parallelism is both the cause of the EoI bug and the
-cure for throughput.)* Figure: `../meetings/figures/fig_spread.png`.
+![One core → eight cores](../meetings/figures/fig_spread.png)
 
-### Q2 — Does the two-sided fix remove wasted polls? (Answer: yes, ~half, stably)
+Reverified on three separate instantiations. All later campaigns run in the `sdfn`
+spread regime. *(Fil rouge: parallelism is both the cause of the EoI bug and the cure
+for throughput.)*
 
-The original M1 "six-line" producer-side fix alone is a **null on real hardware** (see
-Appendix C — at wake time the bell is usually already ringing). Alain's 2026-06-25
-insight: the consumer-side suppress cancels a wasted re-poll but the wake *regenerates*
-through the producer path — so compose both sides. Peer sweep, `sdfn` spread
+> **What I learned.** Throughput was the wrong yardstick for this fix. The machine was
+> not slow because of wasted polls; it was slow because every packet was landing on one
+> receive core.
+
+### Finding 2 — The two-sided fix halves wasted polls (Alain's composition was right)
+
+The original M1 "six-line" producer-side fix alone is a **null on real hardware**
+(Appendix C — at wake time the bell is usually already ringing). The two-sided version
+from §2.3 is what works. Peer sweep, `sdfn` spread
 (`data/cloudlab/twosided_peersweep_20260626.csv`):
 
 | pairs | `off` | consumer only | producer only | **two-sided (`both`)** |
@@ -105,20 +186,27 @@ through the producer path — so compose both sides. Peer sweep, `sdfn` spread
 | 32 | 26.8% | 25.1% | 15.0% | **13.1%** |
 | 64 | 27.5% | 25.3% | 15.4% | **14.4%** |
 
-Three readings: the two sides are **additive** (consumer alone ~2 pts, producer most,
-together best); the **regeneration is visible in the counters** (consumer-only raises
-the fresh-wake share of waste from ~3% to ~6%; adding the producer gate drops it to
-~1%); and the reduction is **flat from 8 to 64 peers** — the M1 "grows with peers"
-effect does not reproduce on real hardware (Appendix C), but the halving is solid.
-Mechanism verification: in-module counters show `wg_supp` fires correctly in **96%** of
-its target cases and reads exactly 0 with the fix off — the null results that follow are
-not "a fix that doesn't fire". Figure: `fig_twosided_peers.png`.
+![Wasted polls vs peer count](../meetings/figures/fig_twosided_peers.png)
 
-### Q3 — Does the saved work show up as CPU or latency under sub-saturation? (Answer: no — clean null)
+The leak §2.3 predicts is visible in the counters: consumer-only *raises* the
+fresh-wake share of waste from ~3% to ~6% (the cancelled re-poll comes back as a fresh
+bell), and adding the producer gate drops it to ~1%. The reduction is **flat from 8 to
+64 peers** — the M1 "grows with peers" effect does not reproduce (Appendix C), but the
+halving is solid. And the fix verifiably *fires*: in-module counters show `wg_supp`
+acting in 96% of its target cases, and reading exactly 0 with the fix off — the nulls
+that follow are not "a fix that doesn't fire".
 
-Phase A design: peer 0 carries *only* a latency probe (sockperf ping-pong); peers 1–7
-carry a capped bulk load; conditions `off` vs `both` × target loads 0/2/4/6 Gb/s × 8
-reps, order fully randomized — 64 runs (`subsat_20260701_0609.csv`).
+> **What I learned.** The one-sided fix was incomplete, and Alain's composition point
+> was exactly right: each side catches the waste the other leaks.
+
+### Finding 3 — CPU and latency do not improve on c220g2 (a clean null)
+
+Phase A asked: with CPU headroom (sub-saturation), does the saved poll work show up
+where a user looks? The design point that matters: peer 0 carried *only* a
+request/response latency probe — so we never measure a latency packet stuck behind its
+own bulk traffic — while peers 1–7 created capped background WireGuard pressure.
+`off` vs `both` × target loads 0/2/4/6 Gb/s × 8 reps, order fully randomized — 64 runs
+(`subsat_20260701_0609.csv`).
 
 - **Fair comparison, verified per run**: off-vs-both actual load matches within ≤3.4%
   (≤1.2% at 4/6 Gb/s) — `both` does not throttle throughput.
@@ -134,10 +222,17 @@ Figures: `fig_subsat_cpu.png`, `fig_subsat_latency.png`. Aborted-start CSVs
 (`subsat_20260701_0400/0605`) kept as methodology provenance — the 0400 rows carry the
 `REJECT_load_dev` flags that motivated per-run load verification.
 
-### Q4 — Does the fix get stronger when decrypt is slower? (Answer: yes, strongly — but still no user-visible payoff)
+> **What I learned.** A clean null is still a result — *because* the loads were matched,
+> the order randomized and the CPU measured three ways, "nothing moved" is a defensible
+> statement rather than an ambiguous one.
 
-Phase B injects a per-packet busy-wait into decrypt (`wg_decrypt_delay_ns`) under the
-same capped-load, single-window design (`decsweep_20260706_0321.csv`, 50/50 runs valid):
+### Finding 4 — The mechanism is dose-responsive (the hero figure)
+
+Phase B injects a per-packet busy-wait into decrypt (`wg_decrypt_delay_ns`), emulating
+slower crypto under the same capped-load design (`decsweep_20260706_0321.csv`, 50/50
+runs valid):
+
+![Fix efficacy grows with decrypt cost](../meetings/figures/fig_decsweep_wasted.png)
 
 | injected delay | `off` wastes | `both` wastes | fix removes |
 |---:|---:|---:|---:|
@@ -147,68 +242,104 @@ same capped-load, single-window design (`decsweep_20260706_0321.csv`, 50/50 runs
 | 5 µs | 33.3% | 7.5% | 78% |
 | 10 µs | 34.6% | **3.8%** | **89%** |
 
-Baseline stays flat (~34% — the waste is structural, not a speed artifact) while the fix
-improves monotonically with tight IQRs: **a dose-response**, the cleanest mechanistic
-result of the project. The head stays encrypted longer ⇒ more gateable wakes, exactly
-the model's prediction. Yet CPU deltas stay mixed-sign at every delay and p99 stays
-mixed — even at a decrypt:poll cost ratio of ~10:1. (Suggestive only, not claimed:
-10–30× fewer TCP retransmits with the fix at 5–10 µs; n=5, high variance.) The earlier
-"stock waste rises to ~44%" observation was an uncapped-load collapse artifact
-(Appendix C). Figures: `fig_decsweep_wasted.png`, `fig_decsweep_cpu.png`.
+Baseline stays flat (~34% — the waste is structural, not a speed artifact) while the
+fix improves monotonically with tight intervals: **a dose-response**, the cleanest
+mechanistic result of the project. Slower decrypt keeps the head encrypted longer,
+which gives the producer gate more wakes to intercept — exactly the model's prediction.
+Yet CPU deltas stay mixed-sign at every delay and p99 stays mixed — even at a
+decrypt:poll cost ratio of ~10:1. (Suggestive only, not claimed: 10–30× fewer TCP
+retransmits with the fix at 5–10 µs; n=5, high variance.) The earlier "stock waste
+rises to ~44%" observation was an uncapped-load collapse artifact (Appendix C).
+Second figure: `fig_decsweep_cpu.png`.
 
-### Q5 — Where did the "missing cycles" go? (Answer: they were never there — measured)
+> **What I learned.** The mechanism is real precisely because it responds to the dose:
+> when I make the disease worse, the medicine removes more of it. That is much stronger
+> evidence than any single A/B.
 
-The paradox — remove up to 89% of a wasted operation, gain nothing — dissolved under
-direct measurement (E10), with two independent instruments in separate windows:
+### Finding 5 — The missing cycles were never there
 
-- **bpftrace duration sums**: a wasted poll costs **1.14–1.36 µs** in-regime (the cost
-  model said ~1.0; kretprobe overhead makes this an upper bound). Baseline's ~500k
-  wasted polls per 30 s window total **657–694 ms of CPU = 0.022 CE**; `both` cuts that
-  to 0.001–0.005 CE.
-- **perf cycle attribution**: the entire poll+wake machinery (`wg_packet_rx_poll`
-  including its *useful* work + `napi_complete_done` + `__napi_schedule`) is **<0.7% of
-  all busy cycles** in every condition.
+This was the part that felt wrong at first. At 10 µs of injected decrypt delay, the
+two-sided fix removes almost all of the wasted polls. Intuitively, that should save
+*something* visible. E10 measured why it does not — with two independent instruments in
+separate windows (bpftrace duration sums; perf cycle attribution).
 
-Against the ±2 CE noise floor, the full reclaimable budget (~0.02 CE) is **~100×
-below** — removing all of it is invisible by construction. The cycles are in per-packet
-delivery, decrypt workers, TCP/IP and userspace, not in polls. **"The fix removes many
-events, but not many cycles."** There is also a structural reason latency cannot move:
-the wake-side fix never makes any packet *deliverable earlier* — the head is delivered
-when its decrypt finishes, which the fix does not touch. Bonus observation: with the fix
-on, polls are fewer but longer (15 → 23 µs avg) — deliveries consolidate into bigger
-batches, the M1 GRO-batch effect on real hardware. Per-cell data provenance: §7.
-
-### Q6 — Is there another latency opportunity? (Answer: probably — head-priority steering, one measurement away)
-
-E11 measured how long delivery stays blocked when a poll finds the head not ready
-(stall episodes, baseline, delays 0/2/5/10 µs). The surprise:
-
-- The bulk of stalls sit at **32–128 µs ≈ 10–20× T_decrypt** (~5 µs), and the median
-  **does not grow** when +10 µs of decrypt delay is injected. If decrypt time dominated
-  the stall, it would follow the delay. It doesn't.
-- Interpretation: the head is not slow to *decrypt* — it is slow to *get decrypted*:
-  queued behind other packets on its worker CPU or waiting for the kworker to be
-  scheduled (matches the bimodal Δ_complete ~5 µs / ~100 µs in the cost model).
-- This is a different problem from the one the current fix solves, and it is the one a
-  **head-priority / decrypt-order steering** scheme (the next free CPU takes the current
-  head, instead of FIFO on its assigned worker) would attack — and unlike the wake-side
-  fix, it *would* deliver packets earlier.
-
-Honest bounds (the probe cannot tell a blocked-head stall from an empty-queue gap —
-~46% of wasted polls are empty-queue; the ms-scale population, ~6% of episodes, is
-inter-burst idle and excluded):
+The resolution: "89% of wasted polls" is not "89% of CPU". A wasted poll is a very
+cheap check — **1.14–1.36 µs**, measured in-regime (the cost model said ~1.0; kretprobe
+overhead makes this an upper bound). All of baseline's ~500k wasted polls per 30 s
+window add up to:
 
 ```text
-raw stall gap                      = upper bound on delivery-blocked time
-× UNCRYPTED-head fraction (~54%)   = upper bound on relevant head stalls
-− decrypt floor                    = conservative recoverable steering excess
+total busy CPU under load:    ~7–9  CE
+run-to-run noise:             ±2    CE
+ALL wasted polls (baseline):   0.022 CE   ← the entire disease
+saved by the fix:              0.017–0.022 CE
 ```
 
-Result: **typically ~30–90 µs recoverable, tail population 200–800 µs** — above the
-agreed "not worth it" band (5–20 µs), tail beyond the "go" threshold (100 µs), but the
-head-vs-empty classification is unresolved. **Decision: do not implement steering yet;
-implement the ~20-line `wg_diag` per-episode classifier first**, then re-run E11
-classified. Figure: `fig_e11_stall_fr.png` (budget figure: `fig_e10_budget_fr.png`).
+![The measured budget](../meetings/figures/fig_e10_budget_fr.png)
+
+perf agrees from the other direction: the entire poll+wake machinery
+(`wg_packet_rx_poll` *including its useful work* + `napi_complete_done` +
+`__napi_schedule`) is **<0.7% of all busy cycles** in every condition. The CPU lives in
+per-packet delivery, decrypt workers, TCP/IP and userspace — not in polls.
+
+So the final interpretation is simple: **the fix removes many events, but not many
+cycles.** The event counter moves a lot because we target exactly that event; the CPU
+counter does not move because that event was a tiny fraction of the total cost. And per
+§2.4, latency could not move either — the fix never makes the head deliverable earlier.
+Bonus observation: with the fix on, polls are fewer but longer (15 → 23 µs average) —
+deliveries consolidate into bigger batches, the M1 GRO-batch effect on real hardware.
+Per-cell data provenance: §7.
+
+> **What I learned.** Event counts are not CPU cost. A percentage is only as meaningful
+> as the budget of the thing it is a percentage *of* — and we should have priced the
+> waste in CE from day one.
+
+### Finding 6 — The next latency opportunity: head-priority steering
+
+E11 measured how long delivery actually stays blocked when a poll finds the head not
+ready (stall episodes, baseline, delays 0/2/5/10 µs):
+
+![Stall distribution](../meetings/figures/fig_e11_stall_fr.png)
+
+The bulk of stalls sit at **32–128 µs ≈ 10–20× T_decrypt** (~5 µs) — and the median
+**does not move** when +10 µs of decrypt delay is injected. That distinction matters:
+the crypto itself is not the delay. The head packet spends most of its blocked time
+waiting *before a worker actually gets to it* — queued behind other packets on its
+assigned CPU, or waiting for the kworker to be scheduled (it matches the bimodal
+Δ_complete ~5 µs / ~100 µs from the cost model). That is why the current wake-side fix
+cannot help latency, and why a head-priority design is more interesting:
+
+```text
+current fix (wg_supp + wg_headwake):
+    stops useless checks while waiting
+    does NOT make the head packet ready earlier      → latency unchanged
+
+steering idea (future):
+    the next free CPU takes the current HEAD first
+    (instead of FIFO on its assigned worker)
+    → head decrypts earlier → delivery unblocks earlier → latency could move
+```
+
+Being precise about the epistemic status:
+
+```text
+What E11 proves:        stall gaps are tens of µs and not explained by decrypt time.
+What E11 suggests:      worker queueing / decrypt ordering is responsible.
+What E11 does NOT prove: that all those gaps are true head-blocked stalls —
+                        ~46% of wasted polls find an EMPTY queue, and the probe
+                        cannot tell the two apart per episode.
+Next step:              classify episodes in wg_diag (~20 lines), re-run E11.
+```
+
+Conservative bound, with the agreed correction chain (raw gap = upper bound on blocked
+time; ×~54% head fraction; − decrypt floor): **typically ~30–90 µs recoverable, tail
+population 200–800 µs** — above the "not worth it" band (5–20 µs), tail beyond the "go"
+threshold (100 µs). The ms-scale population (~6% of episodes) is inter-burst idle and
+excluded. **Decision: do not implement steering yet; build the classifier first.**
+
+> **What I learned.** The wake-side fix and latency were never going to meet — the fix
+> optimizes the *checking*, not the *readiness*. If a latency win exists in this story,
+> it lives in decrypt scheduling, and one small classifier decides whether we chase it.
 
 ## 4. Timeline of experiments
 
@@ -294,7 +425,7 @@ CPU/latency at sub-saturation (Alain, 06-25).
 the waste both sides leak individually?
 **Setup.** `receive.c` made composable (srcversion `EA06EE82…`); `measure_missed.sh`
 with warm-up; peer sweep 8/16/32/64, sdfn.
-**Result.** 27→14% wasted at every N (§3 Q2 table); fresh-wake regeneration visible and
+**Result.** 27→14% wasted at every N (Finding 2 table); fresh-wake regeneration visible and
 closed; `wg_supp` verified firing at 96% via in-module counters (0 with fix off).
 **Interpretation.** The two sides are additive exactly as Alain reasoned; the M1
 peer-growth does not reproduce, the halving does.
@@ -308,7 +439,7 @@ peer-growth does not reproduce, the halving does.
 **Setup.** Instantiation #5; dedicated latency peer + capped bulk peers; off vs both ×
 0/2/4/6 Gb/s × 8 reps, randomized; per-run load verification.
 **Result.** CPU: deltas −4.7…+1.6%, mixed signs, three lenses agree (null). Latency:
-7–8% p99 lean at mid loads, not significant, C-state-confounded (§3 Q3).
+7–8% p99 lean at mid loads, not significant, C-state-confounded (Finding 3).
 **Interpretation.** A defensible null, not an ambiguous one — the harness separated the
 failure modes it was designed to separate.
 **Decision.** Reprioritize to Phase B (decrypt sensitivity), where a win could still
@@ -322,7 +453,7 @@ live.
 **Setup.** Instantiation #7; rewritten capped-load single-window sweep (the 06-26
 uncapped attempt collapsed — Appendix C); delays 0/1/2/5/10 µs × off/both × 5 reps.
 **Result.** Fix removes 56→89% of the waste as delay grows; baseline flat ~34%; CPU and
-p99 still mixed-sign at every delay (§3 Q4).
+p99 still mixed-sign at every delay (Finding 4).
 **Interpretation.** Mechanism dose-responsive — the strongest mechanistic evidence yet —
 but the absolute saving stays micro on this hardware.
 **Decision.** Stop asking "does it pay here" and measure the cost model itself (E10) +
@@ -338,7 +469,7 @@ scheduler) the duration histogram missed?
 and perf cycle attribution in **separate** windows; two runs (first had one cold window
 and an E11 script bug — per-cell provenance in §7).
 **Result.** Wasted poll = 1.14–1.36 µs; baseline's total waste = **0.022 CE**; poll+wake
-machinery < 0.7% of busy cycles (§3 Q5).
+machinery < 0.7% of busy cycles (Finding 5).
 **Interpretation.** No hidden cost. The CPU null is measured. *Many events, not many
 cycles.*
 **Decision.** Close the cost question; keep the "fewer, longer polls" batching
@@ -353,7 +484,7 @@ a head-priority scheme recover at best?
 **Setup.** Baseline, delays 0/2/5/10 µs; per-NAPI episode timing (first wasted →
 next productive poll).
 **Result.** Bulk of stalls 32–128 µs, median delay-*insensitive*; bimodal with an
-excluded ms idle population (§3 Q6 + reading note there).
+excluded ms idle population (Finding 6).
 **Interpretation.** The head waits for scheduling, not for crypto. Conservative
 recoverable excess ~30–90 µs typical, 200–800 µs tail — promising but contaminated.
 **Decision.** Build the wg_diag per-episode classifier before any steering design.
@@ -376,12 +507,12 @@ recoverable excess ~30–90 µs typical, 200–800 µs tail — promising but co
 
 | Result | Data | Script | Figure(s) |
 |---|---|---|---|
-| sdfn spread ×2.2 (Q1) | `cpu_sd_spread.csv`, `cpu_sdfn_spread.csv` | `measure_spread.sh` | `fig_spread.png` |
-| Two-sided peer sweep (Q2) | `twosided_peersweep_20260626.csv` | `measure_missed.sh` | `fig_twosided_peers.png` |
-| Phase A null (Q3) | `subsat_20260701_0609.csv` (provenance: `_0400`, `_0605` + `.placement.txt` sidecars) | `measure_subsat.sh`, `analyze_subsat.py` | `fig_subsat_cpu.png`, `fig_subsat_latency.png` |
-| Phase B dose-response (Q4) | `decsweep_20260706_0321.csv` + placement | `measure_decrypt_sweep.sh`, `analyze_decsweep.py` | `fig_decsweep_wasted.png`, `fig_decsweep_cpu.png` |
-| E10 cost accounting (Q5) | `costacct_20260706_0539/`, `costacct_20260706_0613/` | `measure_cost_accounting.sh` | `fig_e10_budget_fr.png` |
-| E11 stall gaps (Q6) | `costacct_20260706_0613/stall_d*.txt` | `measure_cost_accounting.sh` | `fig_e11_stall_fr.png` |
+| sdfn spread ×2.2 (Finding 1) | `cpu_sd_spread.csv`, `cpu_sdfn_spread.csv` | `measure_spread.sh` | `fig_spread.png` |
+| Two-sided peer sweep (Finding 2) | `twosided_peersweep_20260626.csv` | `measure_missed.sh` | `fig_twosided_peers.png` |
+| Phase A null (Finding 3) | `subsat_20260701_0609.csv` (provenance: `_0400`, `_0605` + `.placement.txt` sidecars) | `measure_subsat.sh`, `analyze_subsat.py` | `fig_subsat_cpu.png`, `fig_subsat_latency.png` |
+| Phase B dose-response (Finding 4) | `decsweep_20260706_0321.csv` + placement | `measure_decrypt_sweep.sh`, `analyze_decsweep.py` | `fig_decsweep_wasted.png`, `fig_decsweep_cpu.png` |
+| E10 cost accounting (Finding 5) | `costacct_20260706_0539/`, `costacct_20260706_0613/` | `measure_cost_accounting.sh` | `fig_e10_budget_fr.png` |
+| E11 stall gaps (Finding 6) | `costacct_20260706_0613/stall_d*.txt` | `measure_cost_accounting.sh` | `fig_e11_stall_fr.png` |
 | Module + knobs | — | `build/wg515-trigger/` (srcversion `EA06EE82…`) | — |
 
 **E10/E11 per-cell provenance** (the raw dirs contain cold windows — use these):
@@ -448,17 +579,17 @@ Each entry: what we believed, why it changed, what the current truth is.
    *Superseded 06-19.* On a real NIC it is a null: at wake time a poll is already
    running ~63% of the time, so the gated `napi_schedule` was mostly a no-op whose
    MISSED side-effect the fix could not prevent. Current truth: only the **two-sided**
-   fix moves the waste (Q2).
+   fix moves the waste (Finding 2).
 2. **"The fix's benefit grows with peer count" (M1).** *Superseded 06-26.* On real
    hardware the reduction is flat from 8 to 64 peers. The halving is real; the growth
    was a loopback artifact.
 3. **"Stock waste rises ~28→44% as decrypt slows" (06-26 sweep).** *Superseded 07-06.*
    That rise was an uncapped-load pipeline collapse artifact; under capped load stock
-   stays flat ~34% at every delay (Q4).
+   stays flat ~34% at every delay (Finding 4).
 4. **Early tail-latency runs (ping, then 2000-sample sockperf)** showed `both` winning/
    losing inconsistently with sample loss on the `off` side. *Superseded by Phase A's
    design* (dedicated latency peer, 30 s windows, verified load): the honest answer is
-   "no significant latency effect, confounded by power states" (Q3).
+   "no significant latency effect, confounded by power states" (Finding 3).
 5. **The hrtimer batching trigger (`wg_trig_k`)** batched polls (−22% useful polls) but
    throughput flat-to-down and softirq *up* — it self-defeats by running on the core it
    relieves. *Closed 06-23*; kept as a knob for reproduction only.
