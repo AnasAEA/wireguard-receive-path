@@ -209,3 +209,187 @@ agreed "not worth it" band (5–20 µs), tail beyond the "go" threshold (100 µs
 head-vs-empty classification is unresolved. **Decision: do not implement steering yet;
 implement the ~20-line `wg_diag` per-episode classifier first**, then re-run E11
 classified. Figure: `fig_e11_stall_fr.png` (budget figure: `fig_e10_budget_fr.png`).
+
+## 4. Timeline of experiments
+
+| Date | Experiment | What changed | Result | Status |
+|---|---|---|---|---|
+| 06-17 | Testbed live (instantiation #1) | 2× c220g2, 10G link, kernel 5.15 verified | probes confirmed, BTF present | settled |
+| 06-18 | EoI reproduction (1 peer) | first bpftrace on real NIC | 35.8% wasted polls — EoI is real off-loopback | settled |
+| 06-18 | Modules built | M1 patch applies unchanged on 5.15 | stock + patched `.ko` | settled |
+| 06-19 | Six-line fix A/B (8 peers) | first real-NIC A/B | **null** + diagnosis (wake already pending ~63%) | settled |
+| 06-19 | Cost model (E2–E5) | per-step probes | T_decrypt 5–6 µs, C_poll ~1 µs, C_deliver ~1.6 µs | settled |
+| 06-22 | Saturation diagnosis | per-core CPU under load | one-core funnel: IP-only NIC hash | settled |
+| 06-23 | Trigger module + `wg_supp` | single-binary runtime knobs | suppression works (−5 pp) but throughput flat | settled |
+| 06-24 | `wg_headwake` + **sdfn spread** | producer gate; NIC hash change | 33→20% wasted; **4.1→9.0 Gb/s (×2.2)** | settled |
+| 06-24 | Mechanism verification | in-module counters | `wg_supp` fires 96%; waste regenerates as fresh wakes | settled |
+| 06-25 | Point with Alain | reframe: compose the fix; measure CPU at sub-saturation; sweep decrypt cost | two-sided build (`EA06EE82…`), 30.4→15.3% single-run | settled |
+| 06-26 | Two-sided peer sweep (#3) | 8–64 peers, warm-up added | **27→14% wasted, flat across peers** | settled |
+| 07-01 | Phase A campaign (#5) | sub-saturation, 64 runs | data collected | settled |
+| 07-02 | Phase A analysis | — | **clean CPU null**; latency confounded | settled |
+| 07-02/03 | Phase B attempt (#6) | rewritten capped-load sweep | ran clean; **data lost to lease expiry** | superseded by 07-06 |
+| 07-06 | Phase B (#7) | capped-load decrypt sweep, 50 runs | **dose-response 56→89% waste removed; CPU/latency still null** | settled |
+| 07-06 | E10 cost accounting | bpftrace duration sums + perf | wasted-poll budget **0.022 CE**, 100× under noise | settled |
+| 07-06 | E11 stall gaps | episode probe, delays 0–10 µs | median stall 50–100 µs, delay-insensitive | **needs classifier** |
+
+## 5. Journal — the decisions, entry by entry
+
+Fixed template per entry: *Question → Setup → Result → Interpretation → Decision →
+Artifacts.* Full raw detail for every entry (including all E0.x setup steps):
+`CLOUDLAB_EXPERIMENTS_LOG_RAW.md`.
+
+### 2026-06-18 — EoI reproduced on real hardware
+
+**Question.** Does the wasted-poll signature exist outside the M1 loopback at all?
+**Setup.** Stock in-tree module, 1 peer, iperf3 through the tunnel, bpftrace histogram
+of `wg_packet_rx_poll` return values, 20 s.
+**Result.** 35.8% of polls returned zero packets; single TCP stream 4.75 Gb/s,
+CPU-bound on one core (not link-bound).
+**Interpretation.** The EoI is real on real hardware — go. Single-peer throughput is
+single-core-bound, so multi-core needs multiple peers.
+**Decision.** Build stock+patched modules, scale to 8 peers.
+**Artifacts.** raw log E1 entry; probe one-liners in `CLOUDLAB_NEXT_STEPS.md`.
+
+### 2026-06-19 — The M1 six-line fix is null on a real NIC — and why
+
+**Question.** Does the original producer-side fix cut the 33% wasted polls at 8 peers?
+**Setup.** Stock vs patched module A/B, 8 peers, repeated runs.
+**Result.** No effect (33.0% vs 33.2%); later confirmed with tight error bars (CV<2%).
+Diagnosis with tracing: when a non-head completion calls `napi_schedule`, a poll is
+already running ~63% of the time — the call is a no-op whose only effect (setting
+MISSED) the fix does not prevent; the fix also sits on the wrong side to stop re-polls.
+**Interpretation.** Not a measurement failure — the fix's premise doesn't hold under
+real-NIC timing. The waste is MISSED-re-poll-driven.
+**Decision.** Attack the re-poll site (consumer side) and, per Alain later, the
+regeneration (producer side). Build the cost model first.
+**Artifacts.** raw log entries E1-A/B + DIAGNOSIS; `MISSED_REPOLL_PROOF.md`.
+
+### 2026-06-19→24 — Cost model measured (E2–E5)
+
+**Question.** What does each step of the receive path actually cost?
+**Result.** `T_decrypt` ≈ 5–6 µs/packet; `Δ_complete` bimodal ~5 µs (active) / ~100 µs
+(idle); `C_poll` ≈ 1.0 µs (empty poll); delivery setup ≈ 3.7 µs; `C_deliver` ≈ 1.64
+µs/packet in-poll.
+**Interpretation.** A wasted poll is the cheapest operation in the chain — first hint
+that waste *count* and waste *cost* are different questions.
+**Decision.** These numbers calibrate everything after (trigger design, Phase B delays,
+E10 predictions).
+**Artifacts.** raw log E2–E5 entries; summary table preserved in Appendix B.
+
+### 2026-06-22→24 — The single-core wall, and the ×2.2 that isn't the fix
+
+**Question.** Why does throughput sit at 4.1 Gb/s on a 10G link whatever we fix?
+**Setup.** Per-core CPU accounting under load; then `ethtool -N … rx-flow-hash udp4 sdfn`.
+**Result.** One core 100% (97% softirq), all others ≤22%, regardless of variant. With
+`sdfn`: 8 cores at ~55%, 9.0 Gb/s — reverified on later instantiations.
+**Interpretation.** The wall was NIC flow placement (IP-only hash), not WireGuard.
+Throughput is the wrong yardstick for the EoI fix.
+**Decision.** All later campaigns run in the spread regime; the fix is judged on
+CPU/latency at sub-saturation (Alain, 06-25).
+**Artifacts.** `cpu_sd_spread.csv`, `cpu_sdfn_spread.csv`, `fig_spread.png`.
+
+### 2026-06-24→26 — Two-sided fix built and verified (the mechanism result)
+
+**Question.** Can consumer suppression + producer gating compose, and does the pair cut
+the waste both sides leak individually?
+**Setup.** `receive.c` made composable (srcversion `EA06EE82…`); `measure_missed.sh`
+with warm-up; peer sweep 8/16/32/64, sdfn.
+**Result.** 27→14% wasted at every N (§3 Q2 table); fresh-wake regeneration visible and
+closed; `wg_supp` verified firing at 96% via in-module counters (0 with fix off).
+**Interpretation.** The two sides are additive exactly as Alain reasoned; the M1
+peer-growth does not reproduce, the halving does.
+**Decision.** `both` becomes the candidate fix; question moves to user-visible payoff.
+**Artifacts.** `twosided_peersweep_20260626.csv`, `fig_twosided_peers.png`,
+`build/wg515-trigger/`.
+
+### 2026-07-01→02 — Phase A: sub-saturation CPU/latency (clean null)
+
+**Question.** With CPU headroom, does the saved poll work show in CPU or tail latency?
+**Setup.** Instantiation #5; dedicated latency peer + capped bulk peers; off vs both ×
+0/2/4/6 Gb/s × 8 reps, randomized; per-run load verification.
+**Result.** CPU: deltas −4.7…+1.6%, mixed signs, three lenses agree (null). Latency:
+7–8% p99 lean at mid loads, not significant, C-state-confounded (§3 Q3).
+**Interpretation.** A defensible null, not an ambiguous one — the harness separated the
+failure modes it was designed to separate.
+**Decision.** Reprioritize to Phase B (decrypt sensitivity), where a win could still
+live.
+**Artifacts.** `subsat_20260701_0609.csv` (+`0400/0605` provenance),
+`analyze_subsat.py`, `fig_subsat_cpu/latency.png`.
+
+### 2026-07-06 — Phase B: decrypt-cost sweep (dose-response, still no payoff)
+
+**Question.** Does slower crypto make the fix matter?
+**Setup.** Instantiation #7; rewritten capped-load single-window sweep (the 06-26
+uncapped attempt collapsed — Appendix C); delays 0/1/2/5/10 µs × off/both × 5 reps.
+**Result.** Fix removes 56→89% of the waste as delay grows; baseline flat ~34%; CPU and
+p99 still mixed-sign at every delay (§3 Q4).
+**Interpretation.** Mechanism dose-responsive — the strongest mechanistic evidence yet —
+but the absolute saving stays micro on this hardware.
+**Decision.** Stop asking "does it pay here" and measure the cost model itself (E10) +
+the blocked-head time (E11).
+**Artifacts.** `decsweep_20260706_0321.csv`, `analyze_decsweep.py`,
+`fig_decsweep_wasted/cpu.png`.
+
+### 2026-07-06 — E10: direct cost accounting (the null, measured)
+
+**Question.** Is a wasted poll really ~1 µs, or is there hidden cost (IPIs, cache,
+scheduler) the duration histogram missed?
+**Setup.** Same capped load; off vs both at delay 0 and 10 µs; bpftrace duration *sums*
+and perf cycle attribution in **separate** windows; two runs (first had one cold window
+and an E11 script bug — per-cell provenance in §7).
+**Result.** Wasted poll = 1.14–1.36 µs; baseline's total waste = **0.022 CE**; poll+wake
+machinery < 0.7% of busy cycles (§3 Q5).
+**Interpretation.** No hidden cost. The CPU null is measured. *Many events, not many
+cycles.*
+**Decision.** Close the cost question; keep the "fewer, longer polls" batching
+observation for the report.
+**Artifacts.** `costacct_20260706_0539/` + `_0613/`, `measure_cost_accounting.sh`,
+`fig_e10_budget_fr.png`.
+
+### 2026-07-06 — E11: stall-episode gaps (the steering bound)
+
+**Question.** How long does delivery stay blocked on a not-ready head — i.e. what could
+a head-priority scheme recover at best?
+**Setup.** Baseline, delays 0/2/5/10 µs; per-NAPI episode timing (first wasted →
+next productive poll).
+**Result.** Bulk of stalls 32–128 µs, median delay-*insensitive*; bimodal with an
+excluded ms idle population (§3 Q6 + reading note there).
+**Interpretation.** The head waits for scheduling, not for crypto. Conservative
+recoverable excess ~30–90 µs typical, 200–800 µs tail — promising but contaminated.
+**Decision.** Build the wg_diag per-episode classifier before any steering design.
+**Artifacts.** `costacct_20260706_0613/stall_d*.txt`, `fig_e11_stall_fr.png`.
+
+## 6. Incidents and methodology fixes
+
+| Date | Problem | Effect | Fix | Lesson |
+|---|---|---|---|---|
+| 06-25 | `insmod` fails with unknown symbols on fresh image | module won't load | `modprobe wireguard; rmmod; insmod ours` (keeps deps) | scripted into bootstrap |
+| 06-26 | First condition measured cold after module reload | bogus `polls=1` rows, fake "stall" scare | warm-up burst before the condition loop | validate poll counts before believing zeros |
+| 06-26 | Decrypt sweep at uncapped load | pipeline collapse past ~10 µs, `gbps=0/NA` | capped-load single-window rewrite (07-02) | collapse is data only if the load is controlled |
+| 07-03 | Lease expired before scp (instantiation #6) | Phase B data lost, full re-run | — | **scp artifacts in the same session that produces them** |
+| 07-06 | Sweep launched twice concurrently | each setup `rmmod`+`pkill`'d the other: all rows `p50=NA`, `act=0.0000` | `flock` single-instance guard | measurement scripts must be single-instance |
+| 07-06 | `REJECT_DEV=0.40` vs iperf3 pacing undershoot (~45–50%) | healthy runs mislabeled "collapse" | threshold 0.60; knee located in analysis vs delay-0 baseline | know the generator's slop before flagging |
+| 07-06 | bpftrace 0.14 rejects scripts with an `END` block | all E11 windows silently empty | drop `END`; filter residual maps in analysis | never send probe stderr to /dev/null while validating |
+| 07-06 | One E10 window ran with no load (twice, same cell) | cold cells in raw dirs | `ensure_load` rx_bytes-delta guard (first, bpftrace-based version was itself broken by BTF-parse startup) | each window must verify its own traffic |
+
+## 7. Raw data and figures index
+
+| Result | Data | Script | Figure(s) |
+|---|---|---|---|
+| sdfn spread ×2.2 (Q1) | `cpu_sd_spread.csv`, `cpu_sdfn_spread.csv` | `measure_spread.sh` | `fig_spread.png` |
+| Two-sided peer sweep (Q2) | `twosided_peersweep_20260626.csv` | `measure_missed.sh` | `fig_twosided_peers.png` |
+| Phase A null (Q3) | `subsat_20260701_0609.csv` (provenance: `_0400`, `_0605` + `.placement.txt` sidecars) | `measure_subsat.sh`, `analyze_subsat.py` | `fig_subsat_cpu.png`, `fig_subsat_latency.png` |
+| Phase B dose-response (Q4) | `decsweep_20260706_0321.csv` + placement | `measure_decrypt_sweep.sh`, `analyze_decsweep.py` | `fig_decsweep_wasted.png`, `fig_decsweep_cpu.png` |
+| E10 cost accounting (Q5) | `costacct_20260706_0539/`, `costacct_20260706_0613/` | `measure_cost_accounting.sh` | `fig_e10_budget_fr.png` |
+| E11 stall gaps (Q6) | `costacct_20260706_0613/stall_d*.txt` | `measure_cost_accounting.sh` | `fig_e11_stall_fr.png` |
+| Module + knobs | — | `build/wg515-trigger/` (srcversion `EA06EE82…`) | — |
+
+**E10/E11 per-cell provenance** (the raw dirs contain cold windows — use these):
+
+| cell | bpf source | perf source |
+|---|---|---|
+| delay 0, off | `0613` (0539 cold: 80 polls) | **none valid** (cold in both runs — first-window warm-up overlap) |
+| delay 0, both | `0539` + `0613` | `0539` + `0613` |
+| delay 10 µs, off | `0539` + `0613` | `0539` + `0613` |
+| delay 10 µs, both | `0539` (0613 cold: 74 polls) | `0539` + `0613` |
+| E11 stalls (all delays) | `0613` only (0539 empty: END-block bug) | — |
