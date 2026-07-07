@@ -68,19 +68,7 @@ steering as future work.
 
 ### 2.1 The normal receive path
 
-```text
-encrypted packets arrive (NIC)
-        ↓
-parallel decrypt workers (one workqueue item per packet, spread over CPUs)
-        ↓
-packets FINISH OUT OF ORDER
-        ↓
-per-peer ORDERED queue (delivery must respect wire order)
-        ↓
-NAPI poll delivers from the HEAD of the queue
-        ↓
-if the head is still encrypted → poll delivers nothing → WASTED POLL
-```
+![Where the wasted polls come from](../meetings/figures/fig_eoi_pipeline_en.png)
 
 Three things to hold onto: parallel decrypt is what gives multi-core throughput (good);
 ordered delivery is a protocol requirement (non-negotiable); wasted polls are the
@@ -88,31 +76,18 @@ friction *between* the two — the delivery engine keeps checking a head that is
 
 ### 2.2 Where the EoI appears
 
-```text
-packet order on the wire:   P1   P2   P3   P4
-decrypt finishes:           P3   P4   P2   ............ P1  (out of order)
-delivery:                   ─────── blocked waiting for P1 ───────▶ P1 P2 P3 P4
-polls meanwhile:            poll(×) poll(×) poll(×)   ← each finds P1 not ready
-```
+![The EoI in one picture](../meetings/figures/fig_eoi_timeline_en.png)
 
 Every time a *non-head* packet (P2/P3/P4) finishes, it rings the delivery bell
 (`napi_schedule`). The bell-ringing while P1 is still decrypting is what produces the
 ~27–34% wasted polls. Worse, a bell rung *during* a poll sets a MISSED flag that forces
 an immediate re-poll — and 95–99.7% of the wasted polls are exactly these MISSED
-re-polls.
+re-polls. (Note the gray span in the figure — P1 sits *queued behind other packets
+before its decrypt even starts*. File that away: it comes back as Finding 6.)
 
 ### 2.3 What the two-sided fix does
 
-```text
-consumer side (wg_supp):        at poll end, head still encrypted?
-                                → clear MISSED → no immediate re-poll
-
-producer side (wg_headwake):    a decrypt just finished — is it the HEAD?
-                                → only then ring the bell
-
-both together:                  suppress the old wasted re-poll
-                                AND prevent the freshly regenerated wake
-```
+![The two-sided fix](../meetings/figures/fig_twosided_en.png)
 
 One side alone leaks: suppress only the re-poll, and the next non-head completion rings
 a *fresh* bell (the waste "regenerates"); gate only the producer, and the MISSED
@@ -275,7 +250,7 @@ ALL wasted polls (baseline):   0.022 CE   ← the entire disease
 saved by the fix:              0.017–0.022 CE
 ```
 
-![The measured budget](../meetings/figures/fig_e10_budget_fr.png)
+![The measured budget](../meetings/figures/fig_e10_budget_en.png)
 
 perf agrees from the other direction: the entire poll+wake machinery
 (`wg_packet_rx_poll` *including its useful work* + `napi_complete_done` +
@@ -299,7 +274,7 @@ Per-cell data provenance: §7.
 E11 measured how long delivery actually stays blocked when a poll finds the head not
 ready (stall episodes, baseline, delays 0/2/5/10 µs):
 
-![Stall distribution](../meetings/figures/fig_e11_stall_fr.png)
+![Stall distribution](../meetings/figures/fig_e11_stall_en.png)
 
 The bulk of stalls sit at **32–128 µs ≈ 10–20× T_decrypt** (~5 µs) — and the median
 **does not move** when +10 µs of decrypt delay is injected. That distinction matters:
@@ -309,16 +284,7 @@ assigned CPU, or waiting for the kworker to be scheduled (it matches the bimodal
 Δ_complete ~5 µs / ~100 µs from the cost model). That is why the current wake-side fix
 cannot help latency, and why a head-priority design is more interesting:
 
-```text
-current fix (wg_supp + wg_headwake):
-    stops useless checks while waiting
-    does NOT make the head packet ready earlier      → latency unchanged
-
-steering idea (future):
-    the next free CPU takes the current HEAD first
-    (instead of FIFO on its assigned worker)
-    → head decrypts earlier → delivery unblocks earlier → latency could move
-```
+![Why the wake-side fix can't move latency — and what could](../meetings/figures/fig_fix_vs_steering_en.png)
 
 Being precise about the epistemic status:
 
@@ -475,7 +441,7 @@ cycles.*
 **Decision.** Close the cost question; keep the "fewer, longer polls" batching
 observation for the report.
 **Artifacts.** `costacct_20260706_0539/` + `_0613/`, `measure_cost_accounting.sh`,
-`fig_e10_budget_fr.png`.
+`fig_e10_budget_en.png` (FR version for the point docs: `_fr`).
 
 ### 2026-07-06 — E11: stall-episode gaps (the steering bound)
 
@@ -488,7 +454,7 @@ excluded ms idle population (Finding 6).
 **Interpretation.** The head waits for scheduling, not for crypto. Conservative
 recoverable excess ~30–90 µs typical, 200–800 µs tail — promising but contaminated.
 **Decision.** Build the wg_diag per-episode classifier before any steering design.
-**Artifacts.** `costacct_20260706_0613/stall_d*.txt`, `fig_e11_stall_fr.png`.
+**Artifacts.** `costacct_20260706_0613/stall_d*.txt`, `fig_e11_stall_en.png` (FR: `_fr`).
 
 ## 6. Incidents and methodology fixes
 
@@ -511,8 +477,9 @@ recoverable excess ~30–90 µs typical, 200–800 µs tail — promising but co
 | Two-sided peer sweep (Finding 2) | `twosided_peersweep_20260626.csv` | `measure_missed.sh` | `fig_twosided_peers.png` |
 | Phase A null (Finding 3) | `subsat_20260701_0609.csv` (provenance: `_0400`, `_0605` + `.placement.txt` sidecars) | `measure_subsat.sh`, `analyze_subsat.py` | `fig_subsat_cpu.png`, `fig_subsat_latency.png` |
 | Phase B dose-response (Finding 4) | `decsweep_20260706_0321.csv` + placement | `measure_decrypt_sweep.sh`, `analyze_decsweep.py` | `fig_decsweep_wasted.png`, `fig_decsweep_cpu.png` |
-| E10 cost accounting (Finding 5) | `costacct_20260706_0539/`, `costacct_20260706_0613/` | `measure_cost_accounting.sh` | `fig_e10_budget_fr.png` |
-| E11 stall gaps (Finding 6) | `costacct_20260706_0613/stall_d*.txt` | `measure_cost_accounting.sh` | `fig_e11_stall_fr.png` |
+| E10 cost accounting (Finding 5) | `costacct_20260706_0539/`, `costacct_20260706_0613/` | `measure_cost_accounting.sh` | `fig_e10_budget_en.png` (+`_fr`) |
+| E11 stall gaps (Finding 6) | `costacct_20260706_0613/stall_d*.txt` | `measure_cost_accounting.sh` | `fig_e11_stall_en.png` (+`_fr`) |
+| Explainer diagrams (§2, Finding 6) | — (conceptual) | `scripts/make_explainer_figs.py` | `fig_eoi_pipeline_en.png`, `fig_eoi_timeline_en.png`, `fig_twosided_en.png`, `fig_fix_vs_steering_en.png` |
 | Module + knobs | — | `build/wg515-trigger/` (srcversion `EA06EE82…`) | — |
 
 **E10/E11 per-cell provenance** (the raw dirs contain cold windows — use these):
