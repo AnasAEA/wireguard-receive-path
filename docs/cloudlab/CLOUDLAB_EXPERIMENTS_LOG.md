@@ -210,6 +210,15 @@ validated by their own poll counts; absolute poll/stall *counts* vary between wi
 achieved load (spurious load restarts from a too-tight precheck, since fixed) — fractions,
 per-poll costs and distributions are consistent and are what we use.
 
+**Per-cell file provenance (raw dirs contain cold windows — use these):**
+| cell | bpf source | perf source |
+|---|---|---|
+| delay 0, off | `0613` (0539 cold: 80 polls) | **none** (cold in both runs — first-window warm-up overlap) |
+| delay 0, both | `0539` + `0613` (both valid) | `0539` + `0613` |
+| delay 10 µs, off | `0539` + `0613` (both valid) | `0539` + `0613` |
+| delay 10 µs, both | `0539` (0613 cold: 74 polls) | `0539` + `0613` |
+| E11 stalls (all delays) | `0613` only (0539 empty: END-block bug) | — |
+
 **E10 — the CPU null is now measured, not derived:**
 - **C_poll (wasted) = 1.14–1.36 µs** across every valid cell (Phase C's ~1.0 µs holds
   in-regime; kretprobe overhead inflates it slightly, so treat as an upper bound).
@@ -231,6 +240,14 @@ per-poll costs and distributions are consistent and are what we use.
 | 2 µs | 52k | ~48 | ~96 | ~380 |
 | 5 µs | 280k | ~48 | ~380 | ~770 |
 | 10 µs | 35k | ~48 | ~3000 | ~190 |
+
+Reading note: the distributions are **bimodal** — a µs-scale bulk (the candidate
+head-blocked population) and a separate ms-scale population (≈6 % of episodes, 2–16 ms:
+inter-burst idle where a wasted poll fired on an empty/drained queue). The "sub-ms pop."
+column deliberately excludes the ms population, which is why p90 (raw, includes it — e.g.
+~3 ms at 10 µs) can exceed the sub-ms p99 (~190 µs): they summarize different populations,
+raw-with-tail vs µs-bulk-only. Whether the µs-bulk really is head-blocked is exactly what
+the classifier must settle.
 
 - **The key mechanistic finding: the median stall (~50–100 µs) is 10–20× T_decrypt and
   does NOT grow with injected decrypt delay.** The head is not slow to *decrypt* — it is

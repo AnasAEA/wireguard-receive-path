@@ -14,21 +14,25 @@
 
 ## TL;DR — what we actually found (and what we did not)
 
-1. **The EoI fix removes real wasted work; the open question is whether that shows up where
-   a user looks.** The wasted-poll inefficiency is real, and the **two-sided fix (producer
-   gate + consumer suppress together) halves it** — ~27% → ~14% of polls, flat from 8 to 64
-   peers (§2b). That is genuine CPU work removed (~1 µs/poll on the receive core). What it
-   does *not* do is move **throughput** — but throughput is the wrong yardstick here, it is
-   already at line rate. Whether the saved work shows up in **tail latency / CPU-per-byte**
-   is being measured and is **not yet conclusive** (latency noisy, decrypt-sweep methodology
-   still rough).
+1. **The EoI fix removes real wasted work — dose-responsively — and the payoff question is
+   now answered and measured.** The two-sided fix (producer gate + consumer suppress)
+   removes **56% of wasted polls on fast crypto and up to 89% under slow crypto**
+   (Phase B, §7), flat from 8 to 64 peers (§2b). But E10's direct cycle accounting shows
+   the *entire* wasted-poll budget is only **~0.022 cores-equivalent** on c220g2 — 100×
+   below the ±2 CE noise floor — so the **CPU null is expected and measured**, not
+   mysterious. Latency does not improve either, and structurally cannot from a wake-side
+   fix: it never makes the head packet decrypt earlier. **E11 identifies where a latency
+   win could actually live**: the head waits ~50–100 µs to *get* decrypted (worker
+   queueing/scheduling, not decrypt time) — the decrypt-order/head-priority steering
+   direction, pending a per-episode classifier (§7).
 2. **The throughput lever is parallelism, and it is a NIC config change, not the fix.** The
    receiver was funnelled onto a single core by the NIC's IP-only flow hash; switching the
    hash to include the UDP ports (`sdfn`) fans the tunnels across 8 cores and lifts
    throughput **4.1 → 9.0 Gb/s (×2.2)**, near line rate, with *stock* WireGuard.
 3. **Deliverable so far: the real lever (parallelism) + a fix that demonstrably removes
-   ~half the wasted polls, with the user-visible payoff under active measurement.** (Note:
-   on the earlier *M1 loopback* testbed the fix's benefit *grew with peers*; on this real-HW
+   half-to-nearly-all wasted polls, + a measured explanation of why that doesn't move
+   CPU/latency on this hardware, + a data-backed future direction (steering).** (Note: on
+   the earlier *M1 loopback* testbed the fix's benefit *grew with peers*; on this real-HW
    spread regime the wasted-poll reduction is **flat across peers** — it does not reproduce
    the peer-count growth, but the reduction itself is solid.)
 
