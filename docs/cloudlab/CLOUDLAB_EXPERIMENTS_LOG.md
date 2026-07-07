@@ -393,3 +393,86 @@ recoverable excess ~30–90 µs typical, 200–800 µs tail — promising but co
 | delay 10 µs, off | `0539` + `0613` | `0539` + `0613` |
 | delay 10 µs, both | `0539` (0613 cold: 74 polls) | `0539` + `0613` |
 | E11 stalls (all delays) | `0613` only (0539 empty: END-block bug) | — |
+
+## 8. Appendices
+
+### Appendix A — CloudLab instantiations
+
+Hardware is the same class every time: 2 × c220g2 (Wisconsin), 2× Xeon E5-2660 v3
+(40 threads), 10 GbE experiment link, Ubuntu 22.04, kernel 5.15.0-177-generic. The lease
+resets daily; each session re-bootstraps from a blank image with
+`scripts/cloudlab/bootstrap_testbed.sh` (one command: packages, module build, tunnel,
+peers, handshake check).
+
+| # | Date | dut / gen | Experiment NIC | Used for |
+|---|---|---|---|---|
+| 1 | 06-17 | c220g2-011308 / -011310 | `enp6s0f1` | setup, EoI repro, six-line null, cost model, funnel diagnosis |
+| 2 | 06-25 | c220g2-011002 / -011003 | `enp6s0f0` | two-sided build, sdfn reverification |
+| 3 | 06-26 | c220g2-010630 / -010628 | `enp6s0f0` | peer sweep 8–64, first (broken) decrypt sweep |
+| 5 | 07-01 | c220g2-011319 / -011315 | `enp6s0f0` | Phase A campaign |
+| 6 | 07-02 | c220g2-011118 / -011131 | `enp6s0f0` | Phase B first run — data lost to lease expiry |
+| 7 | 07-06 | c220g2-011118 / -011119 | `enp6s0f0` | Phase B (clean), E10, E11 |
+
+(#4 was a short-lived instantiation with no experiment output. Node IDs, public keys
+and per-instantiation gotchas: `CLOUDLAB_EXPERIMENTS_LOG_RAW.md`, "Environment of
+record".)
+
+### Appendix B — Environment essentials and the cost model
+
+- **Probe points confirmed** (5.15.0-177, in-tree + our module): `wg_packet_rx_poll`,
+  `wg_packet_decrypt_worker`, `decrypt_packet`, `wg_packet_receive`,
+  `wg_packet_consume_data`, `napi_gro_receive`. **Not probeable:**
+  `wg_queue_enqueue_per_peer_rx` (inlined) — the reason E11 uses poll-episode gaps and
+  the steering classifier must live in the module.
+- **BTF** present for bpftrace (0.14.0); module BTF is *not* generated (no vmlinux at
+  build time) — so bpftrace cannot walk WireGuard struct types.
+- **Module builds** (srcversion → meaning): `81233F6…` stock 5.15 · `069999A…` M1
+  six-line patch · `3076ED3…` first trigger build · `EA06EE82…` **two-sided composable
+  build used by every campaign since 06-25** (knobs: `wg_supp`, `wg_headwake`,
+  `wg_trig_k`, `wg_trig_tau_ns`, `wg_decrypt_delay_ns`, diagnostics under `wg_diag`).
+- **Cost model** (measured 06-19→24, the calibration for everything after):
+
+| Quantity | Value | Note |
+|---|---|---|
+| `T_decrypt` per packet | ~5–6 µs | ChaCha20-Poly1305 with SIMD, these Xeons |
+| `Δ_complete` (decrypt completion gap) | bimodal ~5 µs / ~100 µs | active vs idle worker — the ~100 µs mode is what E11 rediscovered as stalls |
+| `C_poll` (empty poll) | ~1.0 µs (E10 in-regime: 1.14–1.36 µs) | the waste unit |
+| delivery setup per productive poll | ~3.7 µs | what batching amortizes |
+| `C_deliver` per packet | ~1.64 µs | slope, k=1..16 |
+
+### Appendix C — Superseded / historical results (labeled)
+
+Each entry: what we believed, why it changed, what the current truth is.
+
+1. **The M1 six-line producer-side fix helps (M1 loopback: −8.8…−21.9% wasted).**
+   *Superseded 06-19.* On a real NIC it is a null: at wake time a poll is already
+   running ~63% of the time, so the gated `napi_schedule` was mostly a no-op whose
+   MISSED side-effect the fix could not prevent. Current truth: only the **two-sided**
+   fix moves the waste (Q2).
+2. **"The fix's benefit grows with peer count" (M1).** *Superseded 06-26.* On real
+   hardware the reduction is flat from 8 to 64 peers. The halving is real; the growth
+   was a loopback artifact.
+3. **"Stock waste rises ~28→44% as decrypt slows" (06-26 sweep).** *Superseded 07-06.*
+   That rise was an uncapped-load pipeline collapse artifact; under capped load stock
+   stays flat ~34% at every delay (Q4).
+4. **Early tail-latency runs (ping, then 2000-sample sockperf)** showed `both` winning/
+   losing inconsistently with sample loss on the `off` side. *Superseded by Phase A's
+   design* (dedicated latency peer, 30 s windows, verified load): the honest answer is
+   "no significant latency effect, confounded by power states" (Q3).
+5. **The hrtimer batching trigger (`wg_trig_k`)** batched polls (−22% useful polls) but
+   throughput flat-to-down and softirq *up* — it self-defeats by running on the core it
+   relieves. *Closed 06-23*; kept as a knob for reproduction only.
+6. **The one-sided numbers of 06-25** (30.4→15.3% in a single run) were superseded by
+   the multi-N sweep of 06-26 (27→14% with warm-up fix) — same conclusion, cleaner data.
+7. **Early per-peer A/B tables (E1/E5 with the six-line patch)** were abandoned when
+   the fix went two-sided; the M1 reference columns live in the raw log.
+
+### Appendix D — Where the rest lives
+
+- **Full chronological notebook** (every entry, error, node ID, pubkey, probe
+  one-liner): `CLOUDLAB_EXPERIMENTS_LOG_RAW.md`.
+- **Plan / methodology**: `CLOUDLAB_EXPERIMENTS_PLAN.md` (phases A–C original),
+  `CLOUDLAB_PLAN_phase2.md` (sub-saturation + decrypt-sweep design and results).
+- **Mechanism proof**: `MISSED_REPOLL_PROOF.md`. **Trigger design**: `TRIGGER_DESIGN.md`.
+- **Supervisor points**: `../meetings/POINT_ALAIN_2026-06-24_FR.md`,
+  `POINT_ALAIN_2026-07-03_FR.md`, `POINT_ALAIN_2026-07-07_FR.md`.
