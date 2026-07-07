@@ -1,10 +1,8 @@
-# Journal des expériences CloudLab — version française
+# Journal des expériences CloudLab
 
-> La version lisible, en français, de la campagne CloudLab sur le chemin de réception
-> WireGuard : la question posée, ce qui a tourné, ce qu'on a vu, ce que ça veut dire, ce
-> qu'on a décidé. La version anglaise ([`CLOUDLAB_EXPERIMENTS_LOG.md`](CLOUDLAB_EXPERIMENTS_LOG.md))
-> est la référence pour les index de données et les annexes ; le carnet brut intégral
-> (chaque run, chaque erreur) est dans
+> La version lisible de la campagne CloudLab sur le chemin de réception WireGuard :
+> la question posée, ce qui a tourné, ce qu'on a vu, ce que ça veut dire, ce qu'on fait
+> ensuite. Le carnet brut (chaque run, chaque erreur) est dans
 > [`CLOUDLAB_EXPERIMENTS_LOG_RAW.md`](CLOUDLAB_EXPERIMENTS_LOG_RAW.md).
 > Auteur : Anas Ait El Hadj · Inria KrakOS (LIG).
 
@@ -21,9 +19,8 @@ La campagne CloudLab a répondu à la question principale.
   la latence ne montre qu'une tendance bruitée, polluée par les états d'énergie — je ne
   la revendique pas.
 - **La Phase B montre que le mécanisme répond à la dose** : le fix enlève 56 % du
-  gaspillage sur crypto rapide et 89 % quand je ralentis le déchiffrement à 10 µs/paquet
-  — exactement ce que le modèle prédit. Et pourtant, CPU et latence ne bougent toujours
-  pas.
+  gaspillage sur crypto rapide et 89 % quand je ralentis le déchiffrement à 10 µs/paquet,
+  comme le modèle le prédit. Et pourtant, CPU et latence ne bougent toujours pas.
 - **E10 a mesuré pourquoi, directement** : la totalité du budget des polls gaspillés fait
   ~0,022 équivalent-cœur, environ cent fois sous le bruit de ±2 CE. Le null n'est plus
   une déduction, c'est une mesure. *Le fix supprime beaucoup d'événements, pas beaucoup
@@ -34,21 +31,15 @@ La campagne CloudLab a répondu à la question principale.
   l'ordonnanceur. C'est ce qui motive l'idée **head-priority / steering du
   déchiffrement**, en attente d'une dernière mesure.
 
-Le plus surprenant, c'est que le résultat négatif est devenu l'un des résultats les plus
-solides : on sait *pourquoi* le fix n'améliore pas le CPU. Pas parce qu'il est cassé —
-il agit, c'est vérifié par compteurs — mais parce que ce qu'il supprime est extrêmement
-bon marché sur cette machine.
+Le plus surprenant : le résultat négatif est devenu l'un des plus solides du projet,
+parce qu'on sait *pourquoi* le fix n'améliore pas le CPU. Pas parce qu'il est cassé (il
+agit, les compteurs le prouvent), mais parce que ce qu'il supprime ne coûte presque rien
+sur cette machine.
 
 Reste à faire : (1) le classifieur `wg_diag` (~20 lignes) pour séparer les vrais
 blocages de tête des files vides, puis re-mesurer E11 ; (2) le soak de fiabilité de
 `headwake` ; (3) trancher avec Alain/André si le fix du papier (`gro_wq`) et la config
 combinée restent un livrable du 31 juillet ; (4) la rédaction finale.
-
-**Plan de lecture.**
-- *2 minutes :* cette section + la figure budget du Résultat 5.
-- *Le mécanisme :* §2 (modèle mental) + Résultat 2.
-- *Le verdict :* Résultats 3–5.
-- *La suite :* Résultat 6.
 
 ## 1. La question que je me posais
 
@@ -57,9 +48,9 @@ avaient montré que WireGuard réveille parfois son chemin de réception alors q
 paquet ne peut être livré. Si j'évite ces polls gaspillés, est-ce que je gagne quelque
 chose de réel sur du matériel 10G ?
 
-La réponse s'est révélée plus nuancée. Le fix est réel — il supprime bien les polls
-gaspillés, et la Phase B montre qu'il devient plus efficace exactement quand le modèle
-le prédit. Mais sur c220g2, le travail économisé est trop petit pour apparaître en CPU
+La réponse est moins nette que ce que j'espérais. Le fix est réel : il supprime bien
+les polls gaspillés, et la Phase B montre qu'il devient plus efficace là où le modèle
+l'annonce. Mais sur c220g2, le travail économisé est trop petit pour apparaître en CPU
 ou en latence. Le résultat utile n'est donc pas « WireGuard est devenu plus rapide ».
 C'est : on sait précisément où ce gaspillage se loge dans le chemin de réception, ce
 qu'il coûte, et pourquoi il reste invisible sur ce matériel.
@@ -176,7 +167,7 @@ in-module montrent `wg_supp` actif dans 96 % de ses cas cibles, et exactement 0 
 éteint — les nulls qui suivent ne sont pas « un fix qui ne se déclenche pas ».
 
 > **Ce que j'ai retenu.** Le fix à un côté était incomplet, et l'argument de composition
-> d'Alain était exactement juste : chaque côté rattrape la fuite de l'autre.
+> d'Alain était le bon : chaque côté rattrape la fuite de l'autre.
 
 ### Résultat 3 — Ni le CPU ni la latence n'en profitent sur c220g2 (un null propre)
 
@@ -223,7 +214,7 @@ La base reste plate (~34 % — le gaspillage est structurel, pas une affaire de 
 pendant que le fix s'améliore de façon monotone, avec des intervalles serrés : **une
 réponse à la dose**, le résultat mécanistique le plus propre du projet. Plus le
 déchiffrement est lent, plus la tête reste chiffrée longtemps, plus la barrière
-producteur a de cloches à intercepter — exactement la prédiction du modèle. Et pourtant
+producteur a de cloches à intercepter : la prédiction du modèle, mot pour mot. Et pourtant
 les écarts CPU restent à signes mélangés à tous les délais, et le p99 aussi — même à un
 ratio déchiffrement:poll de ~10:1. (Suggestif seulement, non revendiqué : 10 à 30 fois
 moins de retransmissions TCP avec le fix à 5–10 µs ; n=5, forte variance.) L'ancienne
@@ -242,7 +233,7 @@ deux-côtés enlève presque tous les polls gaspillés. Intuitivement, ça devra
 deux instruments indépendants, dans des fenêtres séparées (sommes de durées bpftrace ;
 attribution des cycles perf).
 
-La résolution : « 89 % des polls gaspillés », ce n'est pas « 89 % du CPU ». Un poll
+L'explication : « 89 % des polls gaspillés », ce n'est pas « 89 % du CPU ». Un poll
 gaspillé est une vérification très bon marché — **1,14–1,36 µs**, mesuré en conditions
 réelles (le modèle disait ~1,0 ; le surcoût du kretprobe en fait une borne supérieure).
 Les ~500 000 polls gaspillés de la base par fenêtre de 30 s totalisent :
@@ -266,9 +257,9 @@ L'interprétation finale est donc simple : **le fix supprime beaucoup d'événem
 beaucoup de cycles.** Le compteur d'événements bouge beaucoup parce qu'on vise
 exactement cet événement ; le compteur CPU ne bouge pas parce que cet événement était
 une fraction minuscule du coût total. Et d'après le §2.4, la latence ne pouvait pas
-bouger non plus — le fix ne rend jamais la tête livrable plus tôt. Observation bonus :
-avec le fix, les polls sont moins nombreux mais plus longs (15 → 23 µs en moyenne) —
-les livraisons se regroupent en plus gros lots, l'effet « batch GRO » du M1 retrouvé
+bouger non plus — le fix ne rend jamais la tête livrable plus tôt. Au passage : avec le
+fix, les polls sont moins nombreux mais plus longs (15 → 23 µs en moyenne), les
+livraisons se regroupent en plus gros lots. C'est l'effet « batch GRO » du M1, retrouvé
 sur vrai matériel.
 
 > **Ce que j'ai retenu.** Un compte d'événements n'est pas un coût CPU. Un pourcentage
@@ -293,7 +284,7 @@ intéressante :
 
 ![Pourquoi le fix côté réveil ne peut pas bouger la latence](../meetings/figures/fig_fix_vs_steering_fr.png)
 
-En étant précis sur le statut épistémique :
+Pour être précis sur ce qui est prouvé et ce qui ne l'est pas :
 
 ```text
 Ce qu'E11 prouve :        les blocages font des dizaines de µs et ne s'expliquent
