@@ -286,7 +286,7 @@ def fig_pipeline_fr():
         c = RED if "P1" in lbl else BLUE
         box(ax, 24, y, 20, 8, f"déchiffrement\n{lbl}", c, fs=8.5)
         arrow(ax, 15, 30, 24, y+4)
-    ax.text(34, 53, "déchiffrement parallèle → finit DANS LE DÉSORDRE", fontsize=9.5,
+    ax.text(30, 53, "déchiffrement parallèle\n→ finit DANS LE DÉSORDRE", fontsize=9.5,
             color=INK, ha="center", fontweight="bold")
     qx, qy = 54, 24
     ax.text(qx+10.5, qy+15, "file ORDONNÉE par pair", fontsize=9.5, color=INK,
@@ -303,7 +303,7 @@ def fig_pipeline_fr():
     box(ax, 82, 23, 15, 11, "poll NAPI\nlivre depuis la\ntête seulement", INK2)
     arrow(ax, 76, 28.5, 82, 28.5)
     arrow(ax, 44, 46, 84, 36, color=RED, lw=1.8, con="arc3,rad=-0.25")
-    ax.text(72, 51, "CHAQUE fin de déchiffrement sonne la cloche (napi_schedule) —\ntête chiffrée ⇒ le poll tourne pour rien : POLL GASPILLÉ",
+    ax.text(76, 52, "CHAQUE fin de déchiffrement sonne la cloche\n(napi_schedule) — tête chiffrée ⇒ le poll\ntourne pour rien : POLL GASPILLÉ",
             fontsize=9, color=RED, ha="center", fontweight="bold")
     ax.set_title("Le chemin de réception WireGuard : d'où viennent les polls gaspillés",
                  fontsize=12, color=INK, pad=8)
