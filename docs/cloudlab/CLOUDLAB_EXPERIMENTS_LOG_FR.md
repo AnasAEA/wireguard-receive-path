@@ -1,9 +1,9 @@
 # Journal des expériences CloudLab
 
-> La version lisible de la campagne CloudLab sur le chemin de réception WireGuard :
+> Le journal de la campagne CloudLab sur le chemin de réception WireGuard :
 > la question posée, ce qui a tourné, ce qu'on a vu, ce que ça veut dire, ce qu'on fait
-> ensuite. Le carnet brut (chaque run, chaque erreur) est dans
-> [`CLOUDLAB_EXPERIMENTS_LOG_RAW.md`](CLOUDLAB_EXPERIMENTS_LOG_RAW.md).
+> ensuite. Toutes les données brutes (CSV, scripts, figures) sont dans le dépôt Git du
+> projet ; l'index en §6.
 > Auteur : Anas Ait El Hadj · Inria KrakOS (LIG).
 
 ---
@@ -144,9 +144,11 @@ EoI et le remède du débit.)*
 
 ### Résultat 2 — Le fix deux-côtés divise le gaspillage par deux (Alain avait raison)
 
-Le fix « six lignes » du M1, côté producteur seul, est un **null sur du vrai matériel**
-(au moment de sonner, la cloche sonne déjà — voir l'annexe C de la version anglaise). La
-version deux-côtés du §2.3 est celle qui marche. Balayage en pairs, régime `sdfn`
+Le fix « six lignes » du M1, côté producteur seul, est un **null sur du vrai matériel** :
+le tracing a montré qu'au moment où une fin de déchiffrement veut sonner la cloche, un
+poll est déjà en cours ~63 % du temps — l'appel barré était donc surtout un no-op, dont
+le fix n'empêchait pas l'effet secondaire (le drapeau MISSED). La version deux-côtés du
+§2.3 est celle qui marche. Balayage en pairs, régime `sdfn`
 (`data/cloudlab/twosided_peersweep_20260626.csv`) :
 
 | pairs | `off` | consommateur seul | producteur seul | **deux-côtés (`both`)** |
@@ -341,15 +343,73 @@ classifieur.**
 | 06/07 | bpftrace 0.14 refuse les scripts avec un bloc `END` | toutes les fenêtres E11 silencieusement vides | retirer `END` | ne jamais jeter le stderr d'une sonde en phase de validation |
 | 06/07 | Une fenêtre E10 a tourné sans charge (deux fois, même cellule) | cellules froides dans les répertoires bruts | garde `ensure_load` (delta rx_bytes) | chaque fenêtre doit vérifier son propre trafic |
 
-## 6. Où trouver le reste
+## 6. Données, scripts et figures
 
-- **Données, scripts et figures, cellule par cellule** : §7 de la version anglaise
-  ([`CLOUDLAB_EXPERIMENTS_LOG.md`](CLOUDLAB_EXPERIMENTS_LOG.md)) — y compris la table de
-  provenance E10/E11 (les répertoires bruts contiennent des fenêtres froides).
-- **Journal détaillé entrée par entrée** (gabarit Question → Montage → Résultat →
-  Interprétation → Décision → Artefacts) : §5 de la version anglaise.
-- **Annexes** (instanciations, points de sonde, srcversions des modules, résultats
-  remplacés et pourquoi) : §8 de la version anglaise.
-- **Carnet brut intégral** : [`CLOUDLAB_EXPERIMENTS_LOG_RAW.md`](CLOUDLAB_EXPERIMENTS_LOG_RAW.md).
-- **Points d'avancement pour Alain** : `../meetings/POINT_ALAIN_2026-06-24_FR.md`,
-  `POINT_ALAIN_2026-07-03_FR.md`, `POINT_ALAIN_2026-07-07_FR.md`.
+Tout est dans le dépôt Git du projet (`wireguard-receive-path`). Chaque résultat
+ci-dessus se vérifie depuis son CSV :
+
+| Résultat | Données (`data/cloudlab/`) | Script (`scripts/`) | Figure(s) |
+|---|---|---|---|
+| Étalement sdfn ×2,2 (R1) | `cpu_sd_spread.csv`, `cpu_sdfn_spread.csv` | `cloudlab/measure_spread.sh` | `fig_spread.png` |
+| Balayage pairs deux-côtés (R2) | `twosided_peersweep_20260626.csv` | `cloudlab/measure_missed.sh` | `fig_twosided_peers.png` |
+| Null Phase A (R3) | `subsat_20260701_0609.csv` (+ `_0400`/`_0605`, départs avortés gardés en provenance) | `cloudlab/measure_subsat.sh`, `analyze_subsat.py` | `fig_subsat_cpu.png`, `fig_subsat_latency.png` |
+| Dose-réponse Phase B (R4) | `decsweep_20260706_0321.csv` + sidecar placement | `cloudlab/measure_decrypt_sweep.sh`, `analyze_decsweep.py` | `fig_decsweep_wasted.png`, `fig_decsweep_cpu.png` |
+| Comptabilité des coûts E10 (R5) | `costacct_20260706_0539/`, `costacct_20260706_0613/` | `cloudlab/measure_cost_accounting.sh` | `fig_e10_budget_fr.png` |
+| Blocages E11 (R6) | `costacct_20260706_0613/stall_d*.txt` | `cloudlab/measure_cost_accounting.sh` | `fig_e11_stall_fr.png` |
+| Diagrammes explicatifs (§2, R6) | — (conceptuels) | `make_explainer_figs.py` | `fig_eoi_*_fr.png`, `fig_twosided_fr.png`, `fig_fix_vs_steering_fr.png` |
+| Module + knobs | — | `build/wg515-trigger/` (srcversion `EA06EE82…`) | — |
+
+**Provenance E10/E11 cellule par cellule** — les répertoires bruts contiennent des
+fenêtres froides (voir incidents) ; voici lesquelles utiliser :
+
+| cellule | source bpf | source perf |
+|---|---|---|
+| délai 0, off | `0613` (0539 froide : 80 polls) | **aucune valide** (froide dans les deux runs) |
+| délai 0, both | `0539` + `0613` | `0539` + `0613` |
+| délai 10 µs, off | `0539` + `0613` | `0539` + `0613` |
+| délai 10 µs, both | `0539` (0613 froide : 74 polls) | `0539` + `0613` |
+| blocages E11 (tous délais) | `0613` seulement (0539 vide : bug du bloc END) | — |
+
+## 7. Annexes
+
+### A — Les instanciations CloudLab
+
+Même matériel à chaque fois : 2 × c220g2 (Wisconsin), 2× Xeon E5-2660 v3 (40 threads),
+lien d'expérience 10 GbE, Ubuntu 22.04, noyau 5.15.0-177. Le bail se réinitialise chaque
+jour ; chaque session repart d'une image vierge via `bootstrap_testbed.sh` (une
+commande : paquets, build du module, tunnel, pairs, vérification des handshakes).
+
+| # | Date | dut / gen | Servie à |
+|---|---|---|---|
+| 1 | 17/06 | c220g2-011308 / -011310 | setup, reproduction EoI, null du fix six-lignes, modèle de coût, diagnostic entonnoir |
+| 2 | 25/06 | c220g2-011002 / -011003 | build deux-côtés, revérification sdfn |
+| 3 | 26/06 | c220g2-010630 / -010628 | balayage pairs 8–64, premier sweep déchiffrement (cassé) |
+| 5 | 01/07 | c220g2-011319 / -011315 | campagne Phase A |
+| 6 | 02/07 | c220g2-011118 / -011131 | premier run Phase B — données perdues (bail expiré) |
+| 7 | 06/07 | c220g2-011118 / -011119 | Phase B propre, E10, E11 |
+
+(La #4 a vécu quelques heures sans produire de résultat.)
+
+### B — Résultats remplacés, et pourquoi
+
+Pour l'honnêteté du dossier : ce qu'on a cru, pourquoi ça a changé, ce qui est vrai
+aujourd'hui.
+
+1. **« Le fix six-lignes du M1 aide » (loopback : −8,8 à −21,9 % de gaspillage).**
+   Remplacé le 19/06 : sur vraie carte, null — au moment de sonner, un poll tourne déjà
+   ~63 % du temps. Seul le fix **deux-côtés** déplace le gaspillage (R2).
+2. **« Le bénéfice croît avec le nombre de pairs » (M1).** Remplacé le 26/06 : sur vrai
+   matériel, la réduction est plate de 8 à 64 pairs. La division par deux est réelle ; la
+   croissance était un artefact du loopback.
+3. **« Le gaspillage stock monte de ~28 à ~44 % quand le déchiffrement ralentit »
+   (sweep du 26/06).** Remplacé le 06/07 : c'était un effondrement à charge non
+   plafonnée ; à charge contrôlée, le stock reste plat ~34 % à tous les délais (R4).
+4. **Les premières mesures de latence** (ping puis sockperf court) : incohérentes, avec
+   perte d'échantillons côté `off`. Remplacées par le protocole Phase A (pair de latence
+   dédié, fenêtres de 30 s, charge vérifiée) : « pas d'effet significatif, confondu par
+   les états d'énergie » (R3).
+5. **Le trigger hrtimer (`wg_trig_k`)** groupait les polls (−22 % de polls utiles) mais
+   débit plat-à-baissier et softirq en hausse : il se sabote en tournant sur le cœur
+   qu'il veut soulager. Clos le 23/06 ; gardé comme knob de reproduction.
+6. **Les chiffres mono-run du 25/06** (30,4 → 15,3 %) : remplacés par le balayage
+   multi-N du 26/06 (27 → 14 % avec warm-up) — même conclusion, données plus propres.
