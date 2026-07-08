@@ -118,6 +118,27 @@ c'est le Résultat 6.)
 | **épisode de blocage** | Du premier poll gaspillé après un poll productif au prochain poll productif sur la même NAPI : combien de temps la livraison est restée bloquée. |
 | **Phase A / Phase B / E10 / E11** | Campagne sous-saturation CPU+latence / balayage du délai de déchiffrement / comptabilité directe des coûts / mesure des blocages. |
 | **srcversion** | L'empreinte de build du module, écrite dans chaque ligne de CSV (`EA06EE82…` = le build deux-côtés composable). |
+| **bruit run-à-run** | La variation naturelle du CPU total entre deux répétitions identiques d'une même mesure (~±2 CE ici : ordonnanceur, C-states, dynamique TCP). Un effet plus petit que ce bruit est invisible — détail au Résultat 5. |
+
+### 2.6 Les expériences, une par une
+
+Les identifiants E1, E2… E11 reviennent tout au long du document. Voici ce que chacune
+mesure et comment :
+
+| ID | Question posée | Comment on s'y prend |
+|---|---|---|
+| **E1** | L'EoI existe-t-il sur vraie carte ? Le fix six-lignes aide-t-il ? | Compter les polls qui ne livrent rien (sonde bpftrace sur le retour de `wg_packet_rx_poll`), module stock contre patché, à 1 puis 8 pairs. |
+| **E2** | Combien coûte un déchiffrement ? | Chronométrer `decrypt_packet` sur des millions de paquets → **5–6 µs**. |
+| **E3** | À quel rythme les déchiffrements finissent-ils ? | Mesurer l'écart entre deux fins de déchiffrement sur un même cœur → bimodal : **~5 µs** (worker actif) / **~100 µs** (worker à réveiller). |
+| **E4** | Combien coûte un poll, vide ou plein ? | Chronométrer `wg_packet_rx_poll` selon le nombre de paquets livrés → **~1 µs** à vide ; ~3,7 µs de mise en route + ~1,6 µs par paquet sinon. |
+| **E5** | Combien coûte la remontée vers l'application ? | Chronométrer `napi_gro_receive` → **~1 µs** par paquet. |
+| **Phase A** | Avec de la marge CPU, le fix rend-il du CPU ou de la latence ? | Résultat 3 : pair de latence dédié + charge de fond plafonnée, off/both × 4 charges × 8 répétitions, ordre mélangé. |
+| **Phase B** | Le fix devient-il utile quand le crypto ralentit ? | Résultat 4 : délai injecté par paquet (0→10 µs), off/both × 5 répétitions, même charge plafonnée. |
+| **E10** | Combien coûtent *vraiment* les polls gaspillés ? | Résultat 5 : chronométrage bpftrace des polls à vide + échantillonnage de cycles perf, en fenêtres séparées. |
+| **E11** | Combien de temps la tête bloque-t-elle la livraison ? | Résultat 6 : durée entre le premier poll raté et le prochain poll utile, par file NAPI, à chaque délai. |
+
+(E6 à E9 n'existent pas : la numérotation a sauté au fil des réorganisations du plan.
+E2–E5 forment ensemble le « modèle de coût » cité partout.)
 
 ## 3. Les résultats
 
@@ -173,24 +194,40 @@ in-module montrent `wg_supp` actif dans 96 % de ses cas cibles, et exactement 0 
 
 ### Résultat 3 — Ni le CPU ni la latence n'en profitent sur c220g2 (un null propre)
 
-La Phase A pose la question : avec de la marge CPU (sous-saturation), le travail
-économisé apparaît-il là où un utilisateur regarde ? Le point de conception qui compte :
-le pair 0 ne portait *que* la sonde de latence (sockperf ping-pong) — pour ne jamais
-mesurer un paquet de latence coincé derrière son propre trafic — pendant que les pairs
-1 à 7 créaient une pression WireGuard plafonnée en arrière-plan. `off` contre `both` ×
-charges cibles 0/2/4/6 Gb/s × 8 répétitions, ordre entièrement mélangé — 64 runs
-(`subsat_20260701_0609.csv`).
+**Le montage (Phase A).** L'idée : se placer en dessous de la saturation, là où la
+machine a de la marge, et regarder si le travail que le fix économise se voit quelque
+part. Huit pairs WireGuard : le pair 0 ne fait *que* de la latence — un petit
+ping-pong applicatif (sockperf) qui mesure le temps aller-retour de chaque requête —
+et les pairs 1 à 7 envoient un trafic de fond plafonné (0, 2, 4 ou 6 Gb/s au total).
+Séparer les deux compte : si le pair de latence portait aussi du gros trafic, on
+mesurerait ses paquets coincés derrière leur propre file, pas l'effet du fix. Chaque
+combinaison (charge × fix on/off) est répétée 8 fois, dans un ordre tiré au hasard
+pour qu'une dérive de la machine (échauffement, tâche de fond) ne favorise pas un
+camp. 64 runs au total (`subsat_20260701_0609.csv`).
 
-- **Comparaison équitable, vérifiée run par run** : les charges réelles off/both
-  concordent à ≤3,4 % (≤1,2 % à 4/6 Gb/s) — `both` ne bride pas le débit.
-- **CPU : null propre.** Trois mesures indépendantes (softirq / système+IRQ / total
-  occupé) indiscernables à toutes les charges : écarts −4,7 %…+1,6 %, signes mélangés,
-  p≈0,4–1,0.
-- **Latence : non concluante et confondue.** `both` penche 7–8 % plus bas en p99 à 2 et
-  4 Gb/s mais sans signification (p≈0,37–0,71, IQR qui se recouvrent), et la queue est
-  *la pire à la plus basse charge non nulle* (~1,5 ms à 1,1 Gb/s contre ~1,0 ms à 3,1 ;
-  plancher à vide ~370 µs) — le sens inverse d'une file d'attente, la signature des
-  C-states sous `schedutil`. Non revendiqué.
+**Ce qu'on vérifie avant de comparer.** À chaque run, on enregistre le débit
+réellement atteint : `off` et `both` atteignent la même charge à 3,4 % près. Quand on
+compare leur CPU, on compare donc deux machines qui font le même travail.
+
+**Le CPU ne bouge pas.** On le mesure de trois façons (la partie réseau du noyau
+seule ; tout le noyau ; tout ce qui est occupé). Sur les trois, l'écart off/both
+oscille entre −4,7 % et +1,6 % selon la charge — tantôt dans un sens, tantôt dans
+l'autre, sans direction. C'est la signature d'un non-effet : un vrai gain irait
+toujours dans le même sens, pas ce zigzag. Un test statistique le confirme (le hasard
+suffit largement à expliquer ces écarts), mais l'argument principal, ce sont les
+signes mélangés.
+
+**La latence non plus, et la mesure est piégée.** Le fix penche 7–8 % plus bas sur le
+p99 aux charges moyennes — tentant, mais les barres d'erreur des deux camps se
+recouvrent largement : avec 8 répétitions, impossible de distinguer cet écart du
+hasard. Et il y a un piège : la pire latence de queue n'apparaît pas à forte charge,
+mais à la charge la plus *faible* (hors zéro) — ~1,5 ms à 1,1 Gb/s contre ~1,0 ms à
+3,1 Gb/s. Une file d'attente ferait l'inverse. L'explication : quand la machine n'a
+presque rien à faire, ses cœurs s'endorment pour économiser l'énergie (les
+« C-states »), et le premier paquet qui arrive paie leur réveil. Le gouverneur de
+fréquence par défaut (`schedutil`) laisse faire. Ce bruit d'endormissement-réveil se
+compte en centaines de microsecondes ; les quelques microsecondes que le fix pourrait
+rendre sont noyées dedans. Donc je ne revendique rien sur la latence.
 
 > **Ce que j'ai retenu.** Un null propre est quand même un résultat — *parce que* les
 > charges étaient appariées, l'ordre mélangé et le CPU mesuré trois fois, « rien n'a
@@ -198,9 +235,20 @@ charges cibles 0/2/4/6 Gb/s × 8 répétitions, ordre entièrement mélangé —
 
 ### Résultat 4 — Le mécanisme répond à la dose (la figure vedette)
 
-La Phase B injecte une attente active par paquet dans le déchiffrement
-(`wg_decrypt_delay_ns`), pour émuler un crypto plus lent, avec le même protocole à
-charge plafonnée (`decsweep_20260706_0321.csv`, 50 runs sur 50 valides) :
+**Comment on ralentit le déchiffrement, et pourquoi c'est une mesure valide.** J'ai
+ajouté au module un paramètre, `wg_decrypt_delay_ns` : après chaque déchiffrement réel
+d'un paquet, le worker boucle à vide pendant N nanosecondes avant de continuer. Vu du
+reste du système, rien ne change — même chemin de code, mêmes files, mêmes réveils —
+sauf que « déchiffrer un paquet » prend maintenant 5+N µs au lieu de ~5. C'est
+précisément la situation d'une machine au crypto plus lent : pas d'instructions SIMD,
+chiffrement plus lourd, cœur embarqué. Et comme le coût du *poll*, lui, ne bouge pas,
+on balaie le rapport coût-du-déchiffrement / coût-du-poll sur la même machine, toutes
+choses égales par ailleurs — au lieu de comparer des machines différentes où tout
+changerait à la fois.
+
+Délais testés : 0/1/2/5/10 µs par paquet, `off` contre `both`, 5 répétitions chacun,
+avec le même protocole à charge plafonnée que la Phase A
+(`decsweep_20260706_0321.csv`, 50 runs sur 50 valides) :
 
 ![L'efficacité du fix croît avec le coût de déchiffrement](../meetings/figures/fig_decsweep_wasted.png)
 
@@ -231,14 +279,33 @@ charge non plafonnée.
 
 C'est la partie qui semblait fausse au début. À 10 µs de délai injecté, le fix
 deux-côtés enlève presque tous les polls gaspillés. Intuitivement, ça devrait bien
-économiser *quelque chose* de visible. E10 a mesuré pourquoi ce n'est pas le cas — avec
-deux instruments indépendants, dans des fenêtres séparées (sommes de durées bpftrace ;
-attribution des cycles perf).
+économiser *quelque chose* de visible. E10 a mesuré pourquoi ce n'est pas le cas.
 
-L'explication : « 89 % des polls gaspillés », ce n'est pas « 89 % du CPU ». Un poll
-gaspillé est une vérification très bon marché — **1,14–1,36 µs**, mesuré en conditions
-réelles (le modèle disait ~1,0 ; le surcoût du kretprobe en fait une borne supérieure).
-Les ~500 000 polls gaspillés de la base par fenêtre de 30 s totalisent :
+**Comment on a mesuré (E10).** Deux instruments indépendants, jamais en même temps
+(chacun perturbe un peu la machine ; les faire tourner ensemble fausserait les deux) :
+
+- **Un chronomètre sur la fonction de poll** (sonde bpftrace) : à chaque entrée dans
+  `wg_packet_rx_poll` on note l'heure, à la sortie on calcule la durée ; si le poll n'a
+  rien livré, cette durée s'ajoute au compteur « temps gaspillé ». Au bout de 30 s, on
+  a le temps CPU exact, en nanosecondes, passé à poller pour rien — pas un décompte
+  d'événements, un chronométrage.
+- **Un échantillonneur de cycles** (perf) : plusieurs centaines de fois par seconde,
+  sur les 40 cœurs, il note quelle fonction s'exécute. À la fin, on sait quelle part
+  des cycles occupés chaque fonction consomme — une photo de « où va le CPU »,
+  obtenue sans notre chronomètre, donc un recoupement indépendant.
+
+Le tout dans les conditions de la Phase B (même charge plafonnée, `off` contre
+`both`, délais 0 et 10 µs), exécuté deux fois pour se recouper.
+
+**Ce que ça donne.** « 89 % des polls gaspillés », ce n'est pas « 89 % du CPU ». Un
+poll gaspillé, concrètement, c'est ceci : la fonction de livraison se réveille,
+regarde le premier paquet de la file, le voit encore chiffré, et repart. Une lecture
+mémoire et un test — pas de déchiffrement, pas de copie, aucun paquet remonté.
+Chronométré : **1,14 à 1,36 µs** par poll (le modèle disait ~1,0 ; le surcoût de la
+sonde en fait plutôt une borne haute). À côté, déchiffrer un paquet coûte 5–6 µs et le
+remonter à l'application encore quelques-unes. Voilà ce que « très bon marché » veut
+dire : l'opération qu'on supprime est la moins chère de toute la chaîne. Les ~500 000
+polls gaspillés de la base par fenêtre de 30 s totalisent :
 
 ```text
 CPU total occupé sous charge :   ~7–9  CE
@@ -247,9 +314,19 @@ TOUS les polls gaspillés :        0,022 CE   ← toute la maladie
 récupéré par le fix :             0,017–0,022 CE
 ```
 
+**Et ce « bruit run-à-run » de ±2 CE, c'est quoi ?** Refaites exactement la même
+mesure deux fois — même charge, mêmes réglages, même durée — et le CPU total occupé ne
+revient pas au même chiffre : d'une répétition à l'autre, il oscille entre ~5 et
+~9 équivalents-cœurs. Ce n'est pas un défaut de l'instrument, c'est la vie de la
+machine : l'ordonnanceur place les tâches un peu différemment, les cœurs s'endorment
+et se réveillent, TCP accélère et freine. On l'a chiffré sans rien inventer : c'est la
+dispersion observée entre les 8 répétitions de la Phase A et les 5 de la Phase B, à
+conditions identiques. C'est la barre qu'un gain doit franchir pour être visible — et
+le gain maximal du fix, 0,022 CE, est cent fois en dessous.
+
 ![Le budget mesuré](../meetings/figures/fig_e10_budget_fr.png)
 
-perf confirme par l'autre bout : toute la machinerie poll + réveil
+L'échantillonneur perf confirme par l'autre bout : toute la machinerie poll + réveil
 (`wg_packet_rx_poll` *travail utile compris* + `napi_complete_done` +
 `__napi_schedule`) pèse **moins de 0,7 % des cycles occupés** dans toutes les
 conditions. Le CPU vit dans la livraison par paquet, les workers de déchiffrement,
