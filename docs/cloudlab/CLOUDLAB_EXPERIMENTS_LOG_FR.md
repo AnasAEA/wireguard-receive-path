@@ -12,8 +12,8 @@
 
 La campagne CloudLab a répondu à la question principale.
 
-- **Le fix deux-côtés est réel** : il divise par deux les polls gaspillés sur du vrai
-  matériel 10G (~27 % → ~14 %, stable de 8 à 64 pairs).
+- **Le fix à deux côtés est réel** : il divise par deux les polls gaspillés sur du vrai
+  matériel 10G (~27 % → ~14 %, stable de 8 à 64 pairs, les *peers*).
 - **Mais ces polls gaspillés sont trop bon marché pour produire un gain visible** en CPU
   ou en latence sur c220g2. La Phase A (sous-saturation, 64 runs) est un null CPU propre ;
   la latence ne montre qu'une tendance bruitée, polluée par les états d'énergie — je ne
@@ -23,13 +23,14 @@ La campagne CloudLab a répondu à la question principale.
   comme le modèle le prédit. Et pourtant, CPU et latence ne bougent toujours pas.
 - **E10 a mesuré pourquoi, directement** : la totalité du budget des polls gaspillés fait
   ~0,022 équivalent-cœur, environ cent fois sous le bruit de ±2 CE. Le null n'est plus
-  une déduction, c'est une mesure. *Le fix supprime beaucoup d'événements, pas beaucoup
-  de cycles.*
-- **E11 a trouvé une autre opportunité pour la latence** : le paquet de tête attend
-  ~50–100 µs avant d'*être* déchiffré (10 à 20 fois son propre temps de déchiffrement,
-  insensible au délai injecté) — il fait la queue derrière d'autres paquets, ou attend
-  l'ordonnanceur. C'est ce qui motive l'idée **head-priority / steering du
-  déchiffrement**, en attente d'une dernière mesure.
+  une déduction, c'est une mesure. Le fix supprime beaucoup d'événements, pas beaucoup
+  de cycles.
+- **E11 suggère une autre piste pour la latence** : les épisodes de blocage durent
+  souvent ~50–100 µs, bien plus que le temps de déchiffrement lui-même, et ne
+  s'allongent pas quand on ralentit le crypto. Ça pointe vers une attente *avant*
+  déchiffrement (file du worker, ordonnanceur) — mais il faut encore le classifieur
+  `wg_diag` pour séparer les vrais blocages de tête des files vides avant d'en faire
+  une conclusion. C'est l'idée **head-priority / steering du déchiffrement**.
 
 Le plus surprenant : le résultat négatif est devenu l'un des plus solides du projet,
 parce qu'on sait *pourquoi* le fix n'améliore pas le CPU. Pas parce qu'il est cassé (il
@@ -57,7 +58,7 @@ qu'il coûte, et pourquoi il reste invisible sur ce matériel.
 
 Et ça a changé la direction du projet. Le fix côté réveil évite des vérifications
 inutiles, mais il ne fait jamais finir le paquet de tête plus tôt. E11 suggère que la
-vraie opportunité latence est ailleurs : la tête passe des dizaines de microsecondes à
+vraie piste pour la latence est ailleurs : la tête passe des dizaines de microsecondes à
 attendre *avant même d'être déchiffrée*. Ça pointe vers le steering du déchiffrement
 comme travail futur.
 
@@ -84,9 +85,9 @@ sont exactement ces re-polls MISSED. (Notez la bande grise dans la figure — P1
 queue avant même que son déchiffrement commence*. Gardez-la en tête : elle revient au
 Résultat 6.)
 
-### 2.3 Ce que fait le fix deux-côtés
+### 2.3 Ce que fait le fix à deux côtés
 
-![Le fix deux-côtés](../meetings/figures/fig_twosided_fr.png)
+![Le fix à deux côtés](../meetings/figures/fig_twosided_fr.png)
 
 Un seul côté fuit : supprimez seulement le re-poll, et la prochaine fin de déchiffrement
 non-tête sonne une cloche *neuve* (le gaspillage « se régénère ») ; barrez seulement le
@@ -110,14 +111,14 @@ c'est le Résultat 6.)
 | **re-poll MISSED** | Le re-poll auto-programmé du noyau : une cloche sonnée pendant un poll force un autre poll juste après. |
 | **fresh wake** | Un poll gaspillé lancé par un `napi_schedule` tout neuf — comment le gaspillage se régénère avec un fix à un seul côté. |
 | **`off`** | WireGuard de base (appelé *stock* dans les vieilles entrées ; tous les knobs à 0). |
-| **`wg_supp` / `wg_headwake` / `both`** | Suppression consommateur / barrière producteur / le fix deux-côtés (anciens noms : `move` / `root`). |
+| **`wg_supp` / `wg_headwake` / `both`** | Suppression consommateur / barrière producteur / le fix à deux côtés (anciens noms : `move` / `root`). |
 | **`sdfn`** | Réglage du hachage NIC ajoutant les ports UDP → les tunnels s'étalent sur les cœurs (défaut : IP seules → un seul cœur). |
 | **CE (équivalent-cœur)** | CPU normalisé par le temps : 0,5 CE = un demi-cœur occupé en continu ; 8 CE = huit cœurs pleins. |
 | **p99 / latence de queue** | Le 99ᵉ percentile du temps aller-retour — les « pires moments » que ressent un utilisateur. |
 | **`wg_decrypt_delay_ns`** | Knob injectant une attente active par déchiffrement — émule un crypto plus lent, coût du poll inchangé. |
 | **épisode de blocage** | Du premier poll gaspillé après un poll productif au prochain poll productif sur la même NAPI : combien de temps la livraison est restée bloquée. |
 | **Phase A / Phase B / E10 / E11** | Campagne sous-saturation CPU+latence / balayage du délai de déchiffrement / comptabilité directe des coûts / mesure des blocages. |
-| **srcversion** | L'empreinte de build du module, écrite dans chaque ligne de CSV (`EA06EE82…` = le build deux-côtés composable). |
+| **srcversion** | L'empreinte de build du module, écrite dans chaque ligne de CSV (`EA06EE82…` = le build à deux côtés composable). |
 | **bruit run-à-run** | La variation naturelle du CPU total entre deux répétitions identiques d'une même mesure (~±2 CE ici : ordonnanceur, C-states, dynamique TCP). Un effet plus petit que ce bruit est invisible — détail au Résultat 5. |
 
 ### 2.6 Les expériences, une par une
@@ -163,12 +164,12 @@ EoI et le remède du débit.)*
 > n'était pas lente à cause des polls gaspillés ; elle était lente parce que tous les
 > paquets atterrissaient sur un seul cœur.
 
-### Résultat 2 — Le fix deux-côtés divise le gaspillage par deux (Alain avait raison)
+### Résultat 2 — Le fix à deux côtés divise le gaspillage par deux
 
 Le fix « six lignes » du M1, côté producteur seul, est un **null sur du vrai matériel** :
 le tracing a montré qu'au moment où une fin de déchiffrement veut sonner la cloche, un
 poll est déjà en cours ~63 % du temps — l'appel barré était donc surtout un no-op, dont
-le fix n'empêchait pas l'effet secondaire (le drapeau MISSED). La version deux-côtés du
+le fix n'empêchait pas l'effet secondaire (le drapeau MISSED). La version à deux côtés du
 §2.3 est celle qui marche. Balayage en pairs, régime `sdfn`
 (`data/cloudlab/twosided_peersweep_20260626.csv`) :
 
@@ -240,9 +241,10 @@ revendique rien sur la latence.
 ajouté au module un paramètre, `wg_decrypt_delay_ns` : après chaque déchiffrement réel
 d'un paquet, le worker boucle à vide pendant N nanosecondes avant de continuer. Vu du
 reste du système, rien ne change (même chemin de code, mêmes files, mêmes réveils),
-sauf que « déchiffrer un paquet » prend maintenant 5+N µs au lieu de ~5. C'est
-précisément la situation d'une machine au crypto plus lent : pas d'instructions SIMD,
-chiffrement plus lourd, cœur embarqué. Et comme le coût du *poll*, lui, ne bouge pas,
+sauf que « déchiffrer un paquet » prend maintenant 5+N µs au lieu de ~5. Ce n'est pas
+un autre matériel réel, mais une approximation contrôlée d'un crypto plus lent (pas
+d'instructions SIMD, chiffrement plus lourd, cœur embarqué) : on augmente `T_decrypt`
+sans changer le coût du poll ni le reste du chemin. Et comme le coût du *poll* ne bouge pas,
 on balaie le rapport coût-du-déchiffrement / coût-du-poll sur la même machine, toutes
 choses égales par ailleurs — au lieu de comparer des machines différentes où tout
 changerait à la fois.
@@ -252,7 +254,7 @@ avec le même protocole que la Phase A mais une seule charge, fixée à 2 Gb/s �
 bas pour que même le déchiffrement le plus lent suive le rythme
 (`decsweep_20260706_0321.csv`, 50 runs sur 50 valides) :
 
-![L'efficacité du fix croît avec le coût de déchiffrement](../meetings/figures/fig_decsweep_wasted.png)
+![L'efficacité du fix augmente avec le coût du déchiffrement](../meetings/figures/fig_decsweep_wasted_fr.png)
 
 | délai injecté | `off` gaspille | `both` gaspille | le fix enlève |
 |---:|---:|---:|---:|
@@ -274,13 +276,14 @@ observation « le gaspillage stock monte à ~44 % » était un artefact d'effond
 charge non plafonnée.
 
 > **Ce que j'ai retenu.** Le mécanisme est réel précisément parce qu'il répond à la
-> dose : quand j'aggrave la maladie, le remède en enlève plus. C'est une preuve bien
-> plus forte que n'importe quel A/B isolé.
+> dose : quand j'augmente artificiellement le coût du déchiffrement, le fix supprime
+> une fraction plus grande du gaspillage. C'est une preuve plus forte qu'un simple A/B
+> isolé.
 
 ### Résultat 5 — Les cycles manquants n'ont jamais existé
 
 C'est la partie qui semblait fausse au début. À 10 µs de délai injecté, le fix
-deux-côtés enlève presque tous les polls gaspillés. Intuitivement, ça devrait bien
+à deux côtés enlève presque tous les polls gaspillés. Intuitivement, ça devrait bien
 économiser *quelque chose* de visible. E10 a mesuré pourquoi ce n'est pas le cas.
 
 **Comment on a mesuré (E10).** Deux instruments indépendants, jamais en même temps
@@ -313,7 +316,7 @@ polls gaspillés de la base par fenêtre de 30 s totalisent :
 ```text
 CPU total occupé sous charge :   ~7–9  CE
 bruit run-à-run :                ±2    CE
-TOUS les polls gaspillés :        0,022 CE   ← toute la maladie
+TOUS les polls gaspillés :        0,022 CE   ← tout le gaspillage
 récupéré par le fix :             0,017–0,022 CE
 ```
 
@@ -348,7 +351,7 @@ sur vrai matériel.
 > ne vaut que par le budget de la chose dont il est le pourcentage — on aurait dû
 > chiffrer le gaspillage en CE dès le premier jour.
 
-### Résultat 6 — La prochaine opportunité latence : le steering de la tête
+### Résultat 6 — La prochaine piste pour la latence : le steering de la tête
 
 E11 a mesuré combien de temps la livraison reste réellement bloquée quand un poll
 trouve la tête pas prête (épisodes de blocage, base, délais 0/2/5/10 µs) :
@@ -403,8 +406,8 @@ classifieur.**
 | 19–24/06 | Modèle de coût (E2–E5) | sondes par étape | T_decrypt 5–6 µs, C_poll ~1 µs | réglé |
 | 22/06 | Diagnostic de saturation | CPU par cœur sous charge | entonnoir mono-cœur : hachage IP-seules | réglé |
 | 24/06 | `wg_headwake` + **étalement sdfn** | barrière producteur ; hachage NIC | 33→20 % gaspillés ; **4,1→9,0 Gb/s (×2,2)** | réglé |
-| 25/06 | Point avec Alain | composer le fix ; CPU en sous-saturation ; sensibilité crypto | build deux-côtés (`EA06EE82…`) | réglé |
-| 26/06 | Balayage pairs deux-côtés | 8–64 pairs, warm-up ajouté | **27→14 % gaspillés, plat** | réglé |
+| 25/06 | Point avec Alain | composer le fix ; CPU en sous-saturation ; sensibilité crypto | build à deux côtés (`EA06EE82…`) | réglé |
+| 26/06 | Balayage pairs à deux côtés | 8–64 pairs, warm-up ajouté | **27→14 % gaspillés, plat** | réglé |
 | 01–02/07 | Phase A (64 runs) + analyse | sous-saturation | **null CPU propre** ; latence confondue | réglé |
 | 02–03/07 | Tentative Phase B (#6) | sweep réécrit à charge plafonnée | tourné proprement ; **données perdues (bail expiré)** | remplacé le 06/07 |
 | 06/07 | Phase B (#7, 50 runs) | sweep du délai de déchiffrement | **dose-réponse 56→89 % ; CPU/latence toujours null** | réglé |
@@ -431,12 +434,12 @@ ci-dessus se vérifie depuis son CSV :
 | Résultat | Données (`data/cloudlab/`) | Script (`scripts/`) | Figure(s) |
 |---|---|---|---|
 | Étalement sdfn ×2,2 (R1) | `cpu_sd_spread.csv`, `cpu_sdfn_spread.csv` | `cloudlab/measure_spread.sh` | `fig_spread.png` |
-| Balayage pairs deux-côtés (R2) | `twosided_peersweep_20260626.csv` | `cloudlab/measure_missed.sh` | `fig_twosided_peers.png` |
+| Balayage pairs à deux côtés (R2) | `twosided_peersweep_20260626.csv` | `cloudlab/measure_missed.sh` | `fig_twosided_peers.png` |
 | Null Phase A (R3) | `subsat_20260701_0609.csv` (+ `_0400`/`_0605`, départs avortés gardés en provenance) | `cloudlab/measure_subsat.sh`, `analyze_subsat.py` | `fig_subsat_cpu.png`, `fig_subsat_latency.png` |
-| Dose-réponse Phase B (R4) | `decsweep_20260706_0321.csv` + sidecar placement | `cloudlab/measure_decrypt_sweep.sh`, `analyze_decsweep.py` | `fig_decsweep_wasted.png`, `fig_decsweep_cpu.png` |
+| Dose-réponse Phase B (R4) | `decsweep_20260706_0321.csv` + sidecar placement | `cloudlab/measure_decrypt_sweep.sh`, `analyze_decsweep.py` | `fig_decsweep_wasted_fr.png` (EN : `fig_decsweep_wasted.png`, `fig_decsweep_cpu.png`) |
 | Comptabilité des coûts E10 (R5) | `costacct_20260706_0539/`, `costacct_20260706_0613/` | `cloudlab/measure_cost_accounting.sh` | `fig_e10_budget_fr.png` |
 | Blocages E11 (R6) | `costacct_20260706_0613/stall_d*.txt` | `cloudlab/measure_cost_accounting.sh` | `fig_e11_stall_fr.png` |
-| Diagrammes explicatifs (§2, R6) | — (conceptuels) | `make_explainer_figs.py` | `fig_eoi_*_fr.png`, `fig_twosided_fr.png`, `fig_fix_vs_steering_fr.png` |
+| Diagrammes explicatifs (§2, R4, R6) | — (conceptuels) | `make_explainer_figs.py` | `fig_eoi_*_fr.png`, `fig_twosided_fr.png`, `fig_fix_vs_steering_fr.png`, `fig_decsweep_wasted_fr.png` |
 | Module + knobs | — | `build/wg515-trigger/` (srcversion `EA06EE82…`) | — |
 
 **Provenance E10/E11 cellule par cellule** — les répertoires bruts contiennent des
@@ -462,7 +465,7 @@ commande : paquets, build du module, tunnel, pairs, vérification des handshakes
 | # | Date | dut / gen | Servie à |
 |---|---|---|---|
 | 1 | 17/06 | c220g2-011308 / -011310 | setup, reproduction EoI, null du fix six-lignes, modèle de coût, diagnostic entonnoir |
-| 2 | 25/06 | c220g2-011002 / -011003 | build deux-côtés, revérification sdfn |
+| 2 | 25/06 | c220g2-011002 / -011003 | build à deux côtés, revérification sdfn |
 | 3 | 26/06 | c220g2-010630 / -010628 | balayage pairs 8–64, premier sweep déchiffrement (cassé) |
 | 5 | 01/07 | c220g2-011319 / -011315 | campagne Phase A |
 | 6 | 02/07 | c220g2-011118 / -011131 | premier run Phase B — données perdues (bail expiré) |

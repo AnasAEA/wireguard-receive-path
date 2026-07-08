@@ -363,8 +363,36 @@ def fig_steering_fr():
     fig.tight_layout(rect=(0, 0, 1, 0.96))
     fig.savefig(f"{OUT}/fig_fix_vs_steering_fr.png", dpi=150)
 
+
+def fig_decsweep_fr(csv_path="data/cloudlab/decsweep_20260706_0321.csv"):
+    """FR version of the Phase B hero figure (analyze_decsweep.py makes the EN one)."""
+    import csv as _csv, statistics as _st
+    from collections import defaultdict
+    rows = [r for r in _csv.DictReader(open(csv_path)) if r.get("status") == "ok"]
+    g = defaultdict(list)
+    for r in rows:
+        g[(int(r["delay_ns"]), r["condition"])].append(float(r["wasted_frac"]))
+    delays = sorted({d for d, _ in g})
+    xs = [d / 1000 for d in delays]
+    fig, ax = plt.subplots(figsize=(6.5, 4.2))
+    fig.patch.set_facecolor(SURF); ax.set_facecolor(SURF)
+    for c, col, lbl in (("off", RED, "off (sans fix)"), ("both", BLUE, "both (fix à deux côtés)")):
+        med, lo, hi = [], [], []
+        for d in delays:
+            v = sorted(g[(d, c)]); n = len(v)
+            med.append(_st.median(v) * 100)
+            lo.append(v[n // 4] * 100); hi.append(v[(3 * n) // 4] * 100)
+        ax.plot(xs, med, "o-", color=col, label=lbl)
+        ax.fill_between(xs, lo, hi, color=col, alpha=0.18)
+    ax.set_xlabel("délai injecté de déchiffrement (µs/paquet)")
+    ax.set_ylabel("polls gaspillés (% des polls)")
+    ax.set_title("L'efficacité du fix augmente avec le coût du déchiffrement\n(charge plafonnée 2 Gb/s, 8 pairs, 5 répétitions)", fontsize=11)
+    ax.set_ylim(0, 40); ax.legend(); ax.grid(alpha=0.3)
+    fig.tight_layout(); fig.savefig(f"{OUT}/fig_decsweep_wasted_fr.png", dpi=130)
+
 if __name__ == "__main__":
     fig_timeline(); fig_pipeline(); fig_twosided(); fig_steering()
     fig_budget_en(); fig_stall_en()
     fig_timeline_fr(); fig_pipeline_fr(); fig_twosided_fr(); fig_steering_fr()
-    print("wrote 10 figures to", OUT)
+    fig_decsweep_fr()
+    print("wrote 11 figures to", OUT)
