@@ -22,9 +22,10 @@ La campagne CloudLab a répondu à la question principale.
   gaspillage sur crypto rapide et 89 % quand je ralentis le déchiffrement à 10 µs/paquet,
   comme le modèle le prédit. Et pourtant, CPU et latence ne bougent toujours pas.
 - **E10 a mesuré pourquoi, directement** : la totalité du budget des polls gaspillés fait
-  ~0,022 équivalent-cœur, environ cent fois sous le bruit de ±2 CE. Le null n'est plus
-  une déduction, c'est une mesure. Le fix supprime beaucoup d'événements, pas beaucoup
-  de cycles.
+  ~0,022 équivalent-cœur, environ cent fois sous le bruit de ±2 CE. Autrement dit, même
+  en supprimant 100 % des polls gaspillés, le gain CPU attendu serait trop petit pour
+  sortir de la variation naturelle entre deux runs. Le null n'est plus une déduction,
+  c'est une mesure. Le fix supprime beaucoup d'événements, pas beaucoup de cycles.
 - **E11 suggère une autre piste pour la latence** : les épisodes de blocage durent
   souvent ~50–100 µs, bien plus que le temps de déchiffrement lui-même, et ne
   s'allongent pas quand on ralentit le crypto. Ça pointe vers une attente *avant*
@@ -242,9 +243,10 @@ ajouté au module un paramètre, `wg_decrypt_delay_ns` : après chaque déchiffr
 d'un paquet, le worker boucle à vide pendant N nanosecondes avant de continuer. Vu du
 reste du système, rien ne change (même chemin de code, mêmes files, mêmes réveils),
 sauf que « déchiffrer un paquet » prend maintenant 5+N µs au lieu de ~5. Ce n'est pas
-un autre matériel réel, mais une approximation contrôlée d'un crypto plus lent (pas
-d'instructions SIMD, chiffrement plus lourd, cœur embarqué) : on augmente `T_decrypt`
-sans changer le coût du poll ni le reste du chemin. Et comme le coût du *poll* ne bouge pas,
+un autre matériel réel : c'est un outil de sensibilité. Il ne prétend pas reproduire
+parfaitement une machine sans SIMD ou un cœur embarqué ; il permet d'augmenter
+`T_decrypt` sans changer le coût du poll ni le reste du chemin. Et comme le coût du
+*poll* ne bouge pas,
 on balaie le rapport coût-du-déchiffrement / coût-du-poll sur la même machine, toutes
 choses égales par ailleurs — au lieu de comparer des machines différentes où tout
 changerait à la fois.
@@ -353,6 +355,11 @@ sur vrai matériel.
 
 ### Résultat 6 — La prochaine piste pour la latence : le steering de la tête
 
+Jusqu'ici, tous les fixes agissent autour du poll : ils évitent de vérifier la file
+trop tôt. Mais ils ne changent pas le moment où la tête devient réellement livrable
+(§2.4). Pour améliorer la latence, il faut donc regarder plus tôt dans la chaîne :
+pourquoi la tête met-elle autant de temps à être déchiffrée ?
+
 E11 a mesuré combien de temps la livraison reste réellement bloquée quand un poll
 trouve la tête pas prête (épisodes de blocage, base, délais 0/2/5/10 µs) :
 
@@ -369,19 +376,18 @@ intéressante :
 
 ![Pourquoi le fix côté réveil ne peut pas bouger la latence](../meetings/figures/fig_fix_vs_steering_fr.png)
 
-Pour être précis sur ce qui est prouvé et ce qui ne l'est pas :
-
-```text
-Ce qu'E11 prouve :        les blocages font des dizaines de µs et ne s'expliquent
-                          pas par le temps de déchiffrement.
-Ce qu'E11 suggère :       la file du worker / l'ordre de déchiffrement en est
-                          responsable.
-Ce qu'E11 ne prouve PAS : que tous ces blocages sont de vrais blocages de tête —
-                          ~46 % des polls gaspillés trouvent une file VIDE, et la
-                          sonde ne sait pas les distinguer épisode par épisode.
-Prochaine étape :         classifier les épisodes dans wg_diag (~20 lignes),
-                          re-mesurer E11.
-```
+> **Ce qu'E11 prouve.** Les épisodes de blocage sont souvent bien plus longs que le
+> temps de déchiffrement seul, et leur durée ne suit pas le coût du crypto.
+>
+> **Ce qu'E11 suggère.** Une partie du délai vient probablement de l'attente dans les
+> workers ou de l'ordonnancement.
+>
+> **Ce qu'E11 ne prouve pas encore.** Que tous ces épisodes sont de vrais blocages de
+> tête : ~46 % des polls gaspillés trouvent une file *vide*, et la sonde ne sait pas
+> distinguer les deux cas épisode par épisode.
+>
+> **Prochaine étape.** Classifier les épisodes dans `wg_diag` (~20 lignes), puis
+> re-mesurer E11.
 
 Borne prudente, avec la chaîne de correction convenue (écart brut = borne sup. du temps
 bloqué ; × ~54 % de fraction tête-chiffrée ; − plancher de déchiffrement) :
