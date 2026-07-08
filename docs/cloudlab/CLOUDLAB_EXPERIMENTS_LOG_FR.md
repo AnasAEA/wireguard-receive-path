@@ -196,9 +196,9 @@ in-module montrent `wg_supp` actif dans 96 % de ses cas cibles, et exactement 0 
 
 **Le montage (Phase A).** L'idée : se placer en dessous de la saturation, là où la
 machine a de la marge, et regarder si le travail que le fix économise se voit quelque
-part. Huit pairs WireGuard : le pair 0 ne fait *que* de la latence — un petit
-ping-pong applicatif (sockperf) qui mesure le temps aller-retour de chaque requête —
-et les pairs 1 à 7 envoient un trafic de fond plafonné (0, 2, 4 ou 6 Gb/s au total).
+part. Huit pairs WireGuard : le pair 0 ne fait *que* de la latence (un petit ping-pong
+applicatif, sockperf, qui mesure le temps aller-retour de chaque requête), et les
+pairs 1 à 7 envoient un trafic de fond plafonné (0, 2, 4 ou 6 Gb/s au total).
 Séparer les deux compte : si le pair de latence portait aussi du gros trafic, on
 mesurerait ses paquets coincés derrière leur propre file, pas l'effet du fix. Chaque
 combinaison (charge × fix on/off) est répétée 8 fois, dans un ordre tiré au hasard
@@ -226,8 +226,9 @@ mais à la charge la plus *faible* (hors zéro) — ~1,5 ms à 1,1 Gb/s contre ~
 presque rien à faire, ses cœurs s'endorment pour économiser l'énergie (les
 « C-states »), et le premier paquet qui arrive paie leur réveil. Le gouverneur de
 fréquence par défaut (`schedutil`) laisse faire. Ce bruit d'endormissement-réveil se
-compte en centaines de microsecondes ; les quelques microsecondes que le fix pourrait
-rendre sont noyées dedans. Donc je ne revendique rien sur la latence.
+compte en centaines de microsecondes, et pousse la queue au-delà de la milliseconde ; les
+quelques microsecondes que le fix pourrait rendre sont noyées dedans. Donc je ne
+revendique rien sur la latence.
 
 > **Ce que j'ai retenu.** Un null propre est quand même un résultat — *parce que* les
 > charges étaient appariées, l'ordre mélangé et le CPU mesuré trois fois, « rien n'a
@@ -238,7 +239,7 @@ rendre sont noyées dedans. Donc je ne revendique rien sur la latence.
 **Comment on ralentit le déchiffrement, et pourquoi c'est une mesure valide.** J'ai
 ajouté au module un paramètre, `wg_decrypt_delay_ns` : après chaque déchiffrement réel
 d'un paquet, le worker boucle à vide pendant N nanosecondes avant de continuer. Vu du
-reste du système, rien ne change — même chemin de code, mêmes files, mêmes réveils —
+reste du système, rien ne change (même chemin de code, mêmes files, mêmes réveils),
 sauf que « déchiffrer un paquet » prend maintenant 5+N µs au lieu de ~5. C'est
 précisément la situation d'une machine au crypto plus lent : pas d'instructions SIMD,
 chiffrement plus lourd, cœur embarqué. Et comme le coût du *poll*, lui, ne bouge pas,
@@ -247,7 +248,8 @@ choses égales par ailleurs — au lieu de comparer des machines différentes o�
 changerait à la fois.
 
 Délais testés : 0/1/2/5/10 µs par paquet, `off` contre `both`, 5 répétitions chacun,
-avec le même protocole à charge plafonnée que la Phase A
+avec le même protocole que la Phase A mais une seule charge, fixée à 2 Gb/s — assez
+bas pour que même le déchiffrement le plus lent suive le rythme
 (`decsweep_20260706_0321.csv`, 50 runs sur 50 valides) :
 
 ![L'efficacité du fix croît avec le coût de déchiffrement](../meetings/figures/fig_decsweep_wasted.png)
@@ -295,7 +297,8 @@ deux-côtés enlève presque tous les polls gaspillés. Intuitivement, ça devra
   obtenue sans notre chronomètre, donc un recoupement indépendant.
 
 Le tout dans les conditions de la Phase B (même charge plafonnée, `off` contre
-`both`, délais 0 et 10 µs), exécuté deux fois pour se recouper.
+`both`, délais 0 et 10 µs), exécuté deux fois pour vérifier que les chiffres se
+répètent.
 
 **Ce que ça donne.** « 89 % des polls gaspillés », ce n'est pas « 89 % du CPU ». Un
 poll gaspillé, concrètement, c'est ceci : la fonction de livraison se réveille,
@@ -315,8 +318,8 @@ récupéré par le fix :             0,017–0,022 CE
 ```
 
 **Et ce « bruit run-à-run » de ±2 CE, c'est quoi ?** Refaites exactement la même
-mesure deux fois — même charge, mêmes réglages, même durée — et le CPU total occupé ne
-revient pas au même chiffre : d'une répétition à l'autre, il oscille entre ~5 et
+mesure deux fois, même charge et mêmes réglages : le CPU total occupé ne revient pas
+au même chiffre. D'une répétition à l'autre, il oscille entre ~5 et
 ~9 équivalents-cœurs. Ce n'est pas un défaut de l'instrument, c'est la vie de la
 machine : l'ordonnanceur place les tâches un peu différemment, les cœurs s'endorment
 et se réveillent, TCP accélère et freine. On l'a chiffré sans rien inventer : c'est la
