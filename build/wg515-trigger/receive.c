@@ -472,6 +472,34 @@ enum hrtimer_restart wg_rx_coalesce_timer(struct hrtimer *timer)
 	return HRTIMER_NORESTART;
 }
 
+/* E11 stall classifier (wg_diag): close the open delivery-blocked episode and
+ * account it under the head class it opened with. Called only from the single
+ * NAPI consumer of this peer, so the per-peer fields need no locking; the
+ * global arrays are racy ulongs like every other wg_diag counter (ratios and
+ * bucket shares only).
+ */
+static void wg_stall_close(struct wg_peer *peer)
+{
+	unsigned long *s = peer->rx_stall_class == 2 ? wg_diag_stall_uncrypt :
+						       wg_diag_stall_empty;
+	u64 d = ktime_get_ns() - peer->rx_stall_start_ns;
+
+	s[0]++;
+	s[1] += d;
+	if (d > s[2])
+		s[2] = d;
+	if (d <= 16000)
+		s[3]++;
+	else if (d <= 128000)
+		s[4]++;
+	else if (d <= 1000000)
+		s[5]++;
+	else
+		s[6]++;
+	peer->rx_stall_start_ns = 0;
+	peer->rx_stall_class = 0;
+}
+
 int wg_packet_rx_poll(struct napi_struct *napi, int budget)
 {
 	struct wg_peer *peer = container_of(napi, struct wg_peer, napi);
@@ -526,6 +554,13 @@ next:
 			break;
 	}
 
+	/* E11 stall classifier (wg_diag): a poll that delivered anything ends
+	 * the open blocked episode for this peer (same close point as the
+	 * bpftrace episode probe: the productive poll).
+	 */
+	if (wg_diag && work_done > 0 && peer->rx_stall_start_ns)
+		wg_stall_close(peer);
+
 	if (work_done < budget) {
 		/* Diagnostic (wg_diag, behaviour-preserving): at the completion point,
 		 * classify the head (empty vs UNCRYPTED) × whether MISSED is set (i.e. a
@@ -538,14 +573,32 @@ next:
 		if (wg_diag) {
 			struct sk_buff *dh = wg_prev_queue_peek(&peer->rx_queue);
 			int miss = test_bit(NAPI_STATE_MISSED, &napi->state);
+			u8 cls = 0;
 
 			if (!dh) {
+				cls = 1;
 				if (miss) wg_diag_empty_missed++;
 				else      wg_diag_empty_nomiss++;
 			} else if (atomic_read_acquire(&PACKET_CB(dh)->state) ==
 				   PACKET_STATE_UNCRYPTED) {
+				cls = 2;
 				if (miss) wg_diag_uncrypt_missed++;
 				else      wg_diag_uncrypt_nomiss++;
+			}
+			/* E11 stall classifier: a wasted poll opens an episode
+			 * under the head class it observed. If the class flipped
+			 * mid-episode (queue drained, then a new burst arrived
+			 * still encrypted), close under the old class and reopen,
+			 * so every episode is single-class.
+			 */
+			if (work_done == 0 && cls) {
+				if (peer->rx_stall_start_ns &&
+				    peer->rx_stall_class != cls)
+					wg_stall_close(peer);
+				if (!peer->rx_stall_start_ns) {
+					peer->rx_stall_start_ns = ktime_get_ns();
+					peer->rx_stall_class = cls;
+				}
 			}
 		}
 		/* Head-gated wake (wg_headwake) — the producer-side root fix, completion

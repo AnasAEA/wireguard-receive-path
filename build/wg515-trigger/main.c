@@ -71,6 +71,17 @@ module_param(wg_diag_supp_cleared, ulong, 0644);
 module_param(wg_diag_supp_rearmed, ulong, 0644);
 module_param(wg_diag_supp_reset_race, ulong, 0644);
 MODULE_PARM_DESC(wg_diag, "Enable poll-completion head-state/MISSED classification counters");
+/* E11 stall-episode classifier (wg_diag=1): contiguous delivery-blocked
+ * episodes, from the first wasted poll to the next productive poll, accounted
+ * under the head class the episode opened with. Layout per array:
+ * [0]=episodes [1]=total_ns [2]=max_ns [3]=<=16us [4]=16-128us [5]=128us-1ms
+ * [6]=>1ms. Racy ulongs (ratios/bucket shares only). Reset: write 0,0,0,0,0,0,0.
+ */
+unsigned long wg_diag_stall_empty[7], wg_diag_stall_uncrypt[7];
+module_param_array(wg_diag_stall_empty, ulong, NULL, 0644);
+module_param_array(wg_diag_stall_uncrypt, ulong, NULL, 0644);
+MODULE_PARM_DESC(wg_diag_stall_empty, "Blocked episodes, empty-queue class: n,total_ns,max_ns,le16us,le128us,le1ms,gt1ms");
+MODULE_PARM_DESC(wg_diag_stall_uncrypt, "Blocked episodes, UNCRYPTED-head class: n,total_ns,max_ns,le16us,le128us,le1ms,gt1ms");
 
 static int __init mod_init(void)
 {

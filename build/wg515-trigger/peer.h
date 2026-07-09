@@ -78,6 +78,13 @@ struct wg_peer {
 	 * when completing this exact skb; compared by pointer, never dereferenced.
 	 */
 	struct sk_buff *rx_blocked_on;
+	/* E11 stall classifier (wg_diag): start timestamp of the current
+	 * delivery-blocked episode and the head class it opened under
+	 * (0 = none, 1 = empty queue, 2 = UNCRYPTED head). Touched only by
+	 * the single NAPI consumer, so no locking.
+	 */
+	u64 rx_stall_start_ns;
+	u8 rx_stall_class;
 	u64 internal_id;
 };
 
