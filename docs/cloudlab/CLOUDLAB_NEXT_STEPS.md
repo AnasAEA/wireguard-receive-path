@@ -97,6 +97,39 @@ Read the result with the plan's knee framing: safe / transition / collapse regio
 
 ---
 
+# ▶ RUN NOW — instantiation #8 (2026-07-09): E11-C classified stalls + Phase C soak
+
+Nodes: `dut` c220g2-010631 / `gen` c220g2-010625. The module now carries the
+**E11 stall classifier** (per-episode empty-queue vs UNCRYPTED-head accounting,
+`build/wg515-trigger/`, gated on `wg_diag`) — a NEW srcversion, recorded per CSV row
+as always. The two last experiments before the write-up:
+
+```bash
+# 0) bootstrap (builds the classifier module) — done for #8 if handshakes=8 printed
+DUT=anasait@c220g2-010631.wisc.cloudlab.us GEN=anasait@c220g2-010625.wisc.cloudlab.us \
+  bash scripts/cloudlab/bootstrap_testbed.sh 8
+
+# 1) E11-C — classified stall episodes (~6 min: delays 0/5/10us x 3 reps x 30s), ON DUT
+ssh anasait@c220g2-010631.wisc.cloudlab.us
+sudo -v && nohup sudo bash ~/measure_stall_class.sh 8 > ~/stallclass_run.log 2>&1 &
+tail -f ~/stallclass_run.log
+#    Read it with the decision rule: the UNCRYPT class is the steering prize.
+#    mean_us - decrypt floor in 5-20us => future work only; 100+us => go design.
+#    The EMPTY class should hold the ms tail (inter-burst idle) — if it doesn't,
+#    the bpftrace E11 interpretation needs revisiting.
+
+# 2) Phase C — headwake soak (~32 min: 2 stages x 15 min), ON DUT, after E11-C
+sudo -v && nohup sudo bash ~/measure_soak.sh 8 > ~/soak_run.log 2>&1 &
+tail -f ~/soak_run.log
+#    Ends with VERDICT: PASS/FAIL. PASS = recommend `both` in the report.
+#    FAIL = the fallback wording is ready in RECEIVE_PATH_FINDINGS (consumer-side
+#    suppress is safe; producer gate needs memory-ordering hardening).
+
+# 3) fetch BOTH artifacts immediately (the #6 lesson), from the Mac
+scp "anasait@c220g2-010631.wisc.cloudlab.us:~/stallclass_*.csv" \
+    "anasait@c220g2-010631.wisc.cloudlab.us:~/soak_*.csv" data/cloudlab/
+```
+
 # ▶ RUN NEXT — E10/E11: cost-model confirmation + steering bound (2026-07-06)
 
 Two bounds to measure before designing anything further (agreed with Alain's framing):
