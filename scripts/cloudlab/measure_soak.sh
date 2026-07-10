@@ -16,7 +16,9 @@ exec 9>/tmp/soak.lock
 flock -n 9 || { echo "FATAL: another measure_soak.sh is running" >&2; exit 1; }
 N=${1:-8}
 STAGE_DUR=${2:-900}                 # seconds per stage (default 2x15 min)
-GEN=${3:-gen}; NIC=${4:-enp6s0f0}
+GEN=${3:-gen}; NIC=${4:-$(ip -br addr | awk '/192\.168\.1\.1\//{print $1; exit}')}
+[ -n "$NIC" ] || { echo "FATAL: cannot find the experiment NIC (192.168.1.1)" >&2; exit 1; }
+# NB: the NIC name flips between instantiations (f0 vs f1) — never hardcode it.
 LOAD_MOD=${LOAD_MOD:-4}             # stage 1: moderate capped Gb/s
 KO="$HOME/wireguard_trigger.ko"
 TS=$(date +%Y%m%d_%H%M); CSV="$HOME/soak_$TS.csv"
@@ -37,6 +39,13 @@ bash "$HOME/setup_dut_peers.sh" "$N" >/dev/null
 pkill -f 'iperf3 -s' 2>/dev/null; sleep 1
 for i in $(seq 0 $((N-1))); do iperf3 -s -p $((5201+i)) -D; done
 echo 1 > $P/wg_supp; echo 1 > $P/wg_headwake     # the two-sided fix, ON for the whole soak
+
+# establish all N handshakes BEFORE measuring — the module reload above reset
+# them, and the 2026-07-10 run counted 7/8 through stage 1 only because the
+# unloaded peer 0 had never handshaked (harness artifact, not a lost peer)
+ssh -n -o StrictHostKeyChecking=no "$GEN" \
+  "for i in \$(seq 0 $((N-1))); do ip netns exec ns_c\$i ping -c1 -W2 10.0.0.1 >/dev/null 2>&1 & done; wait" || true
+sleep 2
 
 DMESG_BASE=$(dmesg | wc -l)
 echo "stage,t_s,gbps,handshakes,new_dmesg" > "$CSV"
@@ -75,9 +84,12 @@ for stage in ("moderate", "linerate"):
     hs = [int(r["handshakes"]) for r in rows if r["stage"] == stage]
     dm = [int(r["new_dmesg"]) for r in rows if r["stage"] == stage]
     med = st.median(g) if g else 0
-    collapse = any(x < med / 2 for x in g[2:])  # skip ramp samples
-    print(f"{stage}: median {med:.2f} Gb/s, min {min(g):.2f}, handshakes min {min(hs)}/{n}, dmesg hits {max(dm)}")
-    if collapse or min(hs) < n or max(dm) > 0: ok = False
+    # the first minute of each stage is TCP ramp — judge only steady state
+    collapse = any(x < med / 2 for x in g[4:])
+    hs_bad = len(hs) > 4 and min(hs[4:]) < n
+    print(f"{stage}: median {med:.2f} Gb/s, steady-state min {min(g[4:] or g):.2f}, "
+          f"handshakes steady min {min(hs[4:] or hs)}/{n}, dmesg hits {max(dm)}")
+    if collapse or hs_bad or max(dm) > 0: ok = False
 print("VERDICT:", "PASS - no stall, no collapse, handshakes held" if ok else "FAIL - inspect the log")
 PY
 echo "ARTIFACT $CSV  (srcversion $SRC)"

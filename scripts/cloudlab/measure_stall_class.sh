@@ -17,7 +17,9 @@ N=${1:-8}
 DELAYS=${2:-"0 5000 10000"}
 DUR=${3:-30}
 REPS=${4:-3}
-GEN=${5:-gen}; NIC=${6:-enp6s0f0}
+GEN=${5:-gen}; NIC=${6:-$(ip -br addr | awk '/192\.168\.1\.1\//{print $1; exit}')}
+[ -n "$NIC" ] || { echo "FATAL: cannot find the experiment NIC (192.168.1.1)" >&2; exit 1; }
+# NB: the NIC name flips between instantiations (f0 vs f1) — never hardcode it.
 LOAD=${LOAD:-2}; STREAMS=${STREAMS:-4}
 KO="$HOME/wireguard_trigger.ko"
 TS=$(date +%Y%m%d_%H%M); CSV="$HOME/stallclass_$TS.csv"
