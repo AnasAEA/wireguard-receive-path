@@ -8,7 +8,7 @@
 
 ---
 
-## 0. Où on en est — à lire en premier (7 juillet 2026)
+## 0. Où on en est — à lire en premier (10 juillet 2026)
 
 La campagne CloudLab a répondu à la question principale.
 
@@ -26,22 +26,24 @@ La campagne CloudLab a répondu à la question principale.
   en supprimant 100 % des polls gaspillés, le gain CPU attendu serait trop petit pour
   sortir de la variation naturelle entre deux runs. Le null n'est plus une déduction,
   c'est une mesure. Le fix supprime beaucoup d'événements, pas beaucoup de cycles.
-- **E11 suggère une autre piste pour la latence** : les épisodes de blocage durent
-  souvent ~50–100 µs, bien plus que le temps de déchiffrement lui-même, et ne
-  s'allongent pas quand on ralentit le crypto. Ça pointe vers une attente *avant*
-  déchiffrement (file du worker, ordonnanceur) — mais il faut encore le classifieur
-  `wg_diag` pour séparer les vrais blocages de tête des files vides avant d'en faire
-  une conclusion. C'est l'idée **head-priority / steering du déchiffrement**.
+- **E11, maintenant classifié (E11-C), confirme la piste latence** : la livraison
+  attend ~30–90 µs sur des têtes *vérifiées chiffrées* — 150 à 300 000 épisodes par
+  fenêtre de 30 s, insensibles au délai de déchiffrement injecté : la tête attend
+  l'ordonnanceur, pas le crypto. L'idée **head-priority / steering du déchiffrement**
+  est transmise comme travail futur avec ses preuves (Résultat 6).
+- **Le fix à deux côtés a passé son test d'endurance (Phase C)** : 30 minutes de charge
+  soutenue en régime étalé (4,2 puis 9,57 Gb/s), plus 30 minutes dans le régime
+  entonnoir saturé (le plus dur), zéro avertissement noyau, zéro effondrement,
+  handshakes tenus — **`both` est recommandable** (Résultat 7).
 
 Le plus surprenant : le résultat négatif est devenu l'un des plus solides du projet,
 parce qu'on sait *pourquoi* le fix n'améliore pas le CPU. Pas parce qu'il est cassé (il
 agit, les compteurs le prouvent), mais parce que ce qu'il supprime ne coûte presque rien
 sur cette machine.
 
-Reste à faire : (1) le classifieur `wg_diag` (~20 lignes) pour séparer les vrais
-blocages de tête des files vides, puis re-mesurer E11 ; (2) le soak de fiabilité de
-`headwake` ; (3) trancher avec Alain/André si le fix du papier (`gro_wq`) et la config
-combinée restent un livrable du 31 juillet ; (4) la rédaction finale.
+**La campagne expérimentale est close (10 juillet).** Reste à faire : (1) trancher avec
+Alain/André si le fix du papier (`gro_wq`) et la config combinée restent un livrable du
+31 juillet ; (2) la rédaction finale.
 
 ## 1. La question que je me posais
 
@@ -397,10 +399,53 @@ population milliseconde (~6 % des épisodes) est de l'inactivité entre rafales,
 **Décision : ne pas implémenter le steering maintenant ; construire d'abord le
 classifieur.**
 
+**Mise à jour — le classifieur a tourné (E11-C, 9–10 juillet).** Le module classe
+maintenant chaque épisode à la source (file vide ou tête chiffrée, avec durée par
+tranche : ≤16 µs / 16–128 µs / 128 µs–1 ms / >1 ms). Deux campagnes — l'instanciation
+#8, puis une reprise sur #9 avec le régime étalé garanti — concordent :
+
+- **La classe « tête chiffrée » est réelle et massive** : 150 à 300 000 épisodes par
+  fenêtre de 30 s, **moyenne 35–94 µs en régime étalé**, le gros dans la tranche
+  16–128 µs, moins de 1 % au-delà de 1 ms — et toujours **insensible au délai de
+  déchiffrement injecté**. La tête attend vérifiablement son tour, pas son crypto.
+- **La classe « file vide » porte toute la queue milliseconde** (moyennes 0,5–1,3 ms) —
+  l'exclusion qu'on faisait à la main est maintenant mesurée, plus supposée.
+- **Contre la règle de décision** : l'excès récupérable classifié (moyenne moins le
+  plancher de déchiffrement) fait **~30–80 µs typiques**, avec 2–10 % des épisodes entre
+  128 µs et 1 ms. Au-dessus de la bande « pas la peine » ; la moyenne juste sous un
+  « 100 µs partout ». Verdict : **le steering reste du travail futur, mais avec des
+  preuves classées** — le stage transmet le classifieur, les chiffres et le prix borné ;
+  l'implémentation est le projet d'après. (Dispersion visible entre répétitions, n=3 :
+  un repreneur commencera par resserrer l'estimation.)
+
 > **Ce que j'ai retenu.** Le fix côté réveil et la latence n'allaient jamais se
-> rencontrer — le fix optimise la *vérification*, pas la *disponibilité*. S'il existe un
-> gain de latence dans cette histoire, il vit dans l'ordonnancement du déchiffrement, et
-> un petit classifieur décidera si on le poursuit.
+> rencontrer — le fix optimise la *vérification*, pas la *disponibilité*. Le classifieur
+> a levé la dernière ambiguïté : la livraison attend bien ~30–90 µs sur des têtes
+> vérifiées chiffrées, dix fois leur temps de déchiffrement. C'est le point de passation
+> pour un design head-priority.
+
+### Résultat 7 — Le fix à deux côtés est sûr à l'usage (soak Phase C : PASS)
+
+La barrière producteur porte un risque théorique de réveil perdu (un réveil sauté ⇒ un
+flux TCP qui se bloque) ; le recheck façon Dekker est censé le fermer. Le test
+empirique : 30 minutes de charge soutenue avec `both` activé, en échantillonnant débit,
+handshakes et journal noyau toutes les 15 s.
+
+- **Régime étalé (`soak_20260710_0349.csv`) : PASS.** 15 minutes plafonnées à un
+  4,22 Gb/s stable au centième, puis 15 minutes sans plafond à **9,57 Gb/s** (le régime
+  étalé confirmé), handshakes 8/8 en continu, **zéro** ligne rcu/stall/hung/BUG/WARNING.
+- **Bonus, le cas le plus dur** (`soak_20260710_0238.csv`) : un premier run parti par
+  erreur en régime entonnoir mono-cœur — précisément le régime où le stall headwake
+  originel était apparu — 30 minutes saturées à 4,42 Gb/s stable, zéro avertissement
+  noyau. (Son verdict FAIL était un artefact du harnais : un compte 7/8 dû au
+  rechargement du module, corrigé depuis — détail en §5.)
+
+**Conséquence : `both` est recommandable dans le rapport** — mécaniquement vérifié,
+répondant à la dose, et maintenant éprouvé dans le régime nominal comme dans le pire.
+
+> **Ce que j'ai retenu.** Le re-poll MISSED « gaspilleur » est le filet de sécurité du
+> noyau, et on en a retiré la moitié — le soak est ce qui dit qu'on n'a pas retiré la
+> sécurité avec.
 
 ## 4. Chronologie
 
@@ -418,7 +463,10 @@ classifieur.**
 | 02–03/07 | Tentative Phase B (#6) | sweep réécrit à charge plafonnée | tourné proprement ; **données perdues (bail expiré)** | remplacé le 06/07 |
 | 06/07 | Phase B (#7, 50 runs) | sweep du délai de déchiffrement | **dose-réponse 56→89 % ; CPU/latence toujours null** | réglé |
 | 06/07 | E10 comptabilité des coûts | bpftrace + perf | budget gaspillage **0,022 CE**, 100× sous le bruit | réglé |
-| 06/07 | E11 blocages | sonde d'épisodes, délais 0–10 µs | blocage médian 50–100 µs, insensible au délai | **classifieur requis** |
+| 06/07 | E11 blocages | sonde d'épisodes, délais 0–10 µs | blocage médian 50–100 µs, insensible au délai | remplacé par E11-C |
+| 09/07 | E11-C classifié (#8) | classifieur in-module par épisode | classe tête-chiffrée réelle : moyenne 44–171 µs | réglé |
+| 10/07 | E11-C repris, régime étalé garanti (#9) | autodétection de la carte | moyenne 35–94 µs ; la classe vide porte la queue ms | réglé |
+| 10/07 | Soak Phase C (#9) | `both` activé, 2×15 min + bonus entonnoir | **PASS** — 0 alerte noyau, 9,57 Gb/s | réglé |
 
 ## 5. Incidents et corrections de méthodo
 
@@ -431,6 +479,8 @@ classifieur.**
 | 06/07 | Seuil REJECT 0,40 vs sous-atteinte du pacing iperf3 (~45–50 %) | runs sains marqués « collapse » | seuil 0,60 ; genou localisé à l'analyse | connaître la marge du générateur avant de flaguer |
 | 06/07 | bpftrace 0.14 refuse les scripts avec un bloc `END` | toutes les fenêtres E11 silencieusement vides | retirer `END` | ne jamais jeter le stderr d'une sonde en phase de validation |
 | 06/07 | Une fenêtre E10 a tourné sans charge (deux fois, même cellule) | cellules froides dans les répertoires bruts | garde `ensure_load` (delta rx_bytes) | chaque fenêtre doit vérifier son propre trafic |
+| 10/07 | Scripts avec la carte `enp6s0f0` en dur ; celle de #9 est `enp6s0f1` | premier soak parti en régime entonnoir (« line rate » = 4,42 Gb/s = un cœur) | autodétection depuis l'adresse 192.168.1.1 | ne jamais coder le nom de la carte en dur — il change entre instanciations |
+| 10/07 | Le soak recharge le module ⇒ handshakes remis à zéro ; le pair 0 non chargé ne refait pas le sien | compte 7/8 tout l'étage 1 → FAIL parasite | ping de warm-up pour tous les pairs ; verdict sur le régime établi seulement | un test de fiabilité ne doit pas échouer sur ses propres artefacts de montage |
 
 ## 6. Données, scripts et figures
 
@@ -445,6 +495,8 @@ ci-dessus se vérifie depuis son CSV :
 | Dose-réponse Phase B (R4) | `decsweep_20260706_0321.csv` + sidecar placement | `cloudlab/measure_decrypt_sweep.sh`, `analyze_decsweep.py` | `fig_decsweep_wasted_fr.png` (EN : `fig_decsweep_wasted.png`, `fig_decsweep_cpu.png`) |
 | Comptabilité des coûts E10 (R5) | `costacct_20260706_0539/`, `costacct_20260706_0613/` | `cloudlab/measure_cost_accounting.sh` | `fig_e10_budget_fr.png` |
 | Blocages E11 (R6) | `costacct_20260706_0613/stall_d*.txt` | `cloudlab/measure_cost_accounting.sh` | `fig_e11_stall_fr.png` |
+| E11-C classifié (R6) | `stallclass_20260709_0727.csv`, `stallclass_20260710_0332.csv` | `cloudlab/measure_stall_class.sh` | — |
+| Soak Phase C : PASS (R7) | `soak_20260710_0349.csv` (+ `_0238`, bonus entonnoir) | `cloudlab/measure_soak.sh` | — |
 | Diagrammes explicatifs (§2, R4, R6) | — (conceptuels) | `make_explainer_figs.py` | `fig_eoi_*_fr.png`, `fig_twosided_fr.png`, `fig_fix_vs_steering_fr.png`, `fig_decsweep_wasted_fr.png` |
 | Module + knobs | — | `build/wg515-trigger/` (srcversion `EA06EE82…`) | — |
 
@@ -476,6 +528,8 @@ commande : paquets, build du module, tunnel, pairs, vérification des handshakes
 | 5 | 01/07 | c220g2-011319 / -011315 | campagne Phase A |
 | 6 | 02/07 | c220g2-011118 / -011131 | premier run Phase B — données perdues (bail expiré) |
 | 7 | 06/07 | c220g2-011118 / -011119 | Phase B propre, E10, E11 |
+| 8 | 09/07 | c220g2-010631 / -010625 | E11-C classifié, premier run |
+| 9 | 10/07 | c220g2-010624 / -011126 | E11-C régime étalé garanti, soak Phase C (PASS) |
 
 (La #4 a vécu quelques heures sans produire de résultat.)
 

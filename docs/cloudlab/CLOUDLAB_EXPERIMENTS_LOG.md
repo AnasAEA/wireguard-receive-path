@@ -10,7 +10,7 @@
 
 ---
 
-## 0. Current status — read this first (2026-07-07)
+## 0. Current status — read this first (2026-07-10)
 
 The CloudLab campaign answered the main question.
 
@@ -25,20 +25,24 @@ The CloudLab campaign answered the main question.
 - **E10 measured why, directly**: baseline's *entire* wasted-poll budget is ~0.022
   cores-equivalent, about 100× below the ±2 CE run-to-run noise floor. The null is now a
   measurement, not an inference. *The fix removes many events, but not many cycles.*
-- **E11 found a different latency opportunity**: the head packet waits ~50–100 µs to
-  *get* decrypted (10–20× its own decrypt time, insensitive to injected decrypt delay) —
-  it queues behind other packets / waits for worker scheduling. This motivates a future
-  **head-priority / decrypt-order steering** idea, pending one more measurement.
+- **E11 found a different latency opportunity, now classified (E11-C)**: delivery waits
+  ~30–90 µs on heads that are *verifiably encrypted* — 150–300k such episodes per 30 s
+  window, insensitive to injected decrypt delay: the head waits for scheduling, not for
+  crypto. **Head-priority / decrypt-order steering** is handed over as evidence-backed
+  future work (Finding 6).
+- **The two-sided fix passed its reliability soak (Phase C)**: 30 min sustained load in
+  the spread regime (4.2 then 9.57 Gb/s), plus 30 min in the harsher saturated funnel
+  regime, zero kernel warnings, zero collapse, handshakes held — **`both` is
+  recommendable** (Finding 7).
 
 The surprising part is that the negative result is now one of the strongest results: we
 know *why* the fix does not improve CPU. It is not because the fix is broken — it fires,
 verifiably, and removes exactly what it targets. It is because the thing it removes is
 extremely cheap on this hardware.
 
-Remaining work: (1) the ~20-line `wg_diag` per-episode classifier to separate real
-head-blocked stalls from empty-queue gaps, then re-run E11; (2) the `headwake`
-reliability soak; (3) confirm with Alain/André whether the paper's `gro_wq` combined-fix
-deliverable is still required; (4) final write-up.
+**The experimental campaign is closed (2026-07-10).** Remaining work: (1) confirm with
+Alain/André whether the paper's `gro_wq` combined-fix deliverable is still required;
+(2) the final write-up.
 
 **Reader map.**
 - *2 minutes:* this section + the budget figure in Finding 5.
@@ -303,9 +307,54 @@ population 200–800 µs** — above the "not worth it" band (5–20 µs), tail 
 threshold (100 µs). The ms-scale population (~6% of episodes) is inter-burst idle and
 excluded. **Decision: do not implement steering yet; build the classifier first.**
 
+**UPDATE — the classifier ran (E11-C, 2026-07-09/10).** The module now classifies every
+episode at the source (`wg_diag_stall_{empty,uncrypt}` arrays: count, total, max, and
+buckets ≤16 µs / 16–128 µs / 128 µs–1 ms / >1 ms). Two campaigns — instantiation #8
+(`stallclass_20260709_0727.csv`) and a spread-regime-guaranteed rerun on #9
+(`stallclass_20260710_0332.csv`, NIC autodetected) — agree:
+
+- **The UNCRYPTED-head class is real and big**: 150k–298k episodes per 30 s window,
+  **mean 35–94 µs in the spread regime** (44–171 µs on #8), bulk in the 16–128 µs
+  bucket, ≤1% above 1 ms, max 2–4.6 ms — and still **insensitive to injected decrypt
+  delay** (means at 10 µs delay ≈ means at 0). The head verifiably waits for
+  *scheduling*, not for crypto.
+- **The empty class carries the entire ms tail** (means 0.5–1.3 ms, 19–28k episodes
+  >1 ms per window vs ≤1.5k for uncrypt) — the bpftrace-era exclusion of the ms
+  population as inter-burst idle is now measured, not assumed.
+- **Against the decision rule**: classified recoverable excess (mean − 5–16 µs decrypt
+  floor) is **~30–80 µs typical**, with 2–10% of episodes in 128 µs–1 ms. Above the
+  "not worth it" band; the mean sits just under a clean 100-µs-everywhere. Verdict:
+  **steering stays evidence-backed future work** — the internship hands over the
+  classifier, the numbers, and the bounded prize; implementing it is the next-stage
+  project. Rep-to-rep spread is visible (n=3 per delay), so a taker should start by
+  tightening the estimate with more reps.
+
 > **What I learned.** The wake-side fix and latency were never going to meet — the fix
-> optimizes the *checking*, not the *readiness*. If a latency win exists in this story,
-> it lives in decrypt scheduling, and one small classifier decides whether we chase it.
+> optimizes the *checking*, not the *readiness*. The classifier settled the last
+> ambiguity: delivery really does wait ~30–90 µs on heads that are verifiably encrypted,
+> 10× their decrypt time. That is the handover point for a head-priority design.
+
+### Finding 7 — The two-sided fix is safe to run (Phase C soak: PASS)
+
+The producer gate carries a theoretical lost-wakeup risk (a skipped wake ⇒ a TCP flow
+deadlocks); the Dekker publish-then-recheck is meant to close it. The empirical gate,
+30 minutes of sustained load with `both` ON, sampling throughput / handshakes / kernel
+log every 15 s (`measure_soak.sh`):
+
+- **Spread regime (#9, `soak_20260710_0349.csv`): PASS.** 15 min capped at a rock-steady
+  4.22 Gb/s, then 15 min uncapped at **9.57 Gb/s** (line-rate spread confirmed),
+  handshakes 8/8 throughout, **zero** rcu/stall/hung/BUG/WARNING lines.
+- **Bonus, the harsh case** (`soak_20260710_0238.csv`): a first run accidentally executed
+  in the single-core *funnel* regime — the exact regime where the original headwake
+  stall appeared — 30 min saturated at a stable 4.42 Gb/s, zero kernel warnings, no
+  collapse. (Its FAIL verdict was a harness artifact: a 7/8 handshake count from the
+  module reload, since fixed with a warm-up; details in §6.)
+
+**Consequence: `both` is recommendable in the report** — mechanically verified,
+dose-responsive, and now soak-tested in both the nominal and the worst-case regime.
+
+> **What I learned.** The "wasteful" MISSED re-poll is the kernel's safety net, and we
+> removed half of it — the soak is what says we didn't remove the safety with it.
 
 ## 4. Timeline of experiments
 
@@ -327,7 +376,10 @@ excluded. **Decision: do not implement steering yet; build the classifier first.
 | 07-02/03 | Phase B attempt (#6) | rewritten capped-load sweep | ran clean; **data lost to lease expiry** | superseded by 07-06 |
 | 07-06 | Phase B (#7) | capped-load decrypt sweep, 50 runs | **dose-response 56→89% waste removed; CPU/latency still null** | settled |
 | 07-06 | E10 cost accounting | bpftrace duration sums + perf | wasted-poll budget **0.022 CE**, 100× under noise | settled |
-| 07-06 | E11 stall gaps | episode probe, delays 0–10 µs | median stall 50–100 µs, delay-insensitive | **needs classifier** |
+| 07-06 | E11 stall gaps | episode probe, delays 0–10 µs | median stall 50–100 µs, delay-insensitive | superseded by E11-C |
+| 07-09 | E11-C classified stalls (#8) | in-module per-episode classifier | UNCRYPT class real: mean 44–171 µs, delay-insensitive | settled |
+| 07-10 | E11-C rerun, spread-guaranteed (#9) | NIC autodetection | UNCRYPT mean 35–94 µs; empty class holds the ms tail | settled |
+| 07-10 | Phase C soak (#9) | `both` ON, 2×15 min + funnel bonus run | **PASS** — 0 dmesg hits, no collapse, 9.57 Gb/s line rate | settled |
 
 ## 5. Journal — the decisions, entry by entry
 
@@ -456,6 +508,23 @@ recoverable excess ~30–90 µs typical, 200–800 µs tail — promising but co
 **Decision.** Build the wg_diag per-episode classifier before any steering design.
 **Artifacts.** `costacct_20260706_0613/stall_d*.txt`, `fig_e11_stall_en.png` (FR: `_fr`).
 
+### 2026-07-09/10 — E11-C and the soak (the closing experiments)
+
+**Question.** Are the long stalls really blocked-on-encrypted-head (steering prize), and
+is `both` safe under sustained load?
+**Setup.** ~45-line behaviour-preserving classifier in the module (per-episode class +
+duration buckets, gated on `wg_diag`); `measure_stall_class.sh` at delays 0/5/10 µs × 3
+reps; `measure_soak.sh` 2×15 min with `both` ON. Instantiations #8 and #9.
+**Result.** UNCRYPT class: mean 35–94 µs (spread regime), delay-insensitive, ≤1% over
+1 ms; EMPTY class carries the ms tail. Soak: PASS in spread (4.22 / 9.57 Gb/s stages) +
+a bonus saturated-funnel run, both with zero kernel warnings (Findings 6–7).
+**Interpretation.** The steering premise survives classification with a bounded prize
+(~30–80 µs excess); the two-sided fix is safe in nominal and worst-case regimes.
+**Decision.** Campaign closed. Steering = documented handover; `both` = recommendable.
+**Artifacts.** `stallclass_20260709_0727.csv`, `stallclass_20260710_0332.csv`,
+`soak_20260710_0349.csv`, `soak_20260710_0238.csv` (funnel bonus),
+`build/wg515-trigger/` (srcversion `47258C70…`).
+
 ## 6. Incidents and methodology fixes
 
 | Date | Problem | Effect | Fix | Lesson |
@@ -468,6 +537,8 @@ recoverable excess ~30–90 µs typical, 200–800 µs tail — promising but co
 | 07-06 | `REJECT_DEV=0.40` vs iperf3 pacing undershoot (~45–50%) | healthy runs mislabeled "collapse" | threshold 0.60; knee located in analysis vs delay-0 baseline | know the generator's slop before flagging |
 | 07-06 | bpftrace 0.14 rejects scripts with an `END` block | all E11 windows silently empty | drop `END`; filter residual maps in analysis | never send probe stderr to /dev/null while validating |
 | 07-06 | One E10 window ran with no load (twice, same cell) | cold cells in raw dirs | `ensure_load` rx_bytes-delta guard (first, bpftrace-based version was itself broken by BTF-parse startup) | each window must verify its own traffic |
+| 07-10 | Scripts hardcoded NIC `enp6s0f0`; #9's experiment port is `enp6s0f1` | first soak silently ran in the funnel regime ("line rate" = 4.42 Gb/s = one core) | autodetect the NIC from the 192.168.1.1 address | never hardcode the NIC name — it flips between instantiations |
+| 07-10 | Soak reloads the module ⇒ handshakes reset; unloaded peer 0 never re-handshakes | 7/8 count all through stage 1 → spurious FAIL | warm-up ping for all peers; verdict judges steady state only | a reliability check must not fail on its own setup artifacts |
 
 ## 7. Raw data and figures index
 
@@ -480,7 +551,9 @@ recoverable excess ~30–90 µs typical, 200–800 µs tail — promising but co
 | E10 cost accounting (Finding 5) | `costacct_20260706_0539/`, `costacct_20260706_0613/` | `measure_cost_accounting.sh` | `fig_e10_budget_en.png` (+`_fr`) |
 | E11 stall gaps (Finding 6) | `costacct_20260706_0613/stall_d*.txt` | `measure_cost_accounting.sh` | `fig_e11_stall_en.png` (+`_fr`) |
 | Explainer diagrams (§2, Finding 6) | — (conceptual) | `scripts/make_explainer_figs.py` | `fig_eoi_pipeline_en.png`, `fig_eoi_timeline_en.png`, `fig_twosided_en.png`, `fig_fix_vs_steering_en.png` |
-| Module + knobs | — | `build/wg515-trigger/` (srcversion `EA06EE82…`) | — |
+| E11-C classified stalls (Finding 6) | `stallclass_20260709_0727.csv`, `stallclass_20260710_0332.csv` | `measure_stall_class.sh` | — |
+| Phase C soak PASS (Finding 7) | `soak_20260710_0349.csv` (+ `_0238` funnel bonus) | `measure_soak.sh` | — |
+| Module + knobs | — | `build/wg515-trigger/` (srcversion `EA06EE82…` campaigns ≤07-06; `47258C70…` = + E11-C classifier, 07-09 on) | — |
 
 **E10/E11 per-cell provenance** (the raw dirs contain cold windows — use these):
 
@@ -510,6 +583,8 @@ peers, handshake check).
 | 5 | 07-01 | c220g2-011319 / -011315 | `enp6s0f0` | Phase A campaign |
 | 6 | 07-02 | c220g2-011118 / -011131 | `enp6s0f0` | Phase B first run — data lost to lease expiry |
 | 7 | 07-06 | c220g2-011118 / -011119 | `enp6s0f0` | Phase B (clean), E10, E11 |
+| 8 | 07-09 | c220g2-010631 / -010625 | (unverified) | E11-C classified stalls, first run |
+| 9 | 07-10 | c220g2-010624 / -011126 | `enp6s0f1` | E11-C spread-guaranteed rerun, Phase C soak (PASS) |
 
 (#4 was a short-lived instantiation with no experiment output. Node IDs, public keys
 and per-instantiation gotchas: `CLOUDLAB_EXPERIMENTS_LOG_RAW.md`, "Environment of

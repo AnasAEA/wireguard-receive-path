@@ -97,7 +97,14 @@ Read the result with the plan's knee framing: safe / transition / collapse regio
 
 ---
 
-# ▶ RUN NOW — instantiation #8 (2026-07-09): E11-C classified stalls + Phase C soak
+# ▶ DONE 2026-07-10 — E11-C classified stalls + Phase C soak (campaign CLOSED)
+
+> E11-C: UNCRYPT-class stalls mean 35–94 µs in the guaranteed spread regime (#9),
+> delay-insensitive; the empty class holds the ms tail. Soak: **PASS** (4.22 then
+> 9.57 Gb/s stages, 0 dmesg hits, handshakes held) + a bonus saturated-funnel run.
+> Details: EXPERIMENTS_LOG Findings 6–7. Remaining work is the write-up.
+
+# ▶ was: RUN NOW — instantiation #8 (2026-07-09): E11-C classified stalls + Phase C soak
 
 Nodes: `dut` c220g2-010631 / `gen` c220g2-010625. The module now carries the
 **E11 stall classifier** (per-episode empty-queue vs UNCRYPTED-head accounting,
