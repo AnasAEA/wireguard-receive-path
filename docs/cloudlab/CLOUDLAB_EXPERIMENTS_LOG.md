@@ -380,6 +380,7 @@ dose-responsive, and now soak-tested in both the nominal and the worst-case regi
 | 07-09 | E11-C classified stalls (#8) | in-module per-episode classifier | UNCRYPT class real: mean 44–171 µs, delay-insensitive | settled |
 | 07-10 | E11-C rerun, spread-guaranteed (#9) | NIC autodetection | UNCRYPT mean 35–94 µs; empty class holds the ms tail | settled |
 | 07-10 | Phase C soak (#9) | `both` ON, 2×15 min + funnel bonus run | **PASS** — 0 dmesg hits, no collapse, 9.57 Gb/s line rate | settled |
+| 07-10 | **Phase D: wg_steal** (#9) | work-stealing poll implemented + A/B | blocked time **−95%**; CPU neutral; probe p99 null; **single-tunnel +3–5%** | needs soak + sweep |
 
 ## 5. Journal — the decisions, entry by entry
 
@@ -524,6 +525,41 @@ a bonus saturated-funnel run, both with zero kernel warnings (Findings 6–7).
 **Artifacts.** `stallclass_20260709_0727.csv`, `stallclass_20260710_0332.csv`,
 `soak_20260710_0349.csv`, `soak_20260710_0238.csv` (funnel bonus),
 `build/wg515-trigger/` (srcversion `47258C70…`).
+
+### 2026-07-10 — Phase D: wg_steal, the steering fix — first user-visible WIN
+
+**Question.** E11-C proved delivery blocks ~30–90 µs on verifiably-encrypted heads
+waiting for worker scheduling. Can a fix that attacks *that* — instead of the wakes —
+produce something a user sees?
+**Setup.** `wg_steal` implemented (srcversion `40814CD3…`): when the poll finds its head
+UNCRYPTED, it consumes up to `wg_steal` entries from the shared decrypt ring and
+decrypts them itself (MPMC `ptr_ring`, same ownership rules as the worker), then
+resumes delivery if the head unblocked. Four-condition A/B (`steal_20260710_1542.csv`)
++ targeted single-tunnel and in-flow probes.
+**Result.**
+- *Mechanism, crushed*: observed head-blocked wall time 9.50 s → **0.44 s per 30 s
+  window (−95%)** with `bsteal`; episodes 217k → 6.9k. 390–440k packets/window decrypted
+  by polls. Zero kernel warnings. (Caveat: under `both` the classifier under-observes —
+  gated wakes mean fewer wasted polls to open episodes — so off↔steal comparisons are
+  the clean ones.)
+- *CPU, neutral as predicted*: softirq flat (~1.24 CE), total within noise — the
+  migrated decrypt work is ~0.07 CE, invisible, consistent with E10 arithmetic.
+- *Probe p99, null — and expectedly so*: the unloaded latency peer rarely experiences
+  head-blocking (its ping-pongs ride alone in their queue); the blocked time we removed
+  lives in the *bulk* peers' queues. In-flow latency (probe sharing a saturated tunnel):
+  also null, drowned under ~1 ms of the bulk's own TCP queueing.
+- **Single-tunnel uncapped throughput — the win**: one tunnel = one 5-tuple = one RX
+  queue, the case `sdfn` cannot spread. Four shuffled reps per side:
+  `off` 4.078–4.182 Gb/s vs `steal` 4.267–4.445 Gb/s — **no overlap, median +4%**.
+  The mechanism reads clean: the blocked NAPI's pipeline bubbles are filled by the poll
+  decrypting in place.
+**Interpretation.** The steering premise pays exactly where the theory said parallelism
+can't help: the single-heavy-tunnel (site-to-site) regime. Modest (+3–5%) but real,
+mechanically explained, and CPU-neutral.
+**Decision.** Before claiming it in the report: (1) a steal soak (same gate as Phase C),
+(2) a `wg_steal` 1/2/4/8/16 sweep, (3) more single-tunnel reps with CPU capture.
+**Artifacts.** `steal_20260710_1542.csv`; smoke numbers in this entry;
+`measure_steal.sh`; module `build/wg515-trigger/` (`40814CD3…`).
 
 ## 6. Incidents and methodology fixes
 
