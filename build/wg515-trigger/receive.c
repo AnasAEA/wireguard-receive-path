@@ -567,9 +567,11 @@ next:
 	 * our head is already on a worker's bench, and the normal completion
 	 * wake delivers it. Softirq context: the chacha library falls back to
 	 * the generic implementation when SIMD is unavailable, so this is
-	 * correct (just possibly slower) in the worst case. Each pass makes
-	 * progress (delivers or exhausts budget/ring), so the goto is bounded
-	 * by the NAPI budget.
+	 * correct (just possibly slower) in the worst case. Each steal pass is
+	 * bounded by wg_steal and delivery remains bounded by the NAPI budget;
+	 * the goto requires a state change (head became deliverable), so every
+	 * iteration makes progress. NB the crypto time itself is not counted
+	 * as work_done — keep wg_steal small.
 	 */
 	if (wg_steal && work_done < budget) {
 		unsigned long pulled = 0;
