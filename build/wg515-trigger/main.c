@@ -82,6 +82,21 @@ module_param_array(wg_diag_stall_empty, ulong, NULL, 0644);
 module_param_array(wg_diag_stall_uncrypt, ulong, NULL, 0644);
 MODULE_PARM_DESC(wg_diag_stall_empty, "Blocked episodes, empty-queue class: n,total_ns,max_ns,le16us,le128us,le1ms,gt1ms");
 MODULE_PARM_DESC(wg_diag_stall_uncrypt, "Blocked episodes, UNCRYPTED-head class: n,total_ns,max_ns,le16us,le128us,le1ms,gt1ms");
+/* Work-stealing poll (wg_steal) — the steering fix, consumer-pull variant.
+ * When the RX poll finds its head UNCRYPTED (E11-C: it would otherwise wait
+ * ~30-90us on worker scheduling), it consumes up to wg_steal entries from the
+ * device decrypt ring and decrypts them itself instead of parking. 0 = off.
+ * Diag: pulled = packets decrypted by polls; unblocked = steal passes after
+ * which the head was deliverable; dryruns = head encrypted but ring empty
+ * (the head was already on a worker's bench — stealing can't help there).
+ */
+unsigned long wg_steal;
+module_param(wg_steal, ulong, 0644);
+MODULE_PARM_DESC(wg_steal, "Max packets the RX poll decrypts itself while its head is encrypted (0=off)");
+unsigned long wg_diag_steal_pulled, wg_diag_steal_unblocked, wg_diag_steal_dryruns;
+module_param(wg_diag_steal_pulled, ulong, 0644);
+module_param(wg_diag_steal_unblocked, ulong, 0644);
+module_param(wg_diag_steal_dryruns, ulong, 0644);
 
 static int __init mod_init(void)
 {

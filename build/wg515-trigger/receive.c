@@ -518,6 +518,7 @@ int wg_packet_rx_poll(struct napi_struct *napi, int budget)
 	 */
 	atomic_set(&peer->rx_ready, 0);
 
+deliver:
 	while ((skb = wg_prev_queue_peek(&peer->rx_queue)) != NULL &&
 	       (state = atomic_read_acquire(&PACKET_CB(skb)->state)) !=
 		       PACKET_STATE_UNCRYPTED) {
@@ -552,6 +553,57 @@ next:
 
 		if (++work_done >= budget)
 			break;
+	}
+
+	/* Work-stealing poll (wg_steal) — the steering fix, consumer-pull
+	 * variant. E11-C measured that delivery blocks ~30-90us on heads that
+	 * are verifiably encrypted, waiting for WORKER SCHEDULING, not for
+	 * crypto. The idle party during that wait is this very poll. So: while
+	 * our head is UNCRYPTED and we still have budget, consume entries from
+	 * the device decrypt ring and decrypt them HERE, exactly as
+	 * wg_packet_decrypt_worker would. ptr_ring_consume_bh is MPMC-safe
+	 * against the workers, and a consumed skb is exclusively ours, so the
+	 * ownership rules are identical to the worker's. If the ring is empty
+	 * our head is already on a worker's bench, and the normal completion
+	 * wake delivers it. Softirq context: the chacha library falls back to
+	 * the generic implementation when SIMD is unavailable, so this is
+	 * correct (just possibly slower) in the worst case. Each pass makes
+	 * progress (delivers or exhausts budget/ring), so the goto is bounded
+	 * by the NAPI budget.
+	 */
+	if (wg_steal && work_done < budget) {
+		unsigned long pulled = 0;
+
+		while (pulled < wg_steal) {
+			struct sk_buff *head = wg_prev_queue_peek(&peer->rx_queue);
+			struct sk_buff *job;
+
+			if (!head || atomic_read_acquire(&PACKET_CB(head)->state) !=
+					     PACKET_STATE_UNCRYPTED)
+				break;
+			job = ptr_ring_consume_bh(&peer->device->decrypt_queue.ring);
+			if (!job) {
+				if (wg_diag && !pulled)
+					wg_diag_steal_dryruns++;
+				break;
+			}
+			wg_queue_enqueue_per_peer_rx(job,
+				likely(decrypt_packet(job, PACKET_CB(job)->keypair)) ?
+					PACKET_STATE_CRYPTED : PACKET_STATE_DEAD);
+			pulled++;
+		}
+		if (pulled) {
+			struct sk_buff *head = wg_prev_queue_peek(&peer->rx_queue);
+
+			if (wg_diag)
+				wg_diag_steal_pulled += pulled;
+			if (head && atomic_read_acquire(&PACKET_CB(head)->state) !=
+					    PACKET_STATE_UNCRYPTED) {
+				if (wg_diag)
+					wg_diag_steal_unblocked++;
+				goto deliver;
+			}
+		}
 	}
 
 	/* E11 stall classifier (wg_diag): a poll that delivered anything ends

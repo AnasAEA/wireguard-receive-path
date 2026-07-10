@@ -207,6 +207,8 @@ extern unsigned long wg_diag_empty_missed, wg_diag_empty_nomiss;
 extern unsigned long wg_diag_uncrypt_missed, wg_diag_uncrypt_nomiss;
 extern unsigned long wg_diag_supp_cleared, wg_diag_supp_rearmed, wg_diag_supp_reset_race;
 extern unsigned long wg_diag_stall_empty[7], wg_diag_stall_uncrypt[7];
+extern unsigned long wg_steal;        /* max packets the poll decrypts itself while head-blocked (0=off) */
+extern unsigned long wg_diag_steal_pulled, wg_diag_steal_unblocked, wg_diag_steal_dryruns;
 
 /* Per-peer hrtimer callback (defined in receive.c): liveness backstop that
  * wakes the poll when the coalesce window elapses before K completions land.
