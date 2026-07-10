@@ -20,6 +20,7 @@ GEN=${3:-gen}; NIC=${4:-$(ip -br addr | awk '/192\.168\.1\.1\//{print $1; exit}'
 [ -n "$NIC" ] || { echo "FATAL: cannot find the experiment NIC (192.168.1.1)" >&2; exit 1; }
 # NB: the NIC name flips between instantiations (f0 vs f1) — never hardcode it.
 LOAD_MOD=${LOAD_MOD:-4}             # stage 1: moderate capped Gb/s
+STEAL=${STEAL:-0}                   # also soak the work-stealing poll (STEAL=8 for Phase D)
 KO="$HOME/wireguard_trigger.ko"
 TS=$(date +%Y%m%d_%H%M); CSV="$HOME/soak_$TS.csv"
 P=/sys/module/wireguard/parameters
@@ -39,6 +40,7 @@ bash "$HOME/setup_dut_peers.sh" "$N" >/dev/null
 pkill -f 'iperf3 -s' 2>/dev/null; sleep 1
 for i in $(seq 0 $((N-1))); do iperf3 -s -p $((5201+i)) -D; done
 echo 1 > $P/wg_supp; echo 1 > $P/wg_headwake     # the two-sided fix, ON for the whole soak
+echo "$STEAL" > $P/wg_steal                      # + the work-stealing poll if requested
 
 # establish all N handshakes BEFORE measuring — the module reload above reset
 # them, and the 2026-07-10 run counted 7/8 through stage 1 only because the
@@ -92,4 +94,4 @@ for stage in ("moderate", "linerate"):
     if collapse or hs_bad or max(dm) > 0: ok = False
 print("VERDICT:", "PASS - no stall, no collapse, handshakes held" if ok else "FAIL - inspect the log")
 PY
-echo "ARTIFACT $CSV  (srcversion $SRC)"
+echo "ARTIFACT $CSV  (srcversion $SRC, wg_steal=$STEAL)"
