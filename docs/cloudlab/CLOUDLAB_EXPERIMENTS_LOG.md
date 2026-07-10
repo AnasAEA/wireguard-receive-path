@@ -40,9 +40,14 @@ know *why* the fix does not improve CPU. It is not because the fix is broken —
 verifiably, and removes exactly what it targets. It is because the thing it removes is
 extremely cheap on this hardware.
 
-**The experimental campaign is closed (2026-07-10).** Remaining work: (1) confirm with
-Alain/André whether the paper's `gro_wq` combined-fix deliverable is still required;
-(2) the final write-up.
+**Reopened same day — Phase D implemented the steering fix.** `wg_steal` (the poll,
+blocked on an encrypted head, decrypts from the shared ring itself) crushes the
+mechanism (−95% blocked time, CPU-neutral) and delivers the **first user-visible win:
+single-tunnel throughput +3–5%** (no overlap across shuffled reps) — the one case
+`sdfn` cannot spread. Probe-p99 stays null, expectedly (the unloaded probe rarely
+head-blocks). Journal entry 2026-07-10. Gates before claiming it in the report: a
+steal soak, a `wg_steal` sweep, more single-tunnel reps with CPU capture. Then:
+(1) the `gro_wq` scope answer, (2) the final write-up.
 
 **Reader map.**
 - *2 minutes:* this section + the budget figure in Finding 5.
