@@ -8,7 +8,7 @@
 
 ---
 
-## 0. Où on en est — à lire en premier (10 juillet 2026)
+## 0. Où on en est — à lire en premier (15 juillet 2026)
 
 La campagne CloudLab a répondu à la question principale.
 
@@ -26,11 +26,10 @@ La campagne CloudLab a répondu à la question principale.
   en supprimant 100 % des polls gaspillés, le gain CPU attendu serait trop petit pour
   sortir de la variation naturelle entre deux runs. Le null n'est plus une déduction,
   c'est une mesure. Le fix supprime beaucoup d'événements, pas beaucoup de cycles.
-- **E11, maintenant classifié (E11-C), confirme la piste latence** : la livraison
-  attend ~30–90 µs sur des têtes *vérifiées chiffrées* — 150 à 300 000 épisodes par
-  fenêtre de 30 s, insensibles au délai de déchiffrement injecté : la tête attend
-  l'ordonnanceur, pas le crypto. L'idée **head-priority / steering du déchiffrement**
-  est transmise comme travail futur avec ses preuves (Résultat 6).
+- **E11, maintenant classifié (E11-C), a trouvé où passe vraiment le temps** : la
+  livraison attend ~30–90 µs sur des têtes *vérifiées chiffrées* — 150 à 300 000 épisodes
+  par fenêtre de 30 s, insensibles au délai de déchiffrement injecté : la tête attend
+  l'ordonnanceur, pas le crypto (Résultat 6).
 - **Le fix à deux côtés a passé son test d'endurance (Phase C)** : 30 minutes de charge
   soutenue en régime étalé (4,2 puis 9,57 Gb/s), plus 30 minutes dans le régime
   entonnoir saturé (le plus dur), zéro avertissement noyau, zéro effondrement,
@@ -41,9 +40,36 @@ parce qu'on sait *pourquoi* le fix n'améliore pas le CPU. Pas parce qu'il est c
 agit, les compteurs le prouvent), mais parce que ce qu'il supprime ne coûte presque rien
 sur cette machine.
 
-**La campagne expérimentale est close (10 juillet).** Reste à faire : (1) trancher avec
-Alain/André si le fix du papier (`gro_wq`) et la config combinée restent un livrable du
-31 juillet ; (2) la rédaction finale.
+**Et puis je suis allé chercher le gain là où E11-C disait qu'il était (Phase D).** Plutôt
+que de laisser le steering en travail futur, je l'ai implémenté : `wg_steal`, le poll
+bloqué sur une tête chiffrée déchiffre lui-même au lieu d'attendre un worker. Le mécanisme
+s'effondre comme prévu (temps bloqué **−95 %**), et c'est **le premier gain visible par un
+utilisateur** de toute la campagne, dans le seul régime que l'étalement `sdfn` ne peut pas
+aider : un tunnel unique. Les deux barrières de validation sont passées (15 juillet,
+Résultat 8) :
+
+- **Débit : +2 à 4 % autour du genou du réglage** — `wg_steal=4` : +4,15 %, p = 0,008 par
+  test de permutation exact, 5 répétitions mélangées par valeur. (Le premier test annonçait
+  « +3–5 % sans recouvrement » : c'était optimiste, les plages se recouvrent. Le genou est
+  à 4 ; à 1 le vol ne sert à rien, à 16 ce n'est pas mieux.)
+- **CPU : 3 à 5 % *moins cher*, pas neutre** — à chaque valeur du réglage, 5 fois sur 5.
+  Le chiffre honnête à retenir est celui-là : **efficacité +5,4 à +7,6 % de Gb/s par cœur
+  occupé, p = 0,008 à chaque valeur.** Le vol ne troque pas du CPU contre du débit : il
+  prend les deux.
+- **Pourquoi : le cœur softirq est cloué à 0,983 ± 0,003 CE sur les 30 runs** — un tunnel,
+  une file RX, un cœur saturé : *c'est ça*, le plafond des 4,2 Gb/s. Le vol ne le lève pas,
+  il arrête de gaspiller les cycles en dessous (l'économie tombe côté workers :
+  3,77 → 3,60 CE).
+- **Sûreté : le soak avec le vol activé : PASS** — 2×15 min (4,22 puis 9,57 Gb/s),
+  handshakes 8/8, zéro avertissement noyau. Il *n'a pas révélé de problème de fiabilité
+  dans les régimes testés* ; du crypto en softirq mérite quand même une étude de latence
+  d'ordonnancement avant d'être embarqué.
+
+L'arc de la campagne est donc complet : le fix côté réveil est réel mais trop bon marché
+pour se voir ; E11-C a localisé où le temps passe vraiment ; le fix de steering convertit
+ça en gain mesurable. Reste à faire : (1) trancher avec Alain/André si le fix du papier
+(`gro_wq`) et la config combinée restent un livrable du 31 juillet ; (2) la rédaction
+finale.
 
 ## 1. La question que je me posais
 
@@ -60,10 +86,12 @@ C'est : on sait précisément où ce gaspillage se loge dans le chemin de récep
 qu'il coûte, et pourquoi il reste invisible sur ce matériel.
 
 Et ça a changé la direction du projet. Le fix côté réveil évite des vérifications
-inutiles, mais il ne fait jamais finir le paquet de tête plus tôt. E11 suggère que la
-vraie piste pour la latence est ailleurs : la tête passe des dizaines de microsecondes à
-attendre *avant même d'être déchiffrée*. Ça pointe vers le steering du déchiffrement
-comme travail futur.
+inutiles, mais il ne fait jamais finir le paquet de tête plus tôt. E11 montrait que la
+vraie piste était ailleurs : la tête passe des dizaines de microsecondes à attendre
+*avant même d'être déchiffrée*. J'ai suivi cette piste jusqu'au bout — le steering du
+déchiffrement, implémenté sous le nom de `wg_steal`, est ce qui a fini par produire le
+seul gain visible de la campagne (Résultat 8). Avec une surprise à l'arrivée :
+l'utilisateur le récupère en débit et en CPU, pas en latence.
 
 ## 2. Le modèle mental : pourquoi WireGuard gaspille des polls
 
@@ -121,6 +149,8 @@ c'est le Résultat 6.)
 | **`wg_decrypt_delay_ns`** | Knob injectant une attente active par déchiffrement — émule un crypto plus lent, coût du poll inchangé. |
 | **épisode de blocage** | Du premier poll gaspillé après un poll productif au prochain poll productif sur la même NAPI : combien de temps la livraison est restée bloquée. |
 | **Phase A / Phase B / E10 / E11** | Campagne sous-saturation CPU+latence / balayage du délai de déchiffrement / comptabilité directe des coûts / mesure des blocages. |
+| **`wg_steal`** | Knob de la Phase D : quand le poll trouve sa tête chiffrée, il consomme jusqu'à N paquets de la file de déchiffrement partagée et les déchiffre lui-même au lieu d'attendre un worker (Résultat 8). |
+| **test de permutation exact** | Test statistique sans hypothèse de distribution : on énumère *toutes* les façons de répartir les mesures observées entre les deux groupes, et on regarde quelle fraction donne un écart aussi grand que celui mesuré. Avec 5+5 mesures il y a 252 répartitions, donc le plus petit p atteignable est 1/126 ≈ 0,008. |
 | **srcversion** | L'empreinte de build du module, écrite dans chaque ligne de CSV (`EA06EE82…` = le build à deux côtés composable). |
 | **bruit run-à-run** | La variation naturelle du CPU total entre deux répétitions identiques d'une même mesure (~±2 CE ici : ordonnanceur, C-states, dynamique TCP). Un effet plus petit que ce bruit est invisible — détail au Résultat 5. |
 
@@ -140,6 +170,9 @@ mesure et comment :
 | **Phase B** | Le fix devient-il utile quand le crypto ralentit ? | Résultat 4 : délai injecté par paquet (0→10 µs), off/both × 5 répétitions, même charge plafonnée. |
 | **E10** | Combien coûtent *vraiment* les polls gaspillés ? | Résultat 5 : chronométrage bpftrace des polls à vide + échantillonnage de cycles perf, en fenêtres séparées. |
 | **E11** | Combien de temps la tête bloque-t-elle la livraison ? | Résultat 6 : durée entre le premier poll raté et le prochain poll utile, par file NAPI, à chaque délai. |
+| **E11-C** | Cette attente, est-ce une tête chiffrée ou une file vide ? | Résultat 6 : un classifieur dans le module étiquette chaque épisode à la source (~20 lignes), avec des compteurs par classe et par tranche de durée — plus besoin de sonde externe. |
+| **Phase C** | Le fix tient-il 30 minutes sans casser ? | Résultat 7 : charge soutenue, `both` activé, 2 étages de 15 min, en surveillant débit, handshakes et journal noyau toutes les 15 s. |
+| **Phase D** | Peut-on convertir l'attente d'E11-C en gain réel ? | Résultat 8 : `wg_steal` (le poll bloqué déchiffre lui-même), puis A/B à 4 conditions, balayage mono-tunnel du réglage (5 répétitions par valeur, tests de permutation exacts) et soak avec le vol activé. |
 
 (E6 à E9 n'existent pas : la numérotation a sauté au fil des réorganisations du plan.
 E2–E5 forment ensemble le « modèle de coût » cité partout.)
@@ -413,10 +446,15 @@ tranche : ≤16 µs / 16–128 µs / 128 µs–1 ms / >1 ms). Deux campagnes —
 - **Contre la règle de décision** : l'excès récupérable classifié (moyenne moins le
   plancher de déchiffrement) fait **~30–80 µs typiques**, avec 2–10 % des épisodes entre
   128 µs et 1 ms. Au-dessus de la bande « pas la peine » ; la moyenne juste sous un
-  « 100 µs partout ». Verdict : **le steering reste du travail futur, mais avec des
-  preuves classées** — le stage transmet le classifieur, les chiffres et le prix borné ;
-  l'implémentation est le projet d'après. (Dispersion visible entre répétitions, n=3 :
-  un repreneur commencera par resserrer l'estimation.)
+  « 100 µs partout ». Verdict du moment : **le steering vaut le coup d'être conçu**, avec
+  des preuves classées — le classifieur, les chiffres et le prix borné. (Dispersion
+  visible entre répétitions, n=3 : l'estimation elle-même gagnerait à être resserrée.)
+
+> **Suite : le Résultat 8.** Ce résultat s'était fermé sur « travail futur » — et je l'ai
+> rouvert le jour même en implémentant le steering. Le prix borné ici, c'est ce que
+> `wg_steal` est allé chercher ; le Résultat 8 dit ce qu'il en a rapporté, avec une
+> torsion intéressante : le temps bloqué est bien réel, mais l'utilisateur l'encaisse en
+> débit et en CPU sur un cœur saturé, pas en latence de sonde.
 
 > **Ce que j'ai retenu.** Le fix côté réveil et la latence n'allaient jamais se
 > rencontrer — le fix optimise la *vérification*, pas la *disponibilité*. Le classifieur
@@ -447,6 +485,89 @@ répondant à la dose, et maintenant éprouvé dans le régime nominal comme dan
 > noyau, et on en a retiré la moitié — le soak est ce qui dit qu'on n'a pas retiré la
 > sécurité avec.
 
+### Résultat 8 — Le poll qui vole du travail : un vrai gain, et c'est d'abord un gain CPU
+
+Le Résultat 6 s'était fermé sur « c'est une piste, à quelqu'un d'autre de la creuser ».
+Je ne voulais pas m'arrêter là, alors je l'ai implémentée : `wg_steal`. L'idée tient en
+une phrase. Quand le poll trouve sa tête de file encore chiffrée, au lieu de repartir
+bredouille en espérant qu'un worker s'en occupe, **il va chercher du travail dans la file
+de déchiffrement partagée et déchiffre lui-même**, jusqu'à `wg_steal` paquets, puis
+reprend la livraison si la tête s'est débloquée. Le vol passe par `ptr_ring_consume_bh`,
+donc les règles de propriété sont exactement celles du worker : pas de paquet touché à
+deux endroits.
+
+Le premier test (10 juillet) était enthousiasmant : temps bloqué **−95 %**, et un débit
+mono-tunnel en hausse de 3–5 % sans recouvrement entre les deux séries. Mais 4
+répétitions par côté, ce n'est pas une preuve. J'ai donc refait la mesure proprement le
+15 juillet : `wg_steal` ∈ {0,1,2,4,8,16} × 5 répétitions en ordre mélangé, 20 s de trafic
+sans plafond dans **un seul tunnel**, avec le CPU capturé autour de chaque fenêtre exacte.
+Un seul tunnel, c'est un seul 5-uplet, donc une seule file RX : le seul régime que
+l'étalement `sdfn` du Résultat 1 ne peut pas aider — le régime site-à-site.
+
+Chaque valeur est comparée à `off` par un **test de permutation exact** (les 252
+répartitions possibles de 5+5 mesures ; le plus petit p atteignable est donc 0,008 — et
+comme je fais 5 comparaisons, je lis les p contre un seuil corrigé de 0,01).
+
+| `wg_steal` | Gb/s (moyenne) | vs off | p | CPU (CE) | vs off | p | Gb/s par cœur occupé |
+|---|---|---|---|---|---|---|---|
+| 0 | 4,193 | — | — | 4,788 | — | — | 0,876 |
+| 1 | 4,193 | +0,00 % | 1,000 | 4,540 | **−5,17 %** | **0,008** | 0,924 |
+| 2 | 4,266 | +1,74 % | 0,341 | 4,595 | **−4,03 %** | **0,008** | 0,928 |
+| 4 | **4,367** | **+4,15 %** | **0,008** | 4,634 | −3,20 % | 0,016 | **0,942** |
+| 8 | 4,311 | +2,81 % | 0,040 | 4,624 | **−3,42 %** | **0,008** | 0,932 |
+| 16 | 4,269 | +1,80 % | 0,151 | 4,616 | −3,59 % | 0,016 | 0,925 |
+
+Honnêtement lu, c'est **plus faible en débit et plus fort en CPU** que ce que le premier
+test annonçait :
+
+- **Le débit** : le gain survit, mais seulement au genou. `wg_steal=4` donne +4,15 %
+  (p = 0,008, survit à la correction) ; `=8` donne +2,81 % (p = 0,04, n'y survit pas).
+  Et cette fois les plages **se recouvrent** (off 4,14–4,24 vs steal=8 4,22–4,40). Donc
+  j'annonce « +2 à 4 % autour du genou », pas « +4 % sans recouvrement » : les 4 premières
+  répétitions avaient eu de la chance. Le genou est à 4, pas à 8 (le 8 était arbitraire).
+  À 1, voler ne débloque jamais la tête : zéro gain de débit. À 16, ce n'est pas mieux
+  qu'à 4.
+- **Le CPU** : le vol est **moins cher**, pas neutre — 3 à 5 % sous la référence, à
+  *chaque* valeur du knob, 5 fois sur 5 dans le même sens. Le vol n'achète pas du débit
+  avec du CPU : il prend les deux.
+- **L'efficacité** (Gb/s par cœur occupé, calculée run par run, donc insensible au
+  tremblement du débit) est le chiffre le plus robuste de tout le balayage :
+  **+5,4 % à +7,6 %, p = 0,008 à chacune des cinq valeurs**.
+
+**Et voilà le pourquoi, que le balayage m'a appris.** Le CPU softirq est cloué à
+**0,983 ± 0,003 CE sur les 30 runs** (écart-type : 0,3 %), quelle que soit la condition.
+Un tunnel unique entonne tout dans une seule file RX, dont le cœur softirq est saturé à
+exactement un cœur : **c'est ça, le plafond des 4,2 Gb/s**. Le vol ne peut donc pas
+ajouter du CPU softirq — il n'y a plus de place. Ce qu'il change, c'est *ce que ce cœur
+saturé fait de ses cycles* : déchiffrer sur place au lieu de re-demander à une tête qui
+n'est pas prête. Et l'économie apparaît entièrement **côté workers** : 3,77 → 3,60 CE,
+soit moins de passages de main, moins de réveils, moins d'allers-retours entre cœurs pour
+livrer les mêmes octets.
+
+```text
+Un tunnel, off :      [cœur softirq : 1,00 CE, saturé]  -> polls bloqués + passages de main
+                      [workers : 3,77 CE]                   4,19 Gb/s
+Un tunnel, steal=4 :  [cœur softirq : 1,00 CE, saturé]  -> déchiffre sur place
+                      [workers : 3,62 CE]                   4,37 Gb/s
+```
+
+**Le test d'endurance avec le vol activé : PASS** (`soak_20260715_0530.csv`, les trois
+knobs à la fois : `wg_supp` + `wg_headwake` + `wg_steal=8`). 15 minutes plafonnées à
+4,22 Gb/s stable, puis 15 minutes sans plafond à **9,57 Gb/s**, handshakes 8/8 en
+continu, **zéro** ligne rcu/stall/hung/BUG/WARNING — et zéro aussi sur les 30 runs du
+balayage. C'était la vraie question de sûreté : faire tourner du crypto à l'intérieur du
+softirq pendant une demi-heure, est-ce que ça tient ? Avec la prudence que je m'impose
+depuis le début : ce test **n'a pas révélé de problème de fiabilité dans les régimes
+testés**. Ce n'est pas une preuve que c'est bon pour la production ; du crypto en softirq
+mérite une étude de latence d'ordonnancement avant que qui que ce soit ne l'embarque.
+
+> **Ce que j'ai retenu.** Je cherchais un gain de débit et j'ai trouvé un gain CPU déguisé
+> en gain de débit. Le plafond n'a jamais été « la machine n'a plus de cycles » : c'était
+> « un cœur est saturé, et il passe une partie de ses cycles à poser une question dont la
+> réponse est encore non ». Le vol ne lève pas le plafond — il arrête de gaspiller les
+> cycles en dessous. C'est exactement la même leçon que le résultat négatif du Résultat 5,
+> vue de l'autre côté : depuis le début, ce projet parle d'où passent les cycles.
+
 ## 4. Chronologie
 
 | Date | Expérience | Ce qui a changé | Résultat | Statut |
@@ -467,6 +588,8 @@ répondant à la dose, et maintenant éprouvé dans le régime nominal comme dan
 | 09/07 | E11-C classifié (#8) | classifieur in-module par épisode | classe tête-chiffrée réelle : moyenne 44–171 µs | réglé |
 | 10/07 | E11-C repris, régime étalé garanti (#9) | autodétection de la carte | moyenne 35–94 µs ; la classe vide porte la queue ms | réglé |
 | 10/07 | Soak Phase C (#9) | `both` activé, 2×15 min + bonus entonnoir | **PASS** — 0 alerte noyau, 9,57 Gb/s | réglé |
+| 10/07 | **Phase D : `wg_steal`** (#9) | le poll vole et déchiffre lui-même | temps bloqué **−95 %** ; premier gain mono-tunnel visible | barrières le 15/07 |
+| 15/07 | **Barrières Phase D** (#10) | balayage mono-tunnel 0/1/2/4/8/16 ×5 ; soak avec vol | genou à 4 : **+4,15 % de débit** (p=0,008) ; CPU **−3 à −5 %** partout ; **efficacité +5,4 à +7,6 %** ; soak **PASS** | réglé (Résultat 8) |
 
 ## 5. Incidents et corrections de méthodo
 
@@ -497,8 +620,11 @@ ci-dessus se vérifie depuis son CSV :
 | Blocages E11 (R6) | `costacct_20260706_0613/stall_d*.txt` | `cloudlab/measure_cost_accounting.sh` | `fig_e11_stall_fr.png` |
 | E11-C classifié (R6) | `stallclass_20260709_0727.csv`, `stallclass_20260710_0332.csv` | `cloudlab/measure_stall_class.sh` | — |
 | Soak Phase C : PASS (R7) | `soak_20260710_0349.csv` (+ `_0238`, bonus entonnoir) | `cloudlab/measure_soak.sh` | — |
+| A/B `wg_steal` Phase D (R8) | `steal_20260710_1542.csv` | `cloudlab/measure_steal.sh` | — |
+| Barrière 1 — balayage mono-tunnel (R8) | `single_20260715_0516.csv` | `cloudlab/measure_single.sh`, `cloudlab/analyze_single.py` | — |
+| Barrière 2 — soak avec vol activé (R8) | `soak_20260715_0530.csv` | `cloudlab/measure_soak.sh` (`STEAL=8`) | — |
 | Diagrammes explicatifs (§2, R4, R6) | — (conceptuels) | `make_explainer_figs.py` | `fig_eoi_*_fr.png`, `fig_twosided_fr.png`, `fig_fix_vs_steering_fr.png`, `fig_decsweep_wasted_fr.png` |
-| Module + knobs | — | `build/wg515-trigger/` (srcversion `EA06EE82…`) | — |
+| Module + knobs | — | `build/wg515-trigger/` (srcversion `EA06EE82…` jusqu'au 06/07 ; `47258C70…` = + classifieur E11-C, 09/07 ; `40814CD3…` = + `wg_steal`, à partir du 10/07) | — |
 
 **Provenance E10/E11 cellule par cellule** — les répertoires bruts contiennent des
 fenêtres froides (voir incidents) ; voici lesquelles utiliser :
@@ -529,7 +655,8 @@ commande : paquets, build du module, tunnel, pairs, vérification des handshakes
 | 6 | 02/07 | c220g2-011118 / -011131 | premier run Phase B — données perdues (bail expiré) |
 | 7 | 06/07 | c220g2-011118 / -011119 | Phase B propre, E10, E11 |
 | 8 | 09/07 | c220g2-010631 / -010625 | E11-C classifié, premier run |
-| 9 | 10/07 | c220g2-010624 / -011126 | E11-C régime étalé garanti, soak Phase C (PASS) |
+| 9 | 10/07 | c220g2-010624 / -011126 | E11-C régime étalé garanti, soak Phase C (PASS), A/B `wg_steal` Phase D |
+| 10 | 15/07 | c220g2-011029 / -011022 | barrières Phase D : balayage mono-tunnel, soak avec vol (PASS) |
 
 (La #4 a vécu quelques heures sans produire de résultat.)
 
@@ -556,3 +683,13 @@ aujourd'hui.
    qu'il veut soulager. Clos le 23/06 ; gardé comme knob de reproduction.
 6. **Les chiffres mono-run du 25/06** (30,4 → 15,3 %) : remplacés par le balayage
    multi-N du 26/06 (27 → 14 % avec warm-up) — même conclusion, données plus propres.
+7. **« `wg_steal` : +3–5 % de débit mono-tunnel, sans recouvrement » (test du 10/07).**
+   Corrigé le 15/07 par le balayage à 5 répétitions par valeur : le gain est réel mais
+   plus modeste, **+2 à 4 % autour du genou** (+4,15 % à `wg_steal=4`, p = 0,008), et les
+   plages *se recouvrent*. Quatre répétitions par côté avaient eu de la chance. En
+   revanche le CPU, annoncé « neutre » le 10/07, est en fait **3 à 5 % moins cher** :
+   l'erreur allait dans les deux sens (R8).
+8. **« Le vol coûte du CPU » (médiane de 8,33 CE pour steal seul dans l'A/B du 10/07).**
+   C'était du bruit : le balayage, avec 5 répétitions par valeur et le CPU capturé autour
+   de la fenêtre exacte, montre le vol *moins cher* que la référence à chacune des cinq
+   valeurs du réglage (R8).
