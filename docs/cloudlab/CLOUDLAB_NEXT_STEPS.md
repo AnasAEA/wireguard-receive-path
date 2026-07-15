@@ -26,7 +26,18 @@
 
 ---
 
-# ▶ RUN NOW — instantiation #10 (2026-07-15): the two Phase D gates
+# ▶ DONE 2026-07-15 — instantiation #10: both Phase D gates PASSED
+
+> **Gate 1** (`single_20260715_0516.csv`): knee at `wg_steal=4` — throughput **+4.15%**
+> (p=0.008, exact permutation, n=5/value); CPU **3–5% cheaper at every knob value**
+> (the A/B's steal-alone 8.33 CE was noise); **efficiency +5.4–7.6% Gb/s per busy core**
+> (p=0.008 ∀). `softirq_ce` pegged at 0.983±0.003 across all 30 runs = the single-tunnel
+> ceiling. The smoke test's "+3–5%, no overlap" is corrected to "+2–4% around the knee".
+> **Gate 2** (`soak_20260715_0530.csv`): **PASS** with steal ON — 4.22 / 9.57 Gb/s,
+> handshakes 8/8, zero kernel warnings.
+> Details: EXPERIMENTS_LOG Finding 8. Remaining: the `gro_wq` scope answer + write-up.
+
+# ▶ was: RUN NOW — instantiation #10 (2026-07-15): the two Phase D gates
 
 Phase D (`wg_steal`, the work-stealing poll) produced the campaign's first user-visible win:
 single-tunnel uncapped throughput `off` 4.078–4.182 vs `steal` 4.267–4.445 Gb/s (4 reps/side,
