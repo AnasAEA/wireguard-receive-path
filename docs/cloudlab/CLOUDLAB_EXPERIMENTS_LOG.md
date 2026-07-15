@@ -10,7 +10,7 @@
 
 ---
 
-## 0. Current status — read this first (2026-07-10)
+## 0. Current status — read this first (2026-07-15)
 
 The CloudLab campaign answered the main question.
 
@@ -40,20 +40,36 @@ know *why* the fix does not improve CPU. It is not because the fix is broken —
 verifiably, and removes exactly what it targets. It is because the thing it removes is
 extremely cheap on this hardware.
 
-**Reopened same day — Phase D implemented the steering fix.** `wg_steal` (the poll,
-blocked on an encrypted head, decrypts from the shared ring itself) crushes the
-mechanism (−95% blocked time, CPU-neutral) and delivers the **first user-visible win:
-single-tunnel throughput +3–5%** (no overlap across shuffled reps) — the one case
-`sdfn` cannot spread. Probe-p99 stays null, expectedly (the unloaded probe rarely
-head-blocks). Journal entry 2026-07-10. Gates before claiming it in the report: a
-steal soak, a `wg_steal` sweep, more single-tunnel reps with CPU capture. Then:
-(1) the `gro_wq` scope answer, (2) the final write-up.
+**Reopened 2026-07-10 — Phase D implemented the steering fix, and it works.** `wg_steal`
+(the poll, blocked on an encrypted head, decrypts from the shared ring itself) crushes
+the mechanism (−95% blocked time) and delivers the campaign's **first user-visible win**,
+in the one regime `sdfn` cannot spread: a single tunnel. Both gates are now passed
+(2026-07-15, instantiation #10, Finding 8):
+
+- **Throughput: +2–4% around the knob's knee** — `wg_steal=4`: +4.15%, p = 0.008 by exact
+  permutation test, 5 shuffled reps per value. (The smoke test's "+3–5%, no overlap" was
+  optimistic: the ranges do overlap. The knee is at 4; `=1` does nothing, `=16` is no
+  better.)
+- **CPU: 3–5% *cheaper*, not neutral** — at every knob value, 5/5 same direction. The
+  honest headline is **efficiency: +5.4–7.6% Gb/s per busy core, p = 0.008 at every
+  value.** Stealing does not trade CPU for throughput; it buys both.
+- **Why: the softirq core is pegged at 0.983 ± 0.003 CE in all 30 runs** — one tunnel,
+  one RX queue, one saturated core: *that* is the 4.2 Gb/s ceiling. Stealing does not
+  raise it, it stops wasting the cycles under it (the savings land on the worker side:
+  3.77 → 3.60 CE).
+- **Safety: soak with stealing ON: PASS** — 2×15 min (4.22 then 9.57 Gb/s), handshakes
+  8/8, zero kernel warnings. It *did not reveal a reliability issue in the tested
+  regimes*; crypto-in-softirq still deserves a scheduler-latency study before shipping.
+
+So the campaign's arc is complete: the wake-side fix is real but too cheap to see; E11-C
+located where the time actually goes; the steering fix converts that into a measurable
+win. Remaining: (1) the `gro_wq` scope answer from Alain/André, (2) the final write-up.
 
 **Reader map.**
 - *2 minutes:* this section + the budget figure in Finding 5.
 - *The mechanism:* §2 (mental model) + Finding 2.
-- *The final verdict:* Findings 3–5.
-- *Future work:* Finding 6.
+- *The negative result and why it is solid:* Findings 3–5.
+- *The win:* Findings 6 (where the time goes) → 8 (the fix that takes it).
 
 ## 1. What I was trying to answer
 
@@ -328,11 +344,16 @@ buckets ≤16 µs / 16–128 µs / 128 µs–1 ms / >1 ms). Two campaigns — in
   population as inter-burst idle is now measured, not assumed.
 - **Against the decision rule**: classified recoverable excess (mean − 5–16 µs decrypt
   floor) is **~30–80 µs typical**, with 2–10% of episodes in 128 µs–1 ms. Above the
-  "not worth it" band; the mean sits just under a clean 100-µs-everywhere. Verdict:
-  **steering stays evidence-backed future work** — the internship hands over the
-  classifier, the numbers, and the bounded prize; implementing it is the next-stage
-  project. Rep-to-rep spread is visible (n=3 per delay), so a taker should start by
-  tightening the estimate with more reps.
+  "not worth it" band; the mean sits just under a clean 100-µs-everywhere. Verdict at
+  the time: **steering is worth designing** — the classifier, the numbers and the bounded
+  prize were meant as the handover. Rep-to-rep spread is visible (n=3 per delay), so the
+  estimate itself is worth tightening with more reps.
+
+> **Reopened by Finding 8 (2026-07-10/15).** This finding closed as "future work" and was
+> reopened the same day: the steering fix (`wg_steal`) got implemented and measured after
+> all. The prize bounded here is what it went after — see Finding 8 for what it actually
+> yielded, and note the twist: the blocked time is real, but the user collects it as
+> throughput and CPU on a pegged core, not as probe latency.
 
 > **What I learned.** The wake-side fix and latency were never going to meet — the fix
 > optimizes the *checking*, not the *readiness*. The classifier settled the last
@@ -361,6 +382,70 @@ dose-responsive, and now soak-tested in both the nominal and the worst-case regi
 > **What I learned.** The "wasteful" MISSED re-poll is the kernel's safety net, and we
 > removed half of it — the soak is what says we didn't remove the safety with it.
 
+### Finding 8 — The work-stealing poll: a real win, and it is a CPU win first
+
+Phase D's smoke test said single-tunnel throughput +3–5%. Gate 1 re-ran that properly:
+`wg_steal` ∈ {0,1,2,4,8,16} × 5 shuffled reps, 20 s of uncapped `iperf3 -P 4` through a
+single tunnel, CPU captured around each exact window (`measure_single.sh`,
+`single_20260715_0516.csv`, instantiation #10). Each value is tested against `off` with an
+**exact permutation test** (C(10,5) = 252 splits ⇒ the smallest reachable two-sided p is
+0.008; with 5 comparisons, read against a Bonferroni threshold of 0.01).
+
+| `wg_steal` | Gb/s (mean) | vs off | p | busy CE | vs off | p | Gb/s per busy core |
+|---|---|---|---|---|---|---|---|
+| 0 | 4.193 | — | — | 4.788 | — | — | 0.876 |
+| 1 | 4.193 | +0.00% | 1.000 | 4.540 | **−5.17%** | **0.008** | 0.924 |
+| 2 | 4.266 | +1.74% | 0.341 | 4.595 | **−4.03%** | **0.008** | 0.928 |
+| 4 | **4.367** | **+4.15%** | **0.008** | 4.634 | −3.20% | 0.016 | **0.942** |
+| 8 | 4.311 | +2.81% | 0.040 | 4.624 | **−3.42%** | **0.008** | 0.932 |
+| 16 | 4.269 | +1.80% | 0.151 | 4.616 | −3.59% | 0.016 | 0.925 |
+
+Read honestly, this is **weaker on throughput and stronger on CPU** than the smoke test
+suggested:
+
+- **Throughput**: the win survives, but only at the knee. `wg_steal=4` gives +4.15%
+  (p = 0.008, survives correction); `=8` gives +2.81% (p = 0.04, does not). Unlike the
+  smoke run, the ranges now **overlap** (off 4.14–4.24 vs steal=8 4.22–4.40) — so the
+  claim is "+2–4% around the knee", not "no overlap, +4%". `=1` is worthless for
+  throughput (one steal per poll never unblocks the head); `=16` is no better than `=4`.
+- **CPU**: stealing is **cheaper, not neutral** — every knob value lands 3–5% below
+  baseline, 5/5 in the same direction. That settles the review's open question: the
+  Phase D A/B's "steal-alone 8.33 CE" was noise. Stealing does not buy throughput with
+  CPU; it buys both.
+- **Efficiency** (Gb/s per busy core, the per-run ratio, immune to the throughput wobble)
+  is the most robust number here: **+5.4% to +7.6%, p = 0.008 at every single knob value**.
+
+**Why — and this is the part the sweep taught us.** `softirq_ce` is pinned at
+**0.983 ± 0.003 CE across all 30 runs** (sd = 0.3%), whatever the condition. One tunnel
+funnels to one RX queue whose softirq core is saturated at exactly one core: *that* is the
+4.2 Gb/s ceiling. So stealing cannot add softirq CPU — there is none to add. It changes
+what the pegged core does with its cycles (decrypting in place instead of re-polling a
+head that is not ready), and the savings show up entirely on the **worker side**:
+system-minus-softirq drops 3.77 → ~3.60 CE. Fewer handoffs, fewer wakeups, less
+cross-core ping-pong for the same delivered bytes.
+
+```text
+Single tunnel, off:     [softirq core: 1.00 CE, pegged]  -> blocked polls + handoffs
+                        [workers: 3.77 CE]                   4.19 Gb/s
+Single tunnel, steal=4: [softirq core: 1.00 CE, pegged]  -> decrypt in place
+                        [workers: 3.62 CE]                   4.37 Gb/s
+```
+
+**Gate 2 — the safety soak with stealing ON: PASS** (`soak_20260715_0530.csv`,
+`wg_supp`+`wg_headwake`+`wg_steal=8`, srcversion `40814CD3…`). 15 min capped at a steady
+4.22 Gb/s, then 15 min uncapped at **9.57 Gb/s**, handshakes 8/8 throughout, **zero**
+rcu/stall/hung/BUG/WARNING lines — and zero across the sweep's 30 runs too. The medians
+match Phase C's to the cell because both stages are ceiling-bound (stage 1 capped at
+4 Gb/s, stage 2 at 10GbE line rate); the file is not a duplicate. Stated with the
+discipline the campaign has used throughout: this **did not reveal a reliability issue in
+the tested regimes** — it is not a proof of production-safety, and running crypto inside
+softirq deserves a scheduler-latency study before anyone ships it.
+
+> **What I learned.** I went looking for a throughput win and found a CPU win wearing a
+> throughput costume. The ceiling was never "the machine is out of cycles" — it was "one
+> core is pegged, and it is spending some of its cycles asking a question whose answer is
+> still no". Stealing does not raise the ceiling; it stops wasting the cycles under it.
+
 ## 4. Timeline of experiments
 
 | Date | Experiment | What changed | Result | Status |
@@ -386,6 +471,7 @@ dose-responsive, and now soak-tested in both the nominal and the worst-case regi
 | 07-10 | E11-C rerun, spread-guaranteed (#9) | NIC autodetection | UNCRYPT mean 35–94 µs; empty class holds the ms tail | settled |
 | 07-10 | Phase C soak (#9) | `both` ON, 2×15 min + funnel bonus run | **PASS** — 0 dmesg hits, no collapse, 9.57 Gb/s line rate | settled |
 | 07-10 | **Phase D: wg_steal** (#9) | work-stealing poll implemented + A/B | blocked time **−95%**; CPU neutral; probe p99 null; **single-tunnel +3–5%** | needs soak + sweep |
+| 07-15 | **Phase D gates** (#10) | single-tunnel `wg_steal` sweep 0/1/2/4/8/16 ×5; soak with steal ON | knee at 4: **+4.15% Gb/s** (p=0.008); CPU **−3–5%** at every value; **efficiency +5.4–7.6%** (p=0.008 ∀); soak **PASS** | Finding 8 |
 
 ## 5. Journal — the decisions, entry by entry
 
@@ -566,6 +652,39 @@ mechanically explained, and CPU-neutral.
 **Artifacts.** `steal_20260710_1542.csv`; smoke numbers in this entry;
 `measure_steal.sh`; module `build/wg515-trigger/` (`40814CD3…`).
 
+### 2026-07-15 — The Phase D gates: the win holds, but it is not the win I announced
+
+**Question.** Three things stood between the smoke test and a claim in the report: is the
++4% real with proper reps and statistics, where is the knob's knee (8 was arbitrary), and
+does stealing cost CPU (the A/B's steal-alone median of 8.33 CE was unexplained)?
+**Setup.** Instantiation #10 (dut c220g2-011029). `measure_single.sh`: `wg_steal` ∈
+{0,1,2,4,8,16} × 5 shuffled reps × 20 s uncapped single-tunnel, CPU snapshotted around
+each exact window. Then `measure_soak.sh` with `STEAL=8` for the safety gate.
+**Result.** Finding 8 has the table. Three corrections to the 07-10 entry:
+- The throughput claim **shrinks**: +4.15% at `wg_steal=4` (p=0.008, exact permutation)
+  and +2.81% at 8 (p=0.04), with **overlapping ranges** — the smoke test's "no overlap,
+  +3–5%" was 4 reps getting lucky. The knee is at 4, not 8.
+- The CPU claim **inverts, in our favour**: not neutral — 3–5% *cheaper* at every knob
+  value. The 8.33 CE was noise. Efficiency (+5.4–7.6% Gb/s per busy core, p=0.008 at all
+  five values) is by far the most robust number in the sweep.
+- The **mechanism finally reads clean**: `softirq_ce` = 0.983 ± 0.003 in all 30 runs. The
+  bottleneck core is pegged at one core no matter what; stealing doesn't add capacity, it
+  spends the pegged core's cycles on decrypt instead of on re-polls that answer "not yet",
+  and the worker side drops 3.77 → 3.60 CE.
+- Soak with steal ON: **PASS** (4.22 / 9.57 Gb/s, 8/8 handshakes, zero warnings).
+**Interpretation.** The honest framing for the report is efficiency-first: *the
+work-stealing poll delivers the same bytes for 3–5% less CPU, and in the single-tunnel
+regime that converts to +2–4% throughput because the receive path's own core is the
+ceiling.* Which is, pleasingly, the same lesson as the negative result — this campaign has
+been about where cycles go from the start.
+**Methodology note.** I first pooled all `steal>0` rows into one group and got a
+meaningless p=0.105: pooling knob values with different means inflates the null's variance
+and makes the test conservative (the bootstrap CI on the same pooling said +0.8..+3.5%,
+contradicting it — that disagreement is what exposed the error). Per-value exact
+permutation tests are the right instrument; `analyze_single.py` documents this.
+**Artifacts.** `single_20260715_0516.csv`, `soak_20260715_0530.csv`;
+`measure_single.sh`, `analyze_single.py`.
+
 ## 6. Incidents and methodology fixes
 
 | Date | Problem | Effect | Fix | Lesson |
@@ -594,7 +713,10 @@ mechanically explained, and CPU-neutral.
 | Explainer diagrams (§2, Finding 6) | — (conceptual) | `scripts/make_explainer_figs.py` | `fig_eoi_pipeline_en.png`, `fig_eoi_timeline_en.png`, `fig_twosided_en.png`, `fig_fix_vs_steering_en.png` |
 | E11-C classified stalls (Finding 6) | `stallclass_20260709_0727.csv`, `stallclass_20260710_0332.csv` | `measure_stall_class.sh` | — |
 | Phase C soak PASS (Finding 7) | `soak_20260710_0349.csv` (+ `_0238` funnel bonus) | `measure_soak.sh` | — |
-| Module + knobs | — | `build/wg515-trigger/` (srcversion `EA06EE82…` campaigns ≤07-06; `47258C70…` = + E11-C classifier, 07-09 on) | — |
+| Phase D wg_steal A/B (Finding 8) | `steal_20260710_1542.csv` | `measure_steal.sh` | — |
+| Phase D gate 1 — single-tunnel sweep (Finding 8) | `single_20260715_0516.csv` | `measure_single.sh`, `analyze_single.py` | — |
+| Phase D gate 2 — soak with steal ON (Finding 8) | `soak_20260715_0530.csv` | `measure_soak.sh` (`STEAL=8`) | — |
+| Module + knobs | — | `build/wg515-trigger/` (srcversion `EA06EE82…` campaigns ≤07-06; `47258C70…` = + E11-C classifier, 07-09; `40814CD3…` = + `wg_steal`, 07-10 on) | — |
 
 **E10/E11 per-cell provenance** (the raw dirs contain cold windows — use these):
 
@@ -625,7 +747,8 @@ peers, handshake check).
 | 6 | 07-02 | c220g2-011118 / -011131 | `enp6s0f0` | Phase B first run — data lost to lease expiry |
 | 7 | 07-06 | c220g2-011118 / -011119 | `enp6s0f0` | Phase B (clean), E10, E11 |
 | 8 | 07-09 | c220g2-010631 / -010625 | (unverified) | E11-C classified stalls, first run |
-| 9 | 07-10 | c220g2-010624 / -011126 | `enp6s0f1` | E11-C spread-guaranteed rerun, Phase C soak (PASS) |
+| 9 | 07-10 | c220g2-010624 / -011126 | `enp6s0f1` | E11-C spread-guaranteed rerun, Phase C soak (PASS), Phase D wg_steal A/B |
+| 10 | 07-15 | c220g2-011029 / -011022 | `enp6s0f0` | Phase D gates: single-tunnel sweep, soak with steal ON (PASS) |
 
 (#4 was a short-lived instantiation with no experiment output. Node IDs, public keys
 and per-instantiation gotchas: `CLOUDLAB_EXPERIMENTS_LOG_RAW.md`, "Environment of
