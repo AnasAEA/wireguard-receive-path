@@ -3,14 +3,19 @@
 > Hands-on walkthrough for the live testbed. Copy blocks from here.
 > Recipe: `CLOUDLAB_EXPERIMENTS_PLAN.md`. Results: `CLOUDLAB_EXPERIMENTS_LOG.md`.
 
-**Live nodes (instantiation #6, re-instantiated 2026-07-02):**
+**Live nodes (instantiation #10, re-instantiated 2026-07-15):**
 
 | Role | Node | SSH |
 |------|------|-----|
-| `dut` (instrumented receiver) | c220g2-011118 (Wisc) | `ssh anasait@c220g2-011118.wisc.cloudlab.us` |
-| `gen` (load generator) | c220g2-011131 (Wisc) | `ssh anasait@c220g2-011131.wisc.cloudlab.us` |
+| `dut` (instrumented receiver) | c220g2-011029 (Wisc) | `ssh anasait@c220g2-011029.wisc.cloudlab.us` |
+| `gen` (load generator) | c220g2-011022 (Wisc) | `ssh anasait@c220g2-011022.wisc.cloudlab.us` |
 
-> **Experiment 10G NIC is now `enp6s0f0`** (was `enp6s0f1` in instantiation #1), already
+> Bootstrapped 2026-07-15: handshakes=8, module srcversion `40814CD3CA80D0908BF87D3`
+> (the wg_steal build), experiment NIC `enp6s0f0` this time. **Never hardcode the NIC** —
+> it flips f0/f1 between instantiations; every current harness autodetects it from
+> `192.168.1.1`.
+
+> **Experiment 10G NIC** is `enp6s0f0` or `enp6s0f1` depending on the instantiation, already
 > up with dut `192.168.1.1` / gen `192.168.1.2`. Node-to-node SSH works only as **root**
 > (`sudo ssh gen`). A fresh instantiation is a blank UBUNTU22 image: re-bootstrap with
 > `scripts/cloudlab/bootstrap_testbed.sh` (installs iperf3/wireguard-tools/linux-source,
@@ -21,7 +26,48 @@
 
 ---
 
-# ▶ RUN NOW — three experiments × peer-count sweep (Alain 2026-06-25)
+# ▶ RUN NOW — instantiation #10 (2026-07-15): the two Phase D gates
+
+Phase D (`wg_steal`, the work-stealing poll) produced the campaign's first user-visible win:
+single-tunnel uncapped throughput `off` 4.078–4.182 vs `steal` 4.267–4.445 Gb/s (4 reps/side,
+no overlap) — the regime the NIC's `sdfn` spread cannot help, because one tunnel is one
+5-tuple is one RX queue. Two gates stand between that and claiming it in the report.
+
+```bash
+# 0) bootstrap — DONE for #10 (handshakes=8, srcversion 40814CD3CA80D0908BF87D3)
+DUT=anasait@c220g2-011029.wisc.cloudlab.us GEN=anasait@c220g2-011022.wisc.cloudlab.us \
+  bash scripts/cloudlab/bootstrap_testbed.sh 8
+
+# 1) GATE 1 — single-tunnel wg_steal sweep (~14 min), ON DUT.
+#    Turns the +4% anecdote into an auditable interval, locates the knob's knee (8 was
+#    arbitrary), and settles the review's CPU question (steal-alone median 8.33 CE: noise
+#    or real cost?) with n=5 per value. Shuffled order, CPU CE x3 around the exact window.
+ssh anasait@c220g2-011029.wisc.cloudlab.us
+sudo -v && nohup sudo bash ~/measure_single.sh > ~/single_run.log 2>&1 &
+tail -f ~/single_run.log          # one line per run: wg_steal / rep / Gb/s / rtx / CE
+
+# 2) GATE 2 — full-stack soak with stealing ON (~32 min), ON DUT, after gate 1.
+#    The safety argument for "crypto inside softirq for 30 minutes": 2x15 min stages
+#    (capped, then uncapped) with wg_supp+wg_headwake+wg_steal=8 all on.
+sudo -v && STEAL=8 nohup sudo bash ~/measure_soak.sh 8 > ~/soak_steal_run.log 2>&1 &
+tail -f ~/soak_steal_run.log      # verdict line at the end: PASS / FAIL
+
+# 3) fetch BOTH immediately (lesson from instantiation #6: the lease dies with the data),
+#    from the Mac:
+scp "anasait@c220g2-011029.wisc.cloudlab.us:~/single_*.csv" \
+    "anasait@c220g2-011029.wisc.cloudlab.us:~/soak_*.csv" data/cloudlab/
+```
+
+If the sweep confirms the separation and the soak says PASS, the report's claim becomes
+defensible as written: *the wake-side fix removes wasted polls but is too cheap to move
+user-visible metrics; E11-C revealed the head-blocked scheduling budget; the work-stealing
+poll cuts blocked time ~95% and lifts single-tunnel throughput ~3–5% in the regime where
+NIC flow spreading cannot help.* Phrase the soak as "did not reveal a reliability issue in
+the tested regimes" — not "production-safe".
+
+---
+
+# ▶ DONE (2026-06-26) — three experiments × peer-count sweep (Alain 2026-06-25)
 
 All on `dut`. Module `~/wireguard_trigger.ko` (srcversion `EA06EE82…`) has the two-sided
 fix composable (`wg_supp` + `wg_headwake`) and the decrypt-cost knob (`wg_decrypt_delay_ns`).
@@ -54,7 +100,7 @@ for N in 8 16 32 64; do sudo bash ~/measure_taillat.sh "$N" 2000 20; done
 
 ---
 
-# ▶ RUN NEXT — Phase B decrypt-cost sweep (rewritten script, 2026-07-02)
+# ▶ DONE (2026-07-06) — Phase B decrypt-cost sweep (rewritten script, 2026-07-02)
 
 `measure_decrypt_sweep.sh` now implements `CLOUDLAB_PLAN_phase2.md` Phase B properly:
 capped bulk load on peers 1..N-1 (default 2 Gb/s total, below the decrypt knee), sockperf
