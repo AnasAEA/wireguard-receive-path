@@ -40,56 +40,92 @@ Decision rules are pre-declared in `analyze_confirm.py`'s docstring — read the
 looking at results, not after.
 
 ```bash
-# 0) bootstrap the fresh instantiation (then update the Live-nodes table above)
+# 0) bootstrap the fresh instantiation (then update the Live-nodes table above),
+#    and stamp the harness provenance on the DUT (read into every .meta sidecar):
 DUT=anasait@<dut-node>.wisc.cloudlab.us GEN=anasait@<gen-node>.wisc.cloudlab.us \
   bash scripts/cloudlab/bootstrap_testbed.sh 8
+git rev-parse HEAD | ssh anasait@<dut-node>.wisc.cloudlab.us 'cat > ~/HARNESS_GITREV'
 
-# 1) GATE A — paired replication, uncapped single tunnel (~35 min), ON DUT.
+# 1) GATE A — paired replication, uncapped single tunnel (~40 min), ON DUT.
 #    12 blocks x {off, both, steal4, bsteal4}, order re-shuffled inside each block,
-#    30 s runs, warm-up per block. WGDIAG=0 default = exact parity with the headline
-#    sweep (which ran wg_diag off). Primary: steal4-off on gbps and total_busy_ce.
+#    30 s runs, identical warm-up AFTER each condition is applied, knob readbacks
+#    verified per run. WGDIAG=0 default = exact parity with the headline sweep
+#    (which ran wg_diag off). Primary: steal4-off on gbps and total_busy_ce.
+#    The harness fails closed: any knob mismatch, dead tunnel, or measurement
+#    failure aborts and preserves the partial artifacts.
 ssh anasait@<dut-node>.wisc.cloudlab.us
-sudo -v && nohup sudo bash ~/measure_confirm.sh > ~/confirm_run.log 2>&1 &
-tail -f ~/confirm_run.log         # one line per run: blk / cond / Gb/s / CE / dmesg
+sudo -v
+nohup sudo -n bash ~/measure_confirm.sh > ~/confirm_run.log 2>&1 &
+tail -f ~/confirm_run.log         # one line per run: blk / pos / cond / Gb/s / CE
 
-# 2) GATE B — matched-load CPU + same-tunnel latency (~42 min), ON DUT, after gate A.
-#    Bulk capped at 3.8 Gb/s (below the ~4.2 off ceiling, so every condition can hold
-#    the same load) + sockperf UDP ping-pong at 2000 msg/s over the SAME tunnel
-#    (ns_c1 -> 10.0.0.1: same outer 5-tuple, same RX queue, same NAPI). 8 blocks x
-#    4 conditions x 60 s. Primary: steal4-off on total_busy_ce at matched load;
-#    p99/p99.9 is exploratory. wg_diag=1 here (measure_steal.sh methodology): also
-#    yields the classifier + steal counters for off/steal4.
-sudo -v && nohup sudo bash ~/measure_fixedload.sh > ~/fixedload_run.log 2>&1 &
+# 2) GATE B — matched-load CPU + same-tunnel latency (~48 min), ON DUT, after gate A
+#    (a shared lock refuses to run both at once). Bulk capped at 3.8 Gb/s (below the
+#    ~4.2 off ceiling, so every condition can hold the same load) + sockperf UDP
+#    ping-pong at 2000 msg/s, 64 B payload, over the SAME tunnel (ns_c1 -> 10.0.0.1:
+#    same outer 5-tuple, same RX queue, same NAPI). 8 blocks x 4 conditions x 60 s.
+#    Load for the matched-load claim is measured over the exact T0-T1 CPU window
+#    from wg0 rx_bytes; iperf JSON is secondary evidence. Primary: steal4-off on
+#    total_busy_ce; latency primary p99 (half-RTT), the rest exploratory. wg_diag=1
+#    (measure_steal.sh methodology): classifier + steal counters for off/steal4.
+sudo -v
+nohup sudo -n bash ~/measure_fixedload.sh > ~/fixedload_run.log 2>&1 &
 tail -f ~/fixedload_run.log
 
-# 3) fetch BOTH immediately (the lease dies with the data), from the Mac.
-#    The .percore sidecars ride along with the wildcard:
+# 3) fetch EVERYTHING immediately (the lease dies with the data), from the Mac:
+#    ~/confirm_<TS>.csv + .meta/.percore/.dmesg sidecars, same for fixedload, the
+#    raw dirs (iperf JSON + raw sockperf per run), and the run logs.
 scp "anasait@<dut-node>.wisc.cloudlab.us:~/confirm_*.csv*" \
-    "anasait@<dut-node>.wisc.cloudlab.us:~/fixedload_*.csv*" data/cloudlab/
+    "anasait@<dut-node>.wisc.cloudlab.us:~/fixedload_*.csv*" \
+    "anasait@<dut-node>.wisc.cloudlab.us:~/*_run.log" data/cloudlab/
+scp -r "anasait@<dut-node>.wisc.cloudlab.us:~/confirm_*_raw" \
+       "anasait@<dut-node>.wisc.cloudlab.us:~/fixedload_*_raw" data/cloudlab/
 
-# 4) commit the raw data FIRST, then analyze with the committed script:
-python3 scripts/cloudlab/analyze_confirm.py data/cloudlab/confirm_<TS>.csv
-python3 scripts/cloudlab/analyze_confirm.py data/cloudlab/fixedload_<TS>.csv
+# 4) commit the raw data FIRST, then analyze with the committed script.
+#    Exit status: 0 = valid, all gates passed; 1 = INVALID artifact (no inference
+#    is printed — do not hand-fix the CSV, diagnose the run); 2 = artifact valid
+#    but a validity gate voided some inference (VOID lines say which and why).
+#    Save the analysis output next to the data (it is part of the record):
+python3 scripts/cloudlab/analyze_confirm.py data/cloudlab/confirm_<TS>.csv \
+  | tee data/cloudlab/confirm_<TS>.analysis.txt
+python3 scripts/cloudlab/analyze_confirm.py data/cloudlab/fixedload_<TS>.csv \
+  | tee data/cloudlab/fixedload_<TS>.analysis.txt
 
 # 5) OPTIONAL, only if the lease still lives — 2 profiling windows to turn the
 #    "worker CE drops" inference (system−softirq is not isolated workers) into a
 #    direct observation: cycles should move from wg_packet_decrypt_worker/kworker
-#    into wg_packet_rx_poll. ON DUT, per condition:
+#    into wg_packet_rx_poll. Supporting evidence only — it does not replace the
+#    primary CPU measurement. ON DUT; both windows use the SAME capped 3.8G load:
+command -v perf >/dev/null || sudo apt-get install -y linux-tools-common "linux-tools-$(uname -r)"
 P=/sys/module/wireguard/parameters
-sudo sh -c "echo 0 > $P/wg_steal"   # 'off' (then repeat below with: echo 4 > .../wg_steal)
-sudo ssh gen "ip netns exec ns_c1 iperf3 -c 10.0.0.1 -p 5202 -P 4 -t 40 >/dev/null 2>&1" &
-sleep 5 && sudo perf record -a -F 499 -o ~/perf_steal$(cat $P/wg_steal).data -- sleep 25
-sudo perf report -i ~/perf_steal$(cat $P/wg_steal).data --stdio --sort symbol \
-  | grep -E 'wg_|chacha|poly1305' | head -25
+for C in 0 4; do   # off, then steal4
+  sudo sh -c "for k in wg_supp wg_headwake wg_trig_k wg_decrypt_delay_ns wg_diag; do echo 0 > $P/\$k; done; echo $C > $P/wg_steal"
+  grep -H . $P/wg_steal $P/wg_supp $P/wg_headwake     # readback, keep in the log
+  RX0=$(cat /sys/class/net/wg0/statistics/rx_bytes)
+  sudo ssh gen "ip netns exec ns_c1 iperf3 -c 10.0.0.1 -p 5202 -P 4 -b 950M -t 40 >/dev/null 2>&1" &
+  LPID=$!; sleep 5
+  sudo perf record -a -F 499 -o ~/perf_steal$C.data -- sleep 25
+  wait $LPID
+  RX1=$(cat /sys/class/net/wg0/statistics/rx_bytes)
+  echo "steal=$C delivered over the 40s load: $(awk -v a=$RX0 -v b=$RX1 'BEGIN{printf "%.2f", (b-a)*8/40/1e9}') Gb/s"
+  sudo perf report -i ~/perf_steal$C.data --stdio --sort symbol > ~/perf_steal$C.report.txt
+  grep -E 'wg_|chacha|poly1305' ~/perf_steal$C.report.txt | head -25
+done
+# fetch ~/perf_steal{0,4}.report.txt with the other artifacts
 ```
 
-**Interpretation grid (declared now).** `steal4` reproduces both primaries → the headline
-is frozen as written. `bsteal4 > steal4` (p<0.05) → claim a cumulative full-stack effect.
-`bsteal4 ≈ steal4` → the wake fixes clean the mechanism but add no user-visible
-performance — honest and expected, matches Phase A/E10. `bsteal4 < steal4` → report as an
-interaction (suppressed polls are lost steal opportunities), not as a broken fix. Latency
-null → stays a null in the report; the CPU result stands on its own. A significant
-`both-off` on gbps/CPU would contradict Phase A and needs a rerun before being believed.
+**Interpretation grid (declared now).** `steal4` reproduces both co-primaries → the
+headline is frozen as written. `bsteal4` favorable vs `steal4` (p<0.05) → claim a
+cumulative full-stack effect. `bsteal4-steal4` small / p large → report "**no incremental
+effect detected** from the wake fixes on top of stealing" — NOT "redundant" (no
+equivalence margin was predeclared). `bsteal4` unfavorable vs `steal4` (p<0.05) → report
+as an interaction (suppressed polls may be lost steal opportunities), not as a broken
+fix; the analyzer's factorial interaction contrast quantifies it. An unexpected
+significant `both-off` on gbps/CPU → inspect load, knob readbacks, ordering/carryover
+and the raw artifacts first; replicate independently before believing it; if it
+reproduces, retain it as a regime-specific finding (the Phase A null was measured in the
+multi-peer regime, not this one). Latency null → stays a null in the report; the CPU
+result stands on its own. p99.9 counts only where the analyzer's loss/support gates let
+it. No outcome here proves production safety.
 
 ---
 
