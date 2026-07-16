@@ -23,6 +23,10 @@
 # iperf sum_received over its own 30 s test remains the primary throughput).
 # dmesg is a true per-run delta, with matching lines archived in $CSV.dmesg.
 #
+# PROVENANCE GUARD (second audit §9): refuses to run without a clean-tree
+# ~/HARNESS_GITREV stamp (NEXT_STEPS step 0). BLOCKS != 12 renames artifacts
+# to confirm_smoke_* so a shortened smoke can never pass as a final artifact.
+#
 # Artifacts: $CSV (rows), $CSV.meta (provenance), $CSV.percore (per-core CE
 # with join keys), $CSV.dmesg (archived warning lines), ${CSV%.csv}_raw/
 # (raw iperf JSON per run).
@@ -38,9 +42,10 @@ NIC=${4:-$(ip -br addr | awk '/192\.168\.1\.1\//{print $1; exit}')}
 WGDIAG=${WGDIAG:-0}
 CONDS=(off both steal4 bsteal4)
 KO="$HOME/wireguard_trigger.ko"
+NAME=confirm; [ "$BLOCKS" -eq 12 ] || NAME=confirm_smoke    # shortened run = smoke artifact
 TS=$(date +%Y%m%d_%H%M%S)
-CSV="$HOME/confirm_$TS.csv"; PCF="$CSV.percore"; META="$CSV.meta"; DMESGF="$CSV.dmesg"
-RAW="$HOME/confirm_${TS}_raw"
+CSV="$HOME/${NAME}_$TS.csv"; PCF="$CSV.percore"; META="$CSV.meta"; DMESGF="$CSV.dmesg"
+RAW="$HOME/${NAME}_${TS}_raw"
 for f in "$CSV" "$PCF" "$META" "$DMESGF" "$RAW"; do
   if [ -e "$f" ]; then echo "FATAL: refusing to overwrite existing artifact $f" >&2; exit 1; fi
 done
@@ -53,14 +58,20 @@ BPID=""
 fatal(){ echo "FATAL: $*" >&2; exit 1; }
 
 cleanup(){ local p
+  # scoped to THIS campaign's flows (namespace/dest/port), not host-wide names
   if [ -n "$BPID" ]; then kill "$BPID" 2>/dev/null || true; wait "$BPID" 2>/dev/null || true; fi
-  ssh -n -o StrictHostKeyChecking=no "$GEN" "pkill -f 'iperf3 -c'" 2>/dev/null || true
+  ssh -n -o StrictHostKeyChecking=no "$GEN" \
+    "pkill -f 'iperf3 -c 10.0.0.1 -p 5202'" 2>/dev/null || true
   for p in wg_supp wg_headwake wg_trig_k wg_decrypt_delay_ns wg_diag wg_steal; do
     echo 0 > $P/$p 2>/dev/null || true; done
   ethtool -N "$NIC" rx-flow-hash udp4 sd >/dev/null 2>&1 || true
-  pkill -f 'iperf3 -s' 2>/dev/null || true
+  pkill -f 'iperf3 -s -p 520' 2>/dev/null || true
   echo "cleanup done — partial artifacts preserved under $CSV* and $RAW/" >&2; }
 trap cleanup EXIT; trap 'exit 130' INT; trap 'exit 143' TERM
+
+GITREV=$(cat "$HOME/HARNESS_GITREV" 2>/dev/null || true)
+[ -n "$GITREV" ] || fatal "missing ~/HARNESS_GITREV — stamp it from the Mac (NEXT_STEPS step 0) so the artifact provenance is auditable"
+case "$GITREV" in *dirty=1*) fatal "harness stamped from a DIRTY tree ($GITREV) — commit or stash, re-sync, re-stamp";; esac
 
 # Write every knob for the condition, read each back, abort on any mismatch.
 # Leaves the readback string (semicolon-separated, CSV-safe) in $KNOBS.
@@ -90,7 +101,7 @@ SRC=$(cat $P/../srcversion 2>/dev/null || echo NA)
 [ -f $P/wg_steal ] || fatal "module has no wg_steal (old build?)"
 ethtool -N "$NIC" rx-flow-hash udp4 sdfn >/dev/null 2>&1 || true  # irrelevant for 1 tunnel, kept for parity
 bash "$HOME/setup_dut_peers.sh" 8 >/dev/null
-pkill -f 'iperf3 -s' 2>/dev/null || true; sleep 1
+pkill -f 'iperf3 -s -p 520' 2>/dev/null || true; sleep 1
 for i in $(seq 0 7); do iperf3 -s -p $((5201+i)) -D; done
 ssh -n -o StrictHostKeyChecking=no "$GEN" \
   "for i in \$(seq 0 7); do ip netns exec ns_c\$i ping -c1 -W2 10.0.0.1 >/dev/null 2>&1 & done; wait" || true
@@ -100,7 +111,7 @@ HS_SETUP=$(wg show wg0 latest-handshakes | awk '$2>0{c++} END{print c+0}')
   echo "started=$(date -Is)"
   echo "hostname=$(hostname)"
   echo "kernel=$(uname -r)"
-  echo "harness_gitrev=$(cat "$HOME/HARNESS_GITREV" 2>/dev/null || echo unknown)"
+  echo "harness_gitrev=$GITREV"
   echo "module_srcversion=$SRC"
   echo "nic=$NIC"
   echo "nic_driver=$(ethtool -i "$NIC" 2>/dev/null | awk '/^driver:/{print $2}')"
@@ -158,6 +169,7 @@ print("%.4f %d" % (d["sum_received"]["bits_per_second"]/1e9,
 PY
     ) || fatal "iperf JSON parse failed: $IPJ"
     read GBPS RTX <<< "$OUT"
+    [ "$RX1" -gt "$RX0" ] || fatal "wg0 rx_bytes did not advance over the window (blk=$BLK cond=$COND): tunnel delivered nothing"
     WALL=$(awk -v a=$T0 -v b=$T1 'BEGIN{printf "%.3f", b-a}')
     RXG=$(awk -v r0=$RX0 -v r1=$RX1 -v w=$WALL 'BEGIN{printf "%.4f", (r1-r0)*8/w/1e9}')
     SOFT_CE=$(awk -v d=$((S1-S0))  -v w=$WALL -v h=$HZ 'BEGIN{printf "%.3f", d/(w*h)}')

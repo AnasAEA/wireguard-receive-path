@@ -24,12 +24,20 @@
 # evidence only, in load_iperf_gbps + archived JSON. The latency window is a
 # subset of [T0,T1] (sockperf starts ~0.3 s after T0, ssh setup).
 #
-# UDP LATENCY VALIDITY (blocker 3): raw sockperf output is archived per run
-# in ${CSV%.csv}_raw/; sent/received/dropped/duplicated/out-of-order counts
-# and the observation count are parsed into the CSV; payload is EXPLICIT
-# (MSGSIZE, default 64 B); percentile columns are named *_half_rtt_us
-# because sockperf ping-pong reports latency = RTT/2. Loss / sample-support
-# thresholds are enforced by analyze_confirm.py, not silently here.
+# UDP LATENCY VALIDITY (blocker 3 + second audit §5): raw sockperf output is
+# archived per run in the _raw/ dir; the CSV separates sockperf's [Total Run]
+# counters (include warm-up; context only) from the [Valid Duration] section
+# (the window the latency distribution actually covers): lat_duration_s,
+# valid_sent/recv/dropped/dup/ooo_msgs, lat_n. ONLY valid-period fields feed
+# the loss and sample-support gates in analyze_confirm.py. If the installed
+# sockperf does not print a parseable [Valid Duration] section, the row FAILS
+# here (raw output preserved) rather than silently mixing denominators — the
+# one-block smoke exists to catch exactly that. Payload is EXPLICIT (MSGSIZE,
+# default 64 B); percentile columns are *_half_rtt_us (ping-pong = RTT/2).
+#
+# PROVENANCE GUARD: refuses to run without a clean-tree ~/HARNESS_GITREV
+# stamp (see NEXT_STEPS step 0). BLOCKS != 8 renames artifacts to
+# fixedload_smoke_* so a shortened smoke can never pass as a final artifact.
 #
 # Artifacts: $CSV, $CSV.meta, $CSV.percore, $CSV.dmesg, ${CSV%.csv}_raw/
 # (iperf JSON + raw sockperf per run).
@@ -49,9 +57,10 @@ MSGSIZE=${MSGSIZE:-64}       # explicit sockperf payload bytes
 WGDIAG=${WGDIAG:-1}
 CONDS=(off both steal4 bsteal4)
 KO="$HOME/wireguard_trigger.ko"
+NAME=fixedload; [ "$BLOCKS" -eq 8 ] || NAME=fixedload_smoke   # shortened run = smoke artifact
 TS=$(date +%Y%m%d_%H%M%S)
-CSV="$HOME/fixedload_$TS.csv"; PCF="$CSV.percore"; META="$CSV.meta"; DMESGF="$CSV.dmesg"
-RAW="$HOME/fixedload_${TS}_raw"
+CSV="$HOME/${NAME}_$TS.csv"; PCF="$CSV.percore"; META="$CSV.meta"; DMESGF="$CSV.dmesg"
+RAW="$HOME/${NAME}_${TS}_raw"
 for f in "$CSV" "$PCF" "$META" "$DMESGF" "$RAW"; do
   if [ -e "$f" ]; then echo "FATAL: refusing to overwrite existing artifact $f" >&2; exit 1; fi
 done
@@ -65,14 +74,22 @@ BPID=""
 fatal(){ echo "FATAL: $*" >&2; exit 1; }
 
 cleanup(){ local p
+  # scoped to THIS campaign's flows (namespace/dest/port), not host-wide names
   if [ -n "$BPID" ]; then kill "$BPID" 2>/dev/null || true; wait "$BPID" 2>/dev/null || true; fi
-  ssh -n -o StrictHostKeyChecking=no "$GEN" "pkill -f 'iperf3 -c'; pkill sockperf" 2>/dev/null || true
+  ssh -n -o StrictHostKeyChecking=no "$GEN" \
+    "pkill -f 'iperf3 -c 10.0.0.1 -p 5202'; pkill -f 'sockperf ping-pong -i 10.0.0.1 -p $LPORT'" \
+    2>/dev/null || true
   for p in wg_supp wg_headwake wg_trig_k wg_decrypt_delay_ns wg_diag wg_steal; do
     echo 0 > $P/$p 2>/dev/null || true; done
   ethtool -N "$NIC" rx-flow-hash udp4 sd >/dev/null 2>&1 || true
-  pkill -f 'iperf3 -s' 2>/dev/null || true; pkill sockperf 2>/dev/null || true
+  pkill -f 'iperf3 -s -p 520' 2>/dev/null || true
+  pkill -f "sockperf server -i 10.0.0.1 -p $LPORT" 2>/dev/null || true
   echo "cleanup done — partial artifacts preserved under $CSV* and $RAW/" >&2; }
 trap cleanup EXIT; trap 'exit 130' INT; trap 'exit 143' TERM
+
+GITREV=$(cat "$HOME/HARNESS_GITREV" 2>/dev/null || true)
+[ -n "$GITREV" ] || fatal "missing ~/HARNESS_GITREV — stamp it from the Mac (NEXT_STEPS step 0) so the artifact provenance is auditable"
+case "$GITREV" in *dirty=1*) fatal "harness stamped from a DIRTY tree ($GITREV) — commit or stash, re-sync, re-stamp";; esac
 
 apply_cond(){ local supp=0 head=0 steal=0 k v got
   case "$1" in
@@ -100,7 +117,8 @@ SRC=$(cat $P/../srcversion 2>/dev/null || echo NA)
 [ -f $P/wg_steal ] || fatal "module has no wg_steal (old build?)"
 ethtool -N "$NIC" rx-flow-hash udp4 sdfn >/dev/null 2>&1 || true  # irrelevant for 1 tunnel, kept for parity
 bash "$HOME/setup_dut_peers.sh" 8 >/dev/null
-pkill -f 'iperf3 -s' 2>/dev/null || true; pkill sockperf 2>/dev/null || true; sleep 1
+pkill -f 'iperf3 -s -p 520' 2>/dev/null || true
+pkill -f "sockperf server -i 10.0.0.1 -p $LPORT" 2>/dev/null || true; sleep 1
 for i in $(seq 0 7); do iperf3 -s -p $((5201+i)) -D; done
 ( sockperf server -i 10.0.0.1 -p $LPORT >/dev/null 2>&1 & ); sleep 1     # UDP server
 ssh -n -o StrictHostKeyChecking=no "$GEN" \
@@ -111,7 +129,7 @@ HS_SETUP=$(wg show wg0 latest-handshakes | awk '$2>0{c++} END{print c+0}')
   echo "started=$(date -Is)"
   echo "hostname=$(hostname)"
   echo "kernel=$(uname -r)"
-  echo "harness_gitrev=$(cat "$HOME/HARNESS_GITREV" 2>/dev/null || echo unknown)"
+  echo "harness_gitrev=$GITREV"
   echo "module_srcversion=$SRC"
   echo "nic=$NIC"
   echo "nic_driver=$(ethtool -i "$NIC" 2>/dev/null | awk '/^driver:/{print $2}')"
@@ -130,7 +148,7 @@ HS_SETUP=$(wg show wg0 latest-handshakes | awk '$2>0{c++} END{print c+0}')
   echo "load_counter=wg0/statistics/rx_bytes (inner plaintext bytes delivered post-decryption, incl ~1 Mb/s probe)"
 } > "$META"
 
-echo "date,srcversion,block,position,cond,knobs,load_window_gbps,load_iperf_gbps,window_s,retransmits,sent_msgs,recv_msgs,dropped_msgs,dup_msgs,ooo_msgs,lat_n,p50_half_rtt_us,p90_half_rtt_us,p99_half_rtt_us,p999_half_rtt_us,max_half_rtt_us,softirq_ce,system_ce,total_busy_ce,ping_ms,hs_age_s,unc_n,unc_total_ns,steal_pulled,steal_unblocked,steal_dryruns,dmesg_new,raw_ref" > "$CSV"
+echo "date,srcversion,block,position,cond,knobs,load_window_gbps,load_iperf_gbps,window_s,retransmits,total_run_sent_msgs,total_run_recv_msgs,lat_duration_s,valid_sent_msgs,valid_recv_msgs,valid_dropped_msgs,valid_dup_msgs,valid_ooo_msgs,lat_n,p50_half_rtt_us,p90_half_rtt_us,p99_half_rtt_us,p999_half_rtt_us,max_half_rtt_us,softirq_ce,system_ce,total_busy_ce,ping_ms,hs_age_s,unc_n,unc_total_ns,steal_pulled,steal_unblocked,steal_dryruns,dmesg_new,raw_ref" > "$CSV"
 echo "timestamp block position cond cpu busy_ce softirq_ce system_ce" > "$PCF"
 : > "$DMESGF"
 
@@ -178,8 +196,19 @@ print("%.4f %d" % (d["sum_received"]["bits_per_second"]/1e9,
 PY
     ) || fatal "iperf JSON parse failed: $IPJ"
     read IPG RTX <<< "$OUT"
-    SENT=$(awk -F'[;= ]+' '/\[Total Run\]/{for(i=1;i<=NF;i++) if($i=="SentMessages") print $(i+1)}' "$SPF" | head -1)
-    RECV=$(awk -F'[;= ]+' '/\[Total Run\]/{for(i=1;i<=NF;i++) if($i=="ReceivedMessages") print $(i+1)}' "$SPF" | head -1)
+    # [Total Run] includes warm-up: context only. [Valid Duration] is the
+    # window the latency distribution covers: ONLY these fields feed the
+    # loss/support gates. A missing/zero valid-period field is a sockperf
+    # format incompatibility -> fail the row (raw preserved), never fall
+    # back to Total Run denominators.
+    TRS=$(awk -F'[;= ]+' '/\[Total Run\]/{for(i=1;i<=NF;i++) if($i=="SentMessages") print $(i+1)}' "$SPF" | head -1)
+    TRR=$(awk -F'[;= ]+' '/\[Total Run\]/{for(i=1;i<=NF;i++) if($i=="ReceivedMessages") print $(i+1)}' "$SPF" | head -1)
+    VDT=$(awk -F'[;= ]+' '/\[Valid Duration\]/{for(i=1;i<=NF;i++) if($i=="RunTime") print $(i+1)}' "$SPF" | head -1)
+    VDS=$(awk -F'[;= ]+' '/\[Valid Duration\]/{for(i=1;i<=NF;i++) if($i=="SentMessages") print $(i+1)}' "$SPF" | head -1)
+    VDR=$(awk -F'[;= ]+' '/\[Valid Duration\]/{for(i=1;i<=NF;i++) if($i=="ReceivedMessages") print $(i+1)}' "$SPF" | head -1)
+    awk -v x="${VDT:-}" 'BEGIN{exit !(x+0>0)}' || fatal "sockperf [Valid Duration] RunTime missing/zero (blk=$BLK cond=$COND) — format incompatibility? raw: $SPF"
+    awk -v x="${VDS:-}" 'BEGIN{exit !(x+0>0)}' || fatal "sockperf [Valid Duration] SentMessages missing/zero (blk=$BLK cond=$COND) — raw: $SPF"
+    awk -v x="${VDR:-}" 'BEGIN{exit !(x+0>0)}' || fatal "sockperf [Valid Duration] ReceivedMessages missing/zero (blk=$BLK cond=$COND) — raw: $SPF"
     DROP=$(sed -n 's/.*dropped messages = \([0-9]*\).*/\1/p' "$SPF" | head -1)
     DUP=$(sed -n 's/.*duplicated messages = \([0-9]*\).*/\1/p' "$SPF" | head -1)
     OOO=$(sed -n 's/.*out-of-order messages = \([0-9]*\).*/\1/p' "$SPF" | head -1)
@@ -189,6 +218,7 @@ PY
     P999=$(awk '/percentile 99.900/{print $NF}' "$SPF")
     PMAX=$(awk '/<MAX> observation/{print $NF}' "$SPF")
     NOBS=$(awk '/observations/{for(i=1;i<=NF;i++) if($i=="Total") print $(i+1)}' "$SPF" | head -1)
+    [ "$RX1" -gt "$RX0" ] || fatal "wg0 rx_bytes did not advance over the window (blk=$BLK cond=$COND): tunnel delivered nothing"
     WALL=$(awk -v a=$T0 -v b=$T1 'BEGIN{printf "%.3f", b-a}')
     RXG=$(awk -v r0=$RX0 -v r1=$RX1 -v w=$WALL 'BEGIN{printf "%.4f", (r1-r0)*8/w/1e9}')
     SOFT_CE=$(awk -v d=$((S1-S0))  -v w=$WALL -v h=$HZ 'BEGIN{printf "%.3f", d/(w*h)}')
@@ -204,7 +234,7 @@ PY
     echo "$PCJ" | awk '$1!=$5{exit 1}' || fatal "CPU topology changed (blk=$BLK cond=$COND)"
     echo "$PCJ" | awk -v ts="$(date -Is)" -v b=$BLK -v p=$POS -v c=$COND -v w=$WALL -v h=$HZ \
       '{printf "%s %s %s %s %s %.3f %.3f %.3f\n", ts,b,p,c,$1,($6-$2)/(w*h),($7-$3)/(w*h),($8-$4)/(w*h)}' >> "$PCF"
-    echo "$(date -Is),$SRC,$BLK,$POS,$COND,$KNOBS,$RXG,$IPG,$WALL,$RTX,${SENT:-NA},${RECV:-NA},${DROP:-NA},${DUP:-NA},${OOO:-NA},${NOBS:-NA},${P50:-NA},${P90:-NA},${P99:-NA},${P999:-NA},${PMAX:-NA},$SOFT_CE,$SYS_CE,$BUSY_CE,$PING_MS,$HS_AGE,$UN,$UT,$SP,$SU,$SD,$DM,$(basename "$IPJ");$(basename "$SPF")" >> "$CSV"
+    echo "$(date -Is),$SRC,$BLK,$POS,$COND,$KNOBS,$RXG,$IPG,$WALL,$RTX,${TRS:-NA},${TRR:-NA},$VDT,$VDS,$VDR,${DROP:-NA},${DUP:-NA},${OOO:-NA},${NOBS:-NA},${P50:-NA},${P90:-NA},${P99:-NA},${P999:-NA},${PMAX:-NA},$SOFT_CE,$SYS_CE,$BUSY_CE,$PING_MS,$HS_AGE,$UN,$UT,$SP,$SU,$SD,$DM,$(basename "$IPJ");$(basename "$SPF")" >> "$CSV"
     printf "blk=%-2s pos=%s cond=%-7s | win=%sG (iperf %sG) | p99=%-7s p999=%-8s n=%-7s drop=%-3s | soft=%s busy=%s | dmesg=%s\n" \
       "$BLK" "$POS" "$COND" "$RXG" "$IPG" "${P99:-NA}" "${P999:-NA}" "${NOBS:-NA}" "${DROP:-NA}" "$SOFT_CE" "$BUSY_CE" "$DM" >&2
     sleep 3
