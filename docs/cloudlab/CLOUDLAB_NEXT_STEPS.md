@@ -26,6 +26,73 @@
 
 ---
 
+# ▶ RUN NEXT — instantiation #11 (fresh node): the two Phase D CONFIRMATION gates
+
+Freezes Finding 8 for the report. The headline (+4.15% at `wg_steal=4`, CPU −3–5%,
+efficiency +5.4–7.6%) currently rests on ONE instantiation, n=5 per knob value, and a
+p-value floored at 0.008 by C(10,5)=252. These two gates replicate it as **within-block
+paired deltas** on a fresh node (12 blocks → smallest reachable p ≈ 0.0005), and answer
+three questions the sweep could not: does the full stack compose (`bsteal4` vs `steal4` —
+the sweep was **steal-alone**, wake fixes off), does "same bytes, less CPU" hold at
+matched load (cleaner than the Gb/s-per-CE ratio), and does same-tunnel tail latency move
+(the old probe peer never shared the blocked tunnel, so its null was by construction).
+Decision rules are pre-declared in `analyze_confirm.py`'s docstring — read them before
+looking at results, not after.
+
+```bash
+# 0) bootstrap the fresh instantiation (then update the Live-nodes table above)
+DUT=anasait@<dut-node>.wisc.cloudlab.us GEN=anasait@<gen-node>.wisc.cloudlab.us \
+  bash scripts/cloudlab/bootstrap_testbed.sh 8
+
+# 1) GATE A — paired replication, uncapped single tunnel (~35 min), ON DUT.
+#    12 blocks x {off, both, steal4, bsteal4}, order re-shuffled inside each block,
+#    30 s runs, warm-up per block. WGDIAG=0 default = exact parity with the headline
+#    sweep (which ran wg_diag off). Primary: steal4-off on gbps and total_busy_ce.
+ssh anasait@<dut-node>.wisc.cloudlab.us
+sudo -v && nohup sudo bash ~/measure_confirm.sh > ~/confirm_run.log 2>&1 &
+tail -f ~/confirm_run.log         # one line per run: blk / cond / Gb/s / CE / dmesg
+
+# 2) GATE B — matched-load CPU + same-tunnel latency (~42 min), ON DUT, after gate A.
+#    Bulk capped at 3.8 Gb/s (below the ~4.2 off ceiling, so every condition can hold
+#    the same load) + sockperf UDP ping-pong at 2000 msg/s over the SAME tunnel
+#    (ns_c1 -> 10.0.0.1: same outer 5-tuple, same RX queue, same NAPI). 8 blocks x
+#    4 conditions x 60 s. Primary: steal4-off on total_busy_ce at matched load;
+#    p99/p99.9 is exploratory. wg_diag=1 here (measure_steal.sh methodology): also
+#    yields the classifier + steal counters for off/steal4.
+sudo -v && nohup sudo bash ~/measure_fixedload.sh > ~/fixedload_run.log 2>&1 &
+tail -f ~/fixedload_run.log
+
+# 3) fetch BOTH immediately (the lease dies with the data), from the Mac.
+#    The .percore sidecars ride along with the wildcard:
+scp "anasait@<dut-node>.wisc.cloudlab.us:~/confirm_*.csv*" \
+    "anasait@<dut-node>.wisc.cloudlab.us:~/fixedload_*.csv*" data/cloudlab/
+
+# 4) commit the raw data FIRST, then analyze with the committed script:
+python3 scripts/cloudlab/analyze_confirm.py data/cloudlab/confirm_<TS>.csv
+python3 scripts/cloudlab/analyze_confirm.py data/cloudlab/fixedload_<TS>.csv
+
+# 5) OPTIONAL, only if the lease still lives — 2 profiling windows to turn the
+#    "worker CE drops" inference (system−softirq is not isolated workers) into a
+#    direct observation: cycles should move from wg_packet_decrypt_worker/kworker
+#    into wg_packet_rx_poll. ON DUT, per condition:
+P=/sys/module/wireguard/parameters
+sudo sh -c "echo 0 > $P/wg_steal"   # 'off' (then repeat below with: echo 4 > .../wg_steal)
+sudo ssh gen "ip netns exec ns_c1 iperf3 -c 10.0.0.1 -p 5202 -P 4 -t 40 >/dev/null 2>&1" &
+sleep 5 && sudo perf record -a -F 499 -o ~/perf_steal$(cat $P/wg_steal).data -- sleep 25
+sudo perf report -i ~/perf_steal$(cat $P/wg_steal).data --stdio --sort symbol \
+  | grep -E 'wg_|chacha|poly1305' | head -25
+```
+
+**Interpretation grid (declared now).** `steal4` reproduces both primaries → the headline
+is frozen as written. `bsteal4 > steal4` (p<0.05) → claim a cumulative full-stack effect.
+`bsteal4 ≈ steal4` → the wake fixes clean the mechanism but add no user-visible
+performance — honest and expected, matches Phase A/E10. `bsteal4 < steal4` → report as an
+interaction (suppressed polls are lost steal opportunities), not as a broken fix. Latency
+null → stays a null in the report; the CPU result stands on its own. A significant
+`both-off` on gbps/CPU would contradict Phase A and needs a rerun before being believed.
+
+---
+
 # ▶ DONE 2026-07-15 — instantiation #10: both Phase D gates PASSED
 
 > **Gate 1** (`single_20260715_0516.csv`): knee at `wg_steal=4` — throughput **+4.15%**
