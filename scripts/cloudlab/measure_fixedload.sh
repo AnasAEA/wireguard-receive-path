@@ -92,29 +92,22 @@ cleanup(){ local p
   echo "cleanup done — partial artifacts preserved under $CSV* and $RAW/" >&2; }
 trap cleanup EXIT; trap 'exit 130' INT; trap 'exit 143' TERM
 
-# Provenance stamp contract (final audit §2): one line
-#   commit=<hash> branch=cloudlab-receive-path-findings dirty=0
-# written by the NEXT_STEPS step 0 preflight. AUDITED_HEAD (env, required)
-# is the coordinator-approved commit; the stamp's commit must equal it.
-validate_stamp(){ local f=$1 line commit="" branch="" dirty="" kv
+# Provenance stamp contract (final audit §2 + duplicate-field fix): the stamp
+# must be EXACTLY one line, byte-identical to the canonical form the step 0
+# preflight writes:
+#   commit=<AUDITED_HEAD> branch=cloudlab-receive-path-findings dirty=0
+# Whole-line comparison rejects missing, duplicated, unknown or reordered
+# fields, extra tokens/whitespace, multi-line stamps, wrong branch, dirty!=0
+# and a wrong commit in one check; malformed input is never normalized.
+validate_stamp(){ local f=$1 expected actual nlines
   [ -n "${AUDITED_HEAD:-}" ] || { echo "AUDITED_HEAD is not set — run via: sudo -n env AUDITED_HEAD=<approved-hash> bash $0 (NEXT_STEPS step 0)"; return 1; }
   [ -f "$f" ] || { echo "missing provenance stamp $f (NEXT_STEPS step 0)"; return 1; }
-  line=$(head -1 "$f")
-  for kv in $line; do
-    case "${kv%%=*}" in
-      commit) commit=${kv#*=};;
-      branch) branch=${kv#*=};;
-      dirty)  dirty=${kv#*=};;
-      *) echo "unknown field '$kv' in stamp — re-run the step 0 preflight"; return 1;;
-    esac
-  done
-  [ -n "$commit" ] || { echo "stamp lacks commit= field"; return 1; }
-  [ -n "$branch" ] || { echo "stamp lacks branch= field (commit-only stamps are refused)"; return 1; }
-  [ -n "$dirty" ]  || { echo "stamp lacks dirty= field"; return 1; }
-  [ "$branch" = "cloudlab-receive-path-findings" ] || { echo "stamp branch=$branch, expected cloudlab-receive-path-findings"; return 1; }
-  [ "$dirty" = "0" ] || { echo "stamp dirty=$dirty — harness synced from a dirty tree, re-sync from the audited commit"; return 1; }
-  [ "$commit" = "$AUDITED_HEAD" ] || { echo "stamp commit=$commit != AUDITED_HEAD=$AUDITED_HEAD — synced tree is not the approved commit"; return 1; }
-  echo "$line"
+  nlines=$(grep -c '' "$f")   # counts a final line even without trailing newline
+  [ "$nlines" -eq 1 ] || { echo "stamp must be exactly one line, got $nlines — re-run the step 0 preflight"; return 1; }
+  actual=$(head -1 "$f")
+  expected="commit=$AUDITED_HEAD branch=cloudlab-receive-path-findings dirty=0"
+  [ "$actual" = "$expected" ] || { echo "invalid provenance stamp — expected: '$expected'  actual: '$actual' — re-run the step 0 preflight"; return 1; }
+  echo "$actual"
 }
 GITREV=$(validate_stamp "$HOME/HARNESS_GITREV") || fatal "provenance: $GITREV"
 
