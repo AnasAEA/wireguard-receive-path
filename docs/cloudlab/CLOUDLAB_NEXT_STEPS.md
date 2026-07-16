@@ -40,11 +40,40 @@ Decision rules are pre-declared in `analyze_confirm.py`'s docstring — read the
 looking at results, not after.
 
 ```bash
-# 0) bootstrap the fresh instantiation (then update the Live-nodes table above),
-#    and stamp the harness provenance on the DUT (read into every .meta sidecar):
+# 0) PRE-FLIGHT, from the Mac: the campaign must run the audited clean tree.
+#    The guard refuses wrong branch / dirty tree; the stamp is REQUIRED — both
+#    harnesses abort without it (or with dirty=1) and copy it into .meta.
+[ "$(git branch --show-current)" = "cloudlab-receive-path-findings" ] \
+  && [ -z "$(git status --porcelain)" ] \
+  || { echo "STOP: wrong branch or dirty tree — do not bootstrap"; false; }
 DUT=anasait@<dut-node>.wisc.cloudlab.us GEN=anasait@<gen-node>.wisc.cloudlab.us \
   bash scripts/cloudlab/bootstrap_testbed.sh 8
-git rev-parse HEAD | ssh anasait@<dut-node>.wisc.cloudlab.us 'cat > ~/HARNESS_GITREV'
+echo "commit=$(git rev-parse HEAD) branch=$(git branch --show-current) \
+dirty=$([ -n "$(git status --porcelain)" ] && echo 1 || echo 0)" \
+  | ssh anasait@<dut-node>.wisc.cloudlab.us 'cat > ~/HARNESS_GITREV'
+
+# 0b) SMOKE, ON DUT — one block per gate (~4 + ~7 min) BEFORE committing the
+#     testbed to the full 40-50 min campaigns. BLOCKS=1 renames the artifacts
+#     confirm_smoke_* / fixedload_smoke_*, so they can never be mistaken for
+#     (or overwrite) final artifacts. Inspect, then delete nothing — fetch
+#     smoke artifacts with the rest.
+scp scripts/cloudlab/analyze_confirm.py anasait@<dut-node>.wisc.cloudlab.us:~/
+ssh anasait@<dut-node>.wisc.cloudlab.us
+sudo -v && sudo -n bash ~/measure_confirm.sh 1        # gate A smoke, foreground
+sudo -n bash ~/measure_fixedload.sh 1                 # gate B smoke, foreground
+# structural check of both smoke artifacts, ON DUT:
+python3 ~/analyze_confirm.py --smoke --blocks 1 ~/confirm_smoke_*.csv
+python3 ~/analyze_confirm.py --smoke --blocks 1 ~/fixedload_smoke_*.csv
+# smoke gate — proceed to the full runs ONLY if ALL of:
+#   1. each smoke CSV has exactly 4 rows, one per condition (positions 1-4);
+#   2. knob readbacks in every row match the condition (analyzer checks too);
+#   3. gate A rows show plausible uncapped Gb/s; gate B load_window_gbps ~3.8;
+#   4. the gate B raw dir has a sockperf_*.txt per row and the analyzer did
+#      not flag the [Valid Duration] fields (a parse failure aborts the
+#      harness run itself — that IS the format-incompatibility signal);
+#   5. .percore sidecars have one row per cpu per run, aligned labels;
+#   6. .dmesg sidecars are empty / dmesg_new=0;
+#   7. both analyzer smoke invocations exited 0 (watermarked output, no verdicts).
 
 # 1) GATE A — paired replication, uncapped single tunnel (~40 min), ON DUT.
 #    12 blocks x {off, both, steal4, bsteal4}, order re-shuffled inside each block,
@@ -72,8 +101,9 @@ nohup sudo -n bash ~/measure_fixedload.sh > ~/fixedload_run.log 2>&1 &
 tail -f ~/fixedload_run.log
 
 # 3) fetch EVERYTHING immediately (the lease dies with the data), from the Mac:
-#    ~/confirm_<TS>.csv + .meta/.percore/.dmesg sidecars, same for fixedload, the
-#    raw dirs (iperf JSON + raw sockperf per run), and the run logs.
+#    CSVs + .meta/.percore/.dmesg sidecars for BOTH gates AND both smokes, the
+#    raw dirs (iperf JSON + raw sockperf per run), and the run logs. The
+#    confirm_*/fixedload_* wildcards match the smoke artifacts too.
 scp "anasait@<dut-node>.wisc.cloudlab.us:~/confirm_*.csv*" \
     "anasait@<dut-node>.wisc.cloudlab.us:~/fixedload_*.csv*" \
     "anasait@<dut-node>.wisc.cloudlab.us:~/*_run.log" data/cloudlab/
@@ -81,14 +111,22 @@ scp -r "anasait@<dut-node>.wisc.cloudlab.us:~/confirm_*_raw" \
        "anasait@<dut-node>.wisc.cloudlab.us:~/fixedload_*_raw" data/cloudlab/
 
 # 4) commit the raw data FIRST, then analyze with the committed script.
-#    Exit status: 0 = valid, all gates passed; 1 = INVALID artifact (no inference
-#    is printed — do not hand-fix the CSV, diagnose the run); 2 = artifact valid
-#    but a validity gate voided some inference (VOID lines say which and why).
-#    Save the analysis output next to the data (it is part of the record):
-python3 scripts/cloudlab/analyze_confirm.py data/cloudlab/confirm_<TS>.csv \
-  | tee data/cloudlab/confirm_<TS>.analysis.txt
-python3 scripts/cloudlab/analyze_confirm.py data/cloudlab/fixedload_<TS>.csv \
-  | tee data/cloudlab/fixedload_<TS>.analysis.txt
+#    Exit status contract: 0 = valid analysis (or valid smoke structural
+#    check); 1 = INVALID artifact / schema / treatment evidence (no inference
+#    is printed — do not hand-fix the CSV, diagnose the run); 2 = artifact
+#    valid but a validity gate voided some inference (VOID lines say which
+#    and why). tee alone would swallow the exit status — capture it via
+#    PIPESTATUS (run as a block; it does not kill your interactive shell):
+(
+  set -o pipefail
+  for f in confirm fixedload; do
+    python3 scripts/cloudlab/analyze_confirm.py "data/cloudlab/${f}_<TS>.csv" 2>&1 \
+      | tee "data/cloudlab/${f}_<TS>.analysis.txt"
+    s=${PIPESTATUS[0]}
+    echo "analyzer_exit(${f})=$s"
+    [ "$s" -eq 0 ] || exit "$s"
+  done
+)
 
 # 5) OPTIONAL, only if the lease still lives — 2 profiling windows to turn the
 #    "worker CE drops" inference (system−softirq is not isolated workers) into a
@@ -97,20 +135,22 @@ python3 scripts/cloudlab/analyze_confirm.py data/cloudlab/fixedload_<TS>.csv \
 #    primary CPU measurement. ON DUT; both windows use the SAME capped 3.8G load:
 command -v perf >/dev/null || sudo apt-get install -y linux-tools-common "linux-tools-$(uname -r)"
 P=/sys/module/wireguard/parameters
-for C in 0 4; do   # off, then steal4
+for C in 0 4; do   # off, then steal4 — SAME capped 3.8G load in both windows
   sudo sh -c "for k in wg_supp wg_headwake wg_trig_k wg_decrypt_delay_ns wg_diag; do echo 0 > $P/\$k; done; echo $C > $P/wg_steal"
-  grep -H . $P/wg_steal $P/wg_supp $P/wg_headwake     # readback, keep in the log
+  grep -H . $P/wg_steal $P/wg_supp $P/wg_headwake $P/wg_diag \
+    $P/wg_decrypt_delay_ns $P/wg_trig_k                  # full readback, keep in the log
   RX0=$(cat /sys/class/net/wg0/statistics/rx_bytes)
   sudo ssh gen "ip netns exec ns_c1 iperf3 -c 10.0.0.1 -p 5202 -P 4 -b 950M -t 40 >/dev/null 2>&1" &
   LPID=$!; sleep 5
-  sudo perf record -a -F 499 -o ~/perf_steal$C.data -- sleep 25
+  sudo perf record -a -e cycles -F 499 -o ~/perf_steal$C.data -- sleep 25
   wait $LPID
   RX1=$(cat /sys/class/net/wg0/statistics/rx_bytes)
   echo "steal=$C delivered over the 40s load: $(awk -v a=$RX0 -v b=$RX1 'BEGIN{printf "%.2f", (b-a)*8/40/1e9}') Gb/s"
   sudo perf report -i ~/perf_steal$C.data --stdio --sort symbol > ~/perf_steal$C.report.txt
   grep -E 'wg_|chacha|poly1305' ~/perf_steal$C.report.txt | head -25
 done
-# fetch ~/perf_steal{0,4}.report.txt with the other artifacts
+# fetch ~/perf_steal{0,4}.data AND .report.txt with the other artifacts —
+# optional supporting evidence only; never a substitute for the primary CPU numbers
 ```
 
 **Interpretation grid (declared now).** `steal4` reproduces both co-primaries → the
