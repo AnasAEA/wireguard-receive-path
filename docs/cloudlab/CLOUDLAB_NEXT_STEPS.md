@@ -78,8 +78,15 @@ DUT=$DUTSSH GEN=anasait@<gen-node>.wisc.cloudlab.us \
 scp scripts/cloudlab/analyze_confirm.py "$DUTSSH":~/
 ssh anasait@<dut-node>.wisc.cloudlab.us
 export AUDITED_HEAD="<coordinator-approved final hash>"   # same value as step 0
-sudo -v && sudo -n env AUDITED_HEAD="$AUDITED_HEAD" bash ~/measure_confirm.sh 1    # gate A smoke
-sudo -n env AUDITED_HEAD="$AUDITED_HEAD" bash ~/measure_fixedload.sh 1             # gate B smoke
+# QUIET PERIOD (smoke finding, 2026-07-16): every harness invocation must come
+# >=130 s after the last traffic through the tunnel (bootstrap fan-out, a
+# previous run, a manual ping). The harness reloads the module, which drops all
+# DUT session state; a gen client whose session is younger than WireGuard's
+# REKEY_AFTER_TIME (120 s) keeps sending under the dead session for ~15 s
+# instead of re-handshaking, and the liveness gate (correctly) aborts. Sessions
+# older than 120 s re-handshake instantly. Hence the sleep guards below.
+sudo -v && sleep 130 && sudo -n env AUDITED_HEAD="$AUDITED_HEAD" bash ~/measure_confirm.sh 1   # gate A smoke
+sleep 130 && sudo -n env AUDITED_HEAD="$AUDITED_HEAD" bash ~/measure_fixedload.sh 1            # gate B smoke
 # structural check of both smoke artifacts, ON DUT. Repeated smoke attempts
 # leave several *_smoke_*.csv, so select exactly the NEWEST one explicitly —
 # the analyzer refuses more than one positional artifact. One fail-stopping
@@ -117,8 +124,8 @@ BASH
 #    failure aborts and preserves the partial artifacts.
 ssh anasait@<dut-node>.wisc.cloudlab.us
 export AUDITED_HEAD="<coordinator-approved final hash>"   # same value as step 0
-sudo -v
-nohup sudo -n env AUDITED_HEAD="$AUDITED_HEAD" bash ~/measure_confirm.sh > ~/confirm_run.log 2>&1 &
+sudo -v      # sleep guard: see the QUIET PERIOD note in step 0b
+nohup sudo -n bash -c "sleep 130; env AUDITED_HEAD=$AUDITED_HEAD bash ~/measure_confirm.sh" > ~/confirm_run.log 2>&1 &
 tail -f ~/confirm_run.log         # one line per run: blk / pos / cond / Gb/s / CE
 
 # 2) GATE B — matched-load CPU + same-tunnel latency (~48 min), ON DUT, after gate A
@@ -135,8 +142,8 @@ tail -f ~/confirm_run.log         # one line per run: blk / pos / cond / Gb/s / 
 #    observed data. Primary: steal4-off on total_busy_ce; latency primary p99
 #    (half-RTT), the rest exploratory. wg_diag=1 (measure_steal.sh methodology):
 #    classifier + steal counters for off/steal4.
-sudo -v
-nohup sudo -n env AUDITED_HEAD="$AUDITED_HEAD" bash ~/measure_fixedload.sh > ~/fixedload_run.log 2>&1 &
+sudo -v      # sleep guard: see the QUIET PERIOD note in step 0b
+nohup sudo -n bash -c "sleep 130; env AUDITED_HEAD=$AUDITED_HEAD bash ~/measure_fixedload.sh" > ~/fixedload_run.log 2>&1 &
 tail -f ~/fixedload_run.log
 
 # 3) fetch EVERYTHING immediately (the lease dies with the data), from the Mac:

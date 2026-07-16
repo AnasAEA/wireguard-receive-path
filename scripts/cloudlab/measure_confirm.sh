@@ -107,7 +107,9 @@ apply_cond(){ local supp=0 head=0 steal=0 k v got
 
 cpu_snap(){ awk '/^cpu[0-9]/{u=$2;n=$3;s=$4;id=$5;io=$6;irq=$7;sq=$8;st=$9;
   tot+=u+n+s+id+io+irq+sq+st; idle+=id+io; soft+=sq; sysirq+=s+irq+sq}
-  END{printf "%d %d %d", tot-idle, soft, sysirq}' /proc/stat; }
+  END{printf "%d %d %d\n", tot-idle, soft, sysirq}' /proc/stat; }
+  # \n matters: read(1) returns 1 at EOF-without-newline, which set -e
+  # turns into a silent abort (found by the gate A smoke, 2026-07-16)
 percore_snap(){ awk '/^cpu[0-9]/{print $1, $2+$3+$4+$7+$8+$9, $8, $4+$7+$8}' /proc/stat; }
 
 ip link del wg0 2>/dev/null||true; rmmod wireguard 2>/dev/null||true
