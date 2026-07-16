@@ -26,18 +26,27 @@
 
 ---
 
-# ▶ RUN NEXT — instantiation #11 (fresh node): the two Phase D CONFIRMATION gates
+# ▶ RUN NEXT — same instantiation (#10, controlled reset): the two Phase D CONFIRMATION gates
 
 Freezes Finding 8 for the report. The headline (+4.15% at `wg_steal=4`, CPU −3–5%,
-efficiency +5.4–7.6%) currently rests on ONE instantiation, n=5 per knob value, and a
-p-value floored at 0.008 by C(10,5)=252. These two gates replicate it as **within-block
-paired deltas** on a fresh node (12 blocks → smallest reachable p ≈ 0.0005), and answer
-three questions the sweep could not: does the full stack compose (`bsteal4` vs `steal4` —
-the sweep was **steal-alone**, wake fixes off), does "same bytes, less CPU" hold at
-matched load (cleaner than the Gb/s-per-CE ratio), and does same-tunnel tail latency move
-(the old probe peer never shared the blocked tunnel, so its null was by construction).
-Decision rules are pre-declared in `analyze_confirm.py`'s docstring — read them before
-looking at results, not after.
+efficiency +5.4–7.6%) currently rests on one discovery sweep, n=5 per knob value, and a
+p-value floored at 0.008 by C(10,5)=252. These two gates re-test it as **within-block
+paired deltas** (12 blocks → smallest reachable p ≈ 0.0005), and answer three questions
+the sweep could not: does the full stack compose (`bsteal4` vs `steal4` — the sweep was
+**steal-alone**, wake fixes off), does "same bytes, less CPU" hold at matched load
+(cleaner than the Gb/s-per-CE ratio), and does same-tunnel tail latency move (the old
+probe peer never shared the blocked tunnel, so its null was by construction). Decision
+rules are pre-declared in `analyze_confirm.py`'s docstring — read them before looking at
+results, not after.
+
+**Scope of the claim.** These confirmation runs reuse the existing DUT and generator
+from the same CloudLab instantiation. The 130-second quiet period below is an
+operational stabilization guard that allows recently created generator-side WireGuard
+sessions to age before the DUT module is reloaded; it occurs before harness execution
+and outside every measured window, and it is not an experimental treatment. Reusing the
+nodes after a controlled environment reset does not convert the campaign into a
+fresh-node or independent-instantiation replication — report it as *a randomized paired
+confirmation on the same CloudLab instantiation after controlled environment reset*.
 
 ```bash
 # 0) PRE-FLIGHT, from the Mac. AUDITED_HEAD is the COORDINATOR-APPROVED final
@@ -125,8 +134,17 @@ BASH
 ssh anasait@<dut-node>.wisc.cloudlab.us
 export AUDITED_HEAD="<coordinator-approved final hash>"   # same value as step 0
 sudo -v      # sleep guard: see the QUIET PERIOD note in step 0b
-nohup sudo -n bash -c "sleep 130; env AUDITED_HEAD=$AUDITED_HEAD bash ~/measure_confirm.sh" > ~/confirm_run.log 2>&1 &
-tail -f ~/confirm_run.log         # one line per run: blk / pos / cond / Gb/s / CE
+# Resolve the harness path AS THE EXPERIMENT USER before sudo: inside a root
+# bash -c body, ~ would resolve to /root and the run would die on a missing
+# /root/measure_confirm.sh after the 130 s wait. The absolute path is passed
+# to the root shell as "$1".
+harness="$(readlink -f "$HOME/measure_confirm.sh")"
+test -f "$harness"
+nohup sudo -n env AUDITED_HEAD="$AUDITED_HEAD" \
+  bash -c 'sleep 130; exec bash "$1"' bash "$harness" \
+  > "$HOME/confirm_run.log" 2>&1 &
+echo "$!" | tee "$HOME/confirm_run.pid"
+tail -f "$HOME/confirm_run.log"   # one line per run: blk / pos / cond / Gb/s / CE
 
 # 2) GATE B — matched-load CPU + same-tunnel latency (~48 min), ON DUT, after gate A
 #    (a shared lock refuses to run both at once). Bulk capped at 3.8 Gb/s (below the
@@ -143,8 +161,14 @@ tail -f ~/confirm_run.log         # one line per run: blk / pos / cond / Gb/s / 
 #    (half-RTT), the rest exploratory. wg_diag=1 (measure_steal.sh methodology):
 #    classifier + steal counters for off/steal4.
 sudo -v      # sleep guard: see the QUIET PERIOD note in step 0b
-nohup sudo -n bash -c "sleep 130; env AUDITED_HEAD=$AUDITED_HEAD bash ~/measure_fixedload.sh" > ~/fixedload_run.log 2>&1 &
-tail -f ~/fixedload_run.log
+# Same user-side path resolution as gate A — never let root's bash expand ~.
+harness="$(readlink -f "$HOME/measure_fixedload.sh")"
+test -f "$harness"
+nohup sudo -n env AUDITED_HEAD="$AUDITED_HEAD" \
+  bash -c 'sleep 130; exec bash "$1"' bash "$harness" \
+  > "$HOME/fixedload_run.log" 2>&1 &
+echo "$!" | tee "$HOME/fixedload_run.pid"
+tail -f "$HOME/fixedload_run.log"
 
 # 3) fetch EVERYTHING immediately (the lease dies with the data), from the Mac:
 #    CSVs + .meta/.percore/.dmesg sidecars for BOTH gates AND both smokes, the
