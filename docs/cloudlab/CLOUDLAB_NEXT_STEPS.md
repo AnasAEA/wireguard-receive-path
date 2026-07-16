@@ -40,30 +40,63 @@ Decision rules are pre-declared in `analyze_confirm.py`'s docstring — read the
 looking at results, not after.
 
 ```bash
-# 0) PRE-FLIGHT, from the Mac: the campaign must run the audited clean tree.
-#    The guard refuses wrong branch / dirty tree; the stamp is REQUIRED — both
-#    harnesses abort without it (or with dirty=1) and copy it into .meta.
-[ "$(git branch --show-current)" = "cloudlab-receive-path-findings" ] \
-  && [ -z "$(git status --porcelain)" ] \
-  || { echo "STOP: wrong branch or dirty tree — do not bootstrap"; false; }
-DUT=anasait@<dut-node>.wisc.cloudlab.us GEN=anasait@<gen-node>.wisc.cloudlab.us \
+# 0) PRE-FLIGHT, from the Mac. AUDITED_HEAD is the COORDINATOR-APPROVED final
+#    commit hash — copy it from the audit GO message, do NOT substitute an
+#    arbitrary current HEAD. The preflight runs as ONE fail-stopping bash
+#    unit (pasting the lines one by one cannot skip a failed check), verifies
+#    branch + exact commit + clean tree, and writes the stamp the harnesses
+#    demand: both refuse to run unless the stamp is
+#    'commit=<AUDITED_HEAD> branch=cloudlab-receive-path-findings dirty=0'
+#    AND the same AUDITED_HEAD is in their environment.
+export AUDITED_HEAD="<coordinator-approved final hash>"
+export DUTSSH=anasait@<dut-node>.wisc.cloudlab.us
+bash -euo pipefail <<'BASH'
+: "${AUDITED_HEAD:?Set AUDITED_HEAD to the coordinator-approved commit}"
+: "${DUTSSH:?Set DUTSSH to the DUT ssh target}"
+expected_branch="cloudlab-receive-path-findings"
+actual_branch="$(git branch --show-current)"
+actual_head="$(git rev-parse HEAD)"
+[[ "$actual_branch" == "$expected_branch" ]] \
+  || { echo "STOP: branch=$actual_branch expected=$expected_branch" >&2; exit 1; }
+[[ "$actual_head" == "$AUDITED_HEAD" ]] \
+  || { echo "STOP: HEAD=$actual_head expected=$AUDITED_HEAD" >&2; exit 1; }
+[[ -z "$(git status --porcelain)" ]] \
+  || { echo "STOP: working tree is dirty" >&2; exit 1; }
+printf 'commit=%s branch=%s dirty=0\n' "$actual_head" "$actual_branch" \
+  | ssh "$DUTSSH" 'cat > ~/HARNESS_GITREV'
+echo "Preflight OK: commit=$actual_head branch=$actual_branch dirty=0 -> $DUTSSH:~/HARNESS_GITREV"
+BASH
+DUT=$DUTSSH GEN=anasait@<gen-node>.wisc.cloudlab.us \
   bash scripts/cloudlab/bootstrap_testbed.sh 8
-echo "commit=$(git rev-parse HEAD) branch=$(git branch --show-current) \
-dirty=$([ -n "$(git status --porcelain)" ] && echo 1 || echo 0)" \
-  | ssh anasait@<dut-node>.wisc.cloudlab.us 'cat > ~/HARNESS_GITREV'
 
 # 0b) SMOKE, ON DUT — one block per gate (~4 + ~7 min) BEFORE committing the
 #     testbed to the full 40-50 min campaigns. BLOCKS=1 renames the artifacts
 #     confirm_smoke_* / fixedload_smoke_*, so they can never be mistaken for
 #     (or overwrite) final artifacts. Inspect, then delete nothing — fetch
-#     smoke artifacts with the rest.
-scp scripts/cloudlab/analyze_confirm.py anasait@<dut-node>.wisc.cloudlab.us:~/
+#     smoke artifacts with the rest. Every harness invocation needs
+#     AUDITED_HEAD in its environment (same value as step 0).
+scp scripts/cloudlab/analyze_confirm.py "$DUTSSH":~/
 ssh anasait@<dut-node>.wisc.cloudlab.us
-sudo -v && sudo -n bash ~/measure_confirm.sh 1        # gate A smoke, foreground
-sudo -n bash ~/measure_fixedload.sh 1                 # gate B smoke, foreground
-# structural check of both smoke artifacts, ON DUT:
-python3 ~/analyze_confirm.py --smoke --blocks 1 ~/confirm_smoke_*.csv
-python3 ~/analyze_confirm.py --smoke --blocks 1 ~/fixedload_smoke_*.csv
+export AUDITED_HEAD="<coordinator-approved final hash>"   # same value as step 0
+sudo -v && sudo -n env AUDITED_HEAD="$AUDITED_HEAD" bash ~/measure_confirm.sh 1    # gate A smoke
+sudo -n env AUDITED_HEAD="$AUDITED_HEAD" bash ~/measure_fixedload.sh 1             # gate B smoke
+# structural check of both smoke artifacts, ON DUT. Repeated smoke attempts
+# leave several *_smoke_*.csv, so select exactly the NEWEST one explicitly —
+# the analyzer refuses more than one positional artifact. One fail-stopping
+# bash unit; the wrapper preserves the analyzer's 0/1/2 exit status:
+bash -euo pipefail <<'BASH'
+confirm_smoke_csv="$(ls -1t "$HOME"/confirm_smoke_*.csv 2>/dev/null | head -n1 || true)"
+[[ -n "$confirm_smoke_csv" && -f "$confirm_smoke_csv" ]] \
+  || { echo "No gate A smoke artifact found" >&2; exit 1; }
+echo "Analyzing gate A smoke artifact: $confirm_smoke_csv"
+python3 ~/analyze_confirm.py --mode confirm --smoke --blocks 1 "$confirm_smoke_csv"
+fixedload_smoke_csv="$(ls -1t "$HOME"/fixedload_smoke_*.csv 2>/dev/null | head -n1 || true)"
+[[ -n "$fixedload_smoke_csv" && -f "$fixedload_smoke_csv" ]] \
+  || { echo "No gate B smoke artifact found" >&2; exit 1; }
+echo "Analyzing gate B smoke artifact: $fixedload_smoke_csv"
+python3 ~/analyze_confirm.py --mode fixedload --smoke --blocks 1 "$fixedload_smoke_csv"
+echo "both smokes structurally valid (exit 0)"
+BASH
 # smoke gate — proceed to the full runs ONLY if ALL of:
 #   1. each smoke CSV has exactly 4 rows, one per condition (positions 1-4);
 #   2. knob readbacks in every row match the condition (analyzer checks too);
@@ -83,8 +116,9 @@ python3 ~/analyze_confirm.py --smoke --blocks 1 ~/fixedload_smoke_*.csv
 #    The harness fails closed: any knob mismatch, dead tunnel, or measurement
 #    failure aborts and preserves the partial artifacts.
 ssh anasait@<dut-node>.wisc.cloudlab.us
+export AUDITED_HEAD="<coordinator-approved final hash>"   # same value as step 0
 sudo -v
-nohup sudo -n bash ~/measure_confirm.sh > ~/confirm_run.log 2>&1 &
+nohup sudo -n env AUDITED_HEAD="$AUDITED_HEAD" bash ~/measure_confirm.sh > ~/confirm_run.log 2>&1 &
 tail -f ~/confirm_run.log         # one line per run: blk / pos / cond / Gb/s / CE
 
 # 2) GATE B — matched-load CPU + same-tunnel latency (~48 min), ON DUT, after gate A
@@ -93,11 +127,16 @@ tail -f ~/confirm_run.log         # one line per run: blk / pos / cond / Gb/s / 
 #    ping-pong at 2000 msg/s, 64 B payload, over the SAME tunnel (ns_c1 -> 10.0.0.1:
 #    same outer 5-tuple, same RX queue, same NAPI). 8 blocks x 4 conditions x 60 s.
 #    Load for the matched-load claim is measured over the exact T0-T1 CPU window
-#    from wg0 rx_bytes; iperf JSON is secondary evidence. Primary: steal4-off on
-#    total_busy_ce; latency primary p99 (half-RTT), the rest exploratory. wg_diag=1
-#    (measure_steal.sh methodology): classifier + steal counters for off/steal4.
+#    from wg0 rx_bytes; iperf JSON is secondary evidence. Gate B validity requires
+#    every condition's exact-window delivered load to remain within +-5% of the
+#    configured target load (default 3.8 Gb/s), in addition to the 1.5%
+#    within-block paired-load gate; the analyzer's --target-load override is only
+#    for a run intentionally predeclared at a different load, never to rescue
+#    observed data. Primary: steal4-off on total_busy_ce; latency primary p99
+#    (half-RTT), the rest exploratory. wg_diag=1 (measure_steal.sh methodology):
+#    classifier + steal counters for off/steal4.
 sudo -v
-nohup sudo -n bash ~/measure_fixedload.sh > ~/fixedload_run.log 2>&1 &
+nohup sudo -n env AUDITED_HEAD="$AUDITED_HEAD" bash ~/measure_fixedload.sh > ~/fixedload_run.log 2>&1 &
 tail -f ~/fixedload_run.log
 
 # 3) fetch EVERYTHING immediately (the lease dies with the data), from the Mac:
@@ -115,18 +154,21 @@ scp -r "anasait@<dut-node>.wisc.cloudlab.us:~/confirm_*_raw" \
 #    check); 1 = INVALID artifact / schema / treatment evidence (no inference
 #    is printed — do not hand-fix the CSV, diagnose the run); 2 = artifact
 #    valid but a validity gate voided some inference (VOID lines say which
-#    and why). tee alone would swallow the exit status — capture it via
-#    PIPESTATUS (run as a block; it does not kill your interactive shell):
-(
-  set -o pipefail
-  for f in confirm fixedload; do
-    python3 scripts/cloudlab/analyze_confirm.py "data/cloudlab/${f}_<TS>.csv" 2>&1 \
-      | tee "data/cloudlab/${f}_<TS>.analysis.txt"
-    s=${PIPESTATUS[0]}
-    echo "analyzer_exit(${f})=$s"
-    [ "$s" -eq 0 ] || exit "$s"
-  done
-)
+#    and why). tee swallows the analyzer's status unless it is captured with
+#    bash's PIPESTATUS — and the Mac's interactive shell is zsh, where
+#    $PIPESTATUS does not exist. run_analysis therefore forces the pipeline
+#    through bash, so it works identically from zsh or bash and returns the
+#    analyzer's own 0/1/2:
+run_analysis() {
+  bash -o pipefail -c '
+    python3 scripts/cloudlab/analyze_confirm.py --mode "$1" "$2" 2>&1 | tee "$3"
+    status=${PIPESTATUS[0]}
+    echo "analyzer_exit=$status"
+    exit "$status"
+  ' bash "$1" "$2" "$3"
+}
+run_analysis confirm   data/cloudlab/confirm_<TS>.csv   data/cloudlab/confirm_<TS>.analysis.txt
+run_analysis fixedload data/cloudlab/fixedload_<TS>.csv data/cloudlab/fixedload_<TS>.analysis.txt
 
 # 5) OPTIONAL, only if the lease still lives — 2 profiling windows to turn the
 #    "worker CE drops" inference (system−softirq is not isolated workers) into a

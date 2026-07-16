@@ -30,6 +30,9 @@ a printed p-value):
   absolute load     every gate B row must sit within +-5% of the target load
                     (--target-load, default 3.8 Gb/s): pairwise equality at
                     the wrong operating point is not the predeclared regime.
+                    --target-load is ONLY for a run that was intentionally
+                    predeclared at a different load — never to rescue data
+                    after observing that it failed the gate.
   pairwise load     within every block of a comparison,
                     |load_a - load_b| / pair_mean <= 1.5%; one failing pair
                     voids the whole comparison (dropping the block would be
@@ -512,12 +515,17 @@ def analyze(path, mode_flag=None, blocks_override=None, smoke=False,
             base_off = st.mean([an.metric(metric, blk, "off") for blk in blocks])
             an.report_line("interaction", ideltas, base_off, fav,
                            "SECONDARY, Holm", p_adj=adj.get(("interaction", "")))
-            print("    An interaction near zero would be consistent with "
-                  "approximate additivity on this metric's scale; a nonzero "
-                  "interaction indicates the incremental effect of stealing "
-                  "depends on whether the wake-side fixes are active. Read the "
-                  "estimate, CI, p and favorable direction above together — "
-                  "synergy/antagonism is not declared from the p-value alone.")
+            if smoke:
+                print("    SMOKE MODE: interaction structure validated; no "
+                      "inferential interpretation is produced from a "
+                      "shortened artifact.")
+            else:
+                print("    An interaction near zero would be consistent with "
+                      "approximate additivity on this metric's scale; a nonzero "
+                      "interaction indicates the incremental effect of stealing "
+                      "depends on whether the wake-side fixes are active. Read the "
+                      "estimate, CI, p and favorable direction above together — "
+                      "synergy/antagonism is not declared from the p-value alone.")
 
     print()
     if smoke:
@@ -830,6 +838,12 @@ def selftest():
     check("  ...watermarked", True, SMOKE_MARK in out)
     check("  ...no scientific verdict", True,
           "REPLICATED" not in out and "PASS" not in out and "p=" not in out)
+    check("  ...smoke interaction note, no final guidance", True,
+          "SMOKE MODE: interaction structure validated" in out
+          and "synergy/antagonism" not in out)
+    rc, out = _run_cli([one_a, art("smoke1dup", "confirm", 1)])
+    check("two positional artifacts rejected", 1, rc)
+    check("  ...names the ambiguity", True, "expected exactly one artifact" in out)
     one_b = art("smoke1b", "fixedload", 1)
     rc, out = _run_cli(["--smoke", "--blocks", "1", one_b])
     check("gate B smoke exits 0 + watermark", True, rc == 0 and SMOKE_MARK in out)
@@ -869,10 +883,15 @@ def main(argv):
               f"artifact must never produce final-looking analysis. Add "
               f"--smoke for structural validation.", file=sys.stderr)
         return 1
-    if not argv:
-        print("usage: analyze_confirm.py [--mode confirm|fixedload] "
-              "[--smoke [--blocks N]] [--target-load G] <artifact.csv> | --selftest",
-              file=sys.stderr)
+    if len(argv) != 1:
+        if len(argv) > 1:
+            print(f"expected exactly one artifact, got {len(argv)}: {argv} — "
+                  f"a glob matched several CSVs; select one explicitly "
+                  f"(newest: ls -1t ... | head -n1)", file=sys.stderr)
+        else:
+            print("usage: analyze_confirm.py [--mode confirm|fixedload] "
+                  "[--smoke [--blocks N]] [--target-load G] <artifact.csv> | --selftest",
+                  file=sys.stderr)
         return 1
     try:
         return analyze(argv[0], mode_flag=mode_flag, blocks_override=blocks,

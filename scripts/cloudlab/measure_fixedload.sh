@@ -1,5 +1,5 @@
 #!/bin/bash
-[ "$(id -u)" -eq 0 ] || exec sudo bash "$0" "$@"
+[ "$(id -u)" -eq 0 ] || exec sudo env AUDITED_HEAD="${AUDITED_HEAD:-}" bash "$0" "$@"
 # Phase D confirmation, gate B — matched-load CPU + same-tunnel tail latency.
 # Single tunnel, bulk CAPPED at LOAD Gb/s (default 3.8 — below the ~4.2 off
 # ceiling, so every condition can hold the same load), plus a low-rate
@@ -17,7 +17,12 @@
 #
 # EXACT-WINDOW LOAD (blocker 2): the matched-load validity number is
 # load_window_gbps = delta(wg0 rx_bytes)*8/(T1-T0), read at the very
-# timestamps of the CPU snapshots. wg0 rx_bytes counts inner (plaintext)
+# timestamps of the CPU snapshots. Gate B validity requires every
+# condition's exact-window delivered load to remain within +-5% of the
+# configured target load (default 3.8 Gb/s), in addition to the 1.5%
+# within-block paired-load gate — both enforced by analyze_confirm.py
+# (--target-load overrides the target ONLY for a run that was intentionally
+# predeclared at a different load, never to rescue observed data). wg0 rx_bytes counts inner (plaintext)
 # bytes delivered post-decryption — the delivered WireGuard traffic — and
 # includes the probe's ~1 Mb/s (<0.03% of 3.8 Gb/s, identical per condition).
 # iperf sum_received (full ~70 s bulk incl. ramp) is kept as SECONDARY
@@ -87,9 +92,31 @@ cleanup(){ local p
   echo "cleanup done — partial artifacts preserved under $CSV* and $RAW/" >&2; }
 trap cleanup EXIT; trap 'exit 130' INT; trap 'exit 143' TERM
 
-GITREV=$(cat "$HOME/HARNESS_GITREV" 2>/dev/null || true)
-[ -n "$GITREV" ] || fatal "missing ~/HARNESS_GITREV — stamp it from the Mac (NEXT_STEPS step 0) so the artifact provenance is auditable"
-case "$GITREV" in *dirty=1*) fatal "harness stamped from a DIRTY tree ($GITREV) — commit or stash, re-sync, re-stamp";; esac
+# Provenance stamp contract (final audit §2): one line
+#   commit=<hash> branch=cloudlab-receive-path-findings dirty=0
+# written by the NEXT_STEPS step 0 preflight. AUDITED_HEAD (env, required)
+# is the coordinator-approved commit; the stamp's commit must equal it.
+validate_stamp(){ local f=$1 line commit="" branch="" dirty="" kv
+  [ -n "${AUDITED_HEAD:-}" ] || { echo "AUDITED_HEAD is not set — run via: sudo -n env AUDITED_HEAD=<approved-hash> bash $0 (NEXT_STEPS step 0)"; return 1; }
+  [ -f "$f" ] || { echo "missing provenance stamp $f (NEXT_STEPS step 0)"; return 1; }
+  line=$(head -1 "$f")
+  for kv in $line; do
+    case "${kv%%=*}" in
+      commit) commit=${kv#*=};;
+      branch) branch=${kv#*=};;
+      dirty)  dirty=${kv#*=};;
+      *) echo "unknown field '$kv' in stamp — re-run the step 0 preflight"; return 1;;
+    esac
+  done
+  [ -n "$commit" ] || { echo "stamp lacks commit= field"; return 1; }
+  [ -n "$branch" ] || { echo "stamp lacks branch= field (commit-only stamps are refused)"; return 1; }
+  [ -n "$dirty" ]  || { echo "stamp lacks dirty= field"; return 1; }
+  [ "$branch" = "cloudlab-receive-path-findings" ] || { echo "stamp branch=$branch, expected cloudlab-receive-path-findings"; return 1; }
+  [ "$dirty" = "0" ] || { echo "stamp dirty=$dirty — harness synced from a dirty tree, re-sync from the audited commit"; return 1; }
+  [ "$commit" = "$AUDITED_HEAD" ] || { echo "stamp commit=$commit != AUDITED_HEAD=$AUDITED_HEAD — synced tree is not the approved commit"; return 1; }
+  echo "$line"
+}
+GITREV=$(validate_stamp "$HOME/HARNESS_GITREV") || fatal "provenance: $GITREV"
 
 apply_cond(){ local supp=0 head=0 steal=0 k v got
   case "$1" in
@@ -130,6 +157,7 @@ HS_SETUP=$(wg show wg0 latest-handshakes | awk '$2>0{c++} END{print c+0}')
   echo "hostname=$(hostname)"
   echo "kernel=$(uname -r)"
   echo "harness_gitrev=$GITREV"
+  echo "audited_head=$AUDITED_HEAD"
   echo "module_srcversion=$SRC"
   echo "nic=$NIC"
   echo "nic_driver=$(ethtool -i "$NIC" 2>/dev/null | awk '/^driver:/{print $2}')"
