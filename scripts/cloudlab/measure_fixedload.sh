@@ -1,5 +1,14 @@
 #!/bin/bash
-[ "$(id -u)" -eq 0 ] || exec sudo env AUDITED_HEAD="${AUDITED_HEAD:-}" bash "$0" "$@"
+# Non-root self-exec: preserve AUDITED_HEAD always, and CPU_ONLY / LOAD
+# exactly as set-or-unset (an unset variable must stay unset across sudo —
+# passing CPU_ONLY="" would turn "unset" into "explicitly empty", which the
+# contract below rejects).
+if [ "$(id -u)" -ne 0 ]; then
+  _envargs=(env AUDITED_HEAD="${AUDITED_HEAD:-}")
+  [ -n "${CPU_ONLY+x}" ] && _envargs+=(CPU_ONLY="$CPU_ONLY")
+  [ -n "${LOAD+x}" ] && _envargs+=(LOAD="$LOAD")
+  exec sudo "${_envargs[@]}" bash "$0" "$@"
+fi
 # Phase D confirmation, gate B — matched-load CPU + same-tunnel tail latency.
 # Single tunnel, bulk CAPPED at LOAD Gb/s (default 3.8 — below the ~4.2 off
 # ceiling, so every condition can hold the same load), plus a low-rate
@@ -63,6 +72,13 @@
 # (iperf JSON per run; + raw sockperf in legacy probe mode).
 #   sudo -v && nohup sudo -n bash ~/measure_fixedload.sh > ~/fixedload_run.log 2>&1 &
 set -euo pipefail
+# CPU_ONLY contract (audit §8): UNSET defaults to 0; explicitly empty, any
+# value other than exactly "0"/"1", leading zeros and whitespace are FATAL.
+if [ -z "${CPU_ONLY+x}" ]; then CPU_ONLY=0; fi
+case "$CPU_ONLY" in
+  0|1) ;;
+  *) echo "FATAL: CPU_ONLY must be exactly 0 or 1 (got '${CPU_ONLY}')" >&2; exit 1;;
+esac
 exec 9>/tmp/wg_confirmation_campaign.lock
 flock -n 9 || { echo "FATAL: another confirmation campaign (gate A or B) is running" >&2; exit 1; }
 BLOCKS=${1:-8}
@@ -70,8 +86,6 @@ DUR=${2:-60}
 GEN=${3:-gen}
 NIC=${4:-$(ip -br addr | awk '/192\.168\.1\.1\//{print $1; exit}')}
 [ -n "$NIC" ] || { echo "FATAL: cannot find the experiment NIC (192.168.1.1)" >&2; exit 1; }
-CPU_ONLY=${CPU_ONLY:-0}      # 1 = CPU-only mode (no latency probe); must be exactly 0 or 1
-case "$CPU_ONLY" in 0|1) ;; *) echo "FATAL: CPU_ONLY must be exactly 0 or 1 (got '$CPU_ONLY')" >&2; exit 1;; esac
 if [ "$CPU_ONLY" = "1" ]; then
   LOAD=${LOAD:-3.58}         # application cap that delivers ~3.8 Gb/s of wg0 rx_bytes
 else
@@ -187,21 +201,27 @@ HS_SETUP=$(wg show wg0 latest-handshakes | awk '$2>0{c++} END{print c+0}')
   echo "governor=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo NA)"
   echo "irqbalance=$(systemctl is-active irqbalance 2>/dev/null || echo NA)"
   echo "blocks=$BLOCKS"; echo "window_s=$DUR"; echo "streams=$STREAMS"
-  echo "target_load_gbps=$LOAD"; echo "per_stream_mbit=$PSM"
   if [ "$CPU_ONLY" = "1" ]; then
+    # unambiguous CPU-only identity only: no 'target_load_gbps' (ambiguous
+    # between the application cap and the delivered target — audit §9)
     echo "cpu_only=1"; echo "probe_mode=none"
-    echo "application_cap_gbps=$LOAD"
+    echo "application_cap_gbps=$LOAD"; echo "per_stream_mbit=$PSM"
     echo "delivered_target_metric=wg0_rx_bytes_exact_window"
     echo "delivered_target_gbps=3.8"
     echo "absolute_tolerance_pct=5"
     echo "paired_tolerance_pct=1.5"
   else
+    echo "target_load_gbps=$LOAD"; echo "per_stream_mbit=$PSM"
     echo "sockperf_mps=$MPS"; echo "sockperf_msgsize=$MSGSIZE"
     echo "sockperf_latency_convention=half_rtt"
   fi
   echo "wgdiag=$WGDIAG"; echo "conds=${CONDS[*]}"
   echo "setup_handshakes=$HS_SETUP/8"
-  echo "load_counter=wg0/statistics/rx_bytes (inner plaintext bytes delivered post-decryption, incl ~1 Mb/s probe)"
+  if [ "$CPU_ONLY" = "1" ]; then
+    echo "load_counter=wg0/statistics/rx_bytes (inner plaintext bytes delivered post-decryption)"
+  else
+    echo "load_counter=wg0/statistics/rx_bytes (inner plaintext bytes delivered post-decryption, incl ~1 Mb/s probe)"
+  fi
 } > "$META"
 
 if [ "$CPU_ONLY" = "1" ]; then

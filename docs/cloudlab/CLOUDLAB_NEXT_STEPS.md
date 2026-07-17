@@ -31,13 +31,11 @@
 Freezes Finding 8 for the report. The headline (+4.15% at `wg_steal=4`, CPU −3–5%,
 efficiency +5.4–7.6%) currently rests on one discovery sweep, n=5 per knob value, and a
 p-value floored at 0.008 by C(10,5)=252. These two gates re-test it as **within-block
-paired deltas** (12 blocks → smallest reachable p ≈ 0.0005), and answer three questions
+paired deltas** (12 blocks → smallest reachable p ≈ 0.0005), and answer two questions
 the sweep could not: does the full stack compose (`bsteal4` vs `steal4` — the sweep was
-**steal-alone**, wake fixes off), does "same bytes, less CPU" hold at matched load
-(cleaner than the Gb/s-per-CE ratio), and does same-tunnel tail latency move (the old
-probe peer never shared the blocked tunnel, so its null was by construction). Decision
-rules are pre-declared in `analyze_confirm.py`'s docstring — read them before looking at
-results, not after.
+**steal-alone**, wake fixes off), and does "same bytes, less CPU" hold at matched load
+(cleaner than the Gb/s-per-CE ratio). Decision rules are pre-declared in
+`analyze_confirm.py`'s docstring — read them before looking at results, not after.
 
 **Scope of the claim.** These confirmation runs reuse the existing DUT and generator
 from the same CloudLab instantiation. The 130-second quiet period below is an
@@ -112,24 +110,29 @@ export AUDITED_HEAD="<coordinator-approved final hash>"   # same value as step 0
 # REKEY_AFTER_TIME (120 s) keeps sending under the dead session for ~15 s
 # instead of re-handshaking, and the liveness gate (correctly) aborts. Sessions
 # older than 120 s re-handshake instantly. Hence the sleep guards below.
-sudo -v && sleep 130 && sudo -n env AUDITED_HEAD="$AUDITED_HEAD" bash ~/measure_confirm.sh 1              # gate A smoke (DONE 2026-07-16)
-sleep 130 && sudo -n env CPU_ONLY=1 LOAD=3.58 AUDITED_HEAD="$AUDITED_HEAD" bash ~/measure_fixedload.sh 1  # gate B CPU-only smoke
-# structural check, ON DUT. Repeated smoke attempts leave several
-# *_smoke_*.csv, so select exactly the NEWEST one explicitly — the analyzer
-# refuses more than one positional artifact. One fail-stopping bash unit;
-# the wrapper preserves the analyzer's 0/1/2 exit status:
+sudo -v && sleep 130 && sudo -n env AUDITED_HEAD="$AUDITED_HEAD" bash ~/measure_confirm.sh 1   # gate A smoke (DONE 2026-07-16)
+# gate B CPU-only smoke, with BEFORE/AFTER set-difference artifact isolation:
+# repeated attempts leave several *_smoke_*.csv (the aborted 2026-07-16/17
+# artifacts are preserved evidence — never delete them), so the newly created
+# CSV is identified by set difference, and exactly ONE new artifact is
+# required. One fail-stopping bash unit; the analyzer's 0/1/2 exit survives.
 bash -euo pipefail <<'BASH'
-confirm_smoke_csv="$(ls -1t "$HOME"/confirm_smoke_*.csv 2>/dev/null | head -n1 || true)"
-[[ -n "$confirm_smoke_csv" && -f "$confirm_smoke_csv" ]] \
-  || { echo "No gate A smoke artifact found" >&2; exit 1; }
-echo "Analyzing gate A smoke artifact: $confirm_smoke_csv"
-python3 ~/analyze_confirm.py --mode confirm --smoke --blocks 1 "$confirm_smoke_csv"
-cpu_smoke_csv="$(ls -1t "$HOME"/fixedload_cpu_smoke_*.csv 2>/dev/null | head -n1 || true)"
-[[ -n "$cpu_smoke_csv" && -f "$cpu_smoke_csv" ]] \
-  || { echo "No gate B CPU-only smoke artifact found" >&2; exit 1; }
-echo "Analyzing gate B CPU-only smoke artifact: $cpu_smoke_csv"
-python3 ~/analyze_confirm.py --cpu-only --smoke --blocks 1 "$cpu_smoke_csv"
-echo "smokes structurally valid (exit 0)"
+before="$(mktemp)"
+find "$HOME" -maxdepth 1 -type f -name 'fixedload_cpu_smoke_*.csv' -print |
+  LC_ALL=C sort > "$before"
+sleep 130
+sudo -n env CPU_ONLY=1 LOAD=3.58 AUDITED_HEAD="$AUDITED_HEAD" bash "$HOME/measure_fixedload.sh" 1
+mapfile -t new_smokes < <(
+  comm -13 "$before" \
+    <(find "$HOME" -maxdepth 1 -type f -name 'fixedload_cpu_smoke_*.csv' -print |
+      LC_ALL=C sort))
+rm -f "$before"
+[[ "${#new_smokes[@]}" -eq 1 ]] \
+  || { echo "expected exactly 1 new gate B smoke CSV, got ${#new_smokes[@]}" >&2; exit 1; }
+fixedload_cpu_smoke_csv="${new_smokes[0]}"
+echo "Analyzing gate B CPU-only smoke artifact: $fixedload_cpu_smoke_csv"
+python3 ~/analyze_confirm.py --cpu-only --smoke --blocks 1 "$fixedload_cpu_smoke_csv"
+echo "gate B CPU-only smoke structurally valid (exit 0)"
 BASH
 # smoke gate — proceed to the full runs ONLY if ALL of:
 #   1. each smoke CSV has exactly 4 rows, one per condition (positions 1-4);
@@ -166,23 +169,28 @@ nohup sudo -n env AUDITED_HEAD="$AUDITED_HEAD" \
 echo "$!" | tee "$HOME/confirm_run.pid"
 tail -f "$HOME/confirm_run.log"   # one line per run: blk / pos / cond / Gb/s / CE
 
-# 2) GATE B — matched-load CPU + same-tunnel latency (~48 min), ON DUT, after gate A
-#    (a shared lock refuses to run both at once). Bulk capped at 3.8 Gb/s (below the
-#    ~4.2 off ceiling, so every condition can hold the same load) + sockperf UDP
-#    ping-pong at 2000 msg/s, 64 B payload, over the SAME tunnel (ns_c1 -> 10.0.0.1:
-#    same outer 5-tuple, same RX queue, same NAPI). 8 blocks x 4 conditions x 60 s.
+# 2) GATE B — matched-load CPU-ONLY confirmation (~48 min), ON DUT, after gate A
+#    (a shared lock refuses to run both at once). Inferential same-tunnel
+#    latency was withdrawn before this full campaign; the failed sockperf smoke
+#    produced no reportable latency null and no reportable percentile, and NO
+#    sockperf process runs in CPU_ONLY=1 mode. (Future work: an open-loop or
+#    loss-tolerant probe could revisit same-tunnel latency; not this campaign.)
+#    Single tunnel (ns_c1 -> 10.0.0.1), 8 blocks x 4 conditions x 60 s.
 #    Load for the matched-load claim is measured over the exact T0-T1 CPU window
-#    from wg0 rx_bytes; iperf JSON is secondary evidence. CPU-ONLY (see the
-#    Status note above): CPU_ONLY=1, no latency probe of any kind; LOAD=3.58 is
+#    from wg0 rx_bytes; iperf JSON is secondary evidence. CPU_ONLY=1: LOAD=3.58 is
 #    the application-level calibration whose delivered wg0 rx_bytes rate is the
 #    unchanged 3.8 Gb/s scientific target; the absolute gate is [3.61, 3.99]
 #    (+-5%) on every row and the paired gate 1.5% per block per comparison;
-#    --target-load is never used to rescue observed data. Primary: steal4-off
-#    on total_busy_ce (single primary). Secondaries: both-off, bsteal4-steal4,
-#    bsteal4-both, bsteal4-off, interaction — one five-test Holm family.
+#    --target-load is never used to rescue observed data. FAIL-CLOSED POLICY
+#    (same as the analyzer's): ANY absolute or paired-load failure, or any
+#    per-run kernel warning, anywhere in the campaign, suppresses ALL
+#    inferential output — no primary verdict, no secondary p-values, no
+#    interaction, no reduced Holm family; the analyzer exits 2. Primary:
+#    steal4-off on total_busy_ce (single primary). Secondaries: both-off,
+#    bsteal4-steal4, bsteal4-both, bsteal4-off, interaction — one FIXED
+#    five-test Holm family (never recalculated over fewer tests).
 #    softirq/system CE, per-core, classifier + steal counters (wg_diag=1) are
-#    DESCRIPTIVE only. Latency inference was withdrawn before this run; no
-#    sockperf percentile from the failed 2026-07-17 smoke is reportable.
+#    DESCRIPTIVE only.
 sudo -v      # sleep guard: see the QUIET PERIOD note in step 0b
 # Same user-side path resolution as gate A — never let root's bash expand ~.
 harness="$(readlink -f "$HOME/measure_fixedload.sh")"
@@ -259,9 +267,10 @@ fix; the analyzer's factorial interaction contrast quantifies it. An unexpected
 significant `both-off` on gbps/CPU → inspect load, knob readbacks, ordering/carryover
 and the raw artifacts first; replicate independently before believing it; if it
 reproduces, retain it as a regime-specific finding (the Phase A null was measured in the
-multi-peer regime, not this one). Latency null → stays a null in the report; the CPU
-result stands on its own. p99.9 counts only where the analyzer's loss/support gates let
-it. No outcome here proves production safety.
+multi-peer regime, not this one). Gate B carries no latency endpoint of any kind:
+inferential same-tunnel latency was withdrawn before the full campaign, and the failed
+sockperf smoke produced no reportable latency null and no reportable percentile — do not
+cite its numbers anywhere. No outcome here proves production safety.
 
 ---
 

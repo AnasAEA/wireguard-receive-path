@@ -226,6 +226,82 @@ def check_raw_ref(row, mode, ctx):
             raise Invalid(f"{ctx}: CPU-only row lacks an iperf raw reference")
 
 
+CPU_META_IDENTITY = ("application_cap_gbps", "delivered_target_metric",
+                     "delivered_target_gbps", "absolute_tolerance_pct",
+                     "paired_tolerance_pct")
+
+
+def check_cpu_sidecars(path, table, src):
+    """CPU-only artifact linkage (audit §5): the .meta and .percore sidecars
+    must exist next to the CSV, agree with it, and align row-for-row.
+    Missing or contradictory linkage is exit 1 — the analyzer must not infer
+    from an artifact whose provenance or per-core evidence is broken."""
+    meta_p, pc_p = path + ".meta", path + ".percore"
+    if not os.path.exists(meta_p):
+        raise Invalid(f"missing metadata sidecar {meta_p}")
+    kv = {}
+    with open(meta_p) as fh:
+        for line in fh:
+            if "=" in line:
+                k, _, v = line.rstrip("\n").partition("=")
+                kv[k] = v
+    if kv.get("cpu_only") != "1" or kv.get("probe_mode") != "none":
+        raise Invalid(f"{meta_p}: cpu_only={kv.get('cpu_only')!r} / "
+                      f"probe_mode={kv.get('probe_mode')!r} contradict the "
+                      f"CSV's CPU-only markers")
+    if kv.get("module_srcversion") != src:
+        raise Invalid(f"{meta_p}: module_srcversion="
+                      f"{kv.get('module_srcversion')!r} != CSV srcversion "
+                      f"{src!r}")
+    ah = (kv.get("audited_head") or "").strip()
+    if not ah:
+        raise Invalid(f"{meta_p}: empty/missing audited_head")
+    if not (kv.get("harness_gitrev") or "").startswith(f"commit={ah} "):
+        raise Invalid(f"{meta_p}: harness_gitrev does not certify "
+                      f"audited_head={ah}")
+    missing = [k for k in CPU_META_IDENTITY if not kv.get(k)]
+    if missing:
+        raise Invalid(f"{meta_p}: missing CPU-only identity key(s) {missing}")
+    if kv["delivered_target_metric"] != "wg0_rx_bytes_exact_window":
+        raise Invalid(f"{meta_p}: delivered_target_metric="
+                      f"{kv['delivered_target_metric']!r}")
+
+    if not os.path.exists(pc_p):
+        raise Invalid(f"missing per-core sidecar {pc_p}")
+    runs = {}
+    with open(pc_p) as fh:
+        header = fh.readline().split()
+        if header[:8] != ["timestamp", "block", "position", "cond", "cpu",
+                          "busy_ce", "softirq_ce", "system_ce"]:
+            raise Invalid(f"{pc_p}: unexpected header {header}")
+        for n, line in enumerate(fh, start=2):
+            f = line.split()
+            if len(f) != 8:
+                raise Invalid(f"{pc_p}:{n}: expected 8 fields, got {len(f)}")
+            for x in f[5:8]:
+                try:
+                    float(x)
+                except ValueError:
+                    raise Invalid(f"{pc_p}:{n}: malformed CE value {x!r}")
+            runs.setdefault((f[1], f[2]), {"cond": set(), "cpus": []})
+            runs[(f[1], f[2])]["cond"].add(f[3])
+            runs[(f[1], f[2])]["cpus"].append(f[4])
+    want_runs = {(b, r["position"]): c for (b, c), r in table.items()}
+    if set(runs) != set(want_runs):
+        raise Invalid(f"{pc_p}: per-core runs {sorted(runs)} != CSV runs "
+                      f"{sorted(want_runs)}")
+    cpu_sets = set()
+    for key, info in runs.items():
+        if info["cond"] != {want_runs[key]}:
+            raise Invalid(f"{pc_p}: run block={key[0]} pos={key[1]} labeled "
+                          f"{sorted(info['cond'])}, CSV says {want_runs[key]} "
+                          f"— contradictory linkage")
+        cpu_sets.add(tuple(sorted(info["cpus"])))
+    if len(cpu_sets) != 1:
+        raise Invalid(f"{pc_p}: per-run CPU sets differ — topology "
+                      f"inconsistent across runs")
+
+
 def load_artifact(path, mode_flag=None, blocks_override=None, cpu_only=False):
     with open(path) as fh:
         rows = list(csv.DictReader(fh))
@@ -263,7 +339,18 @@ def load_artifact(path, mode_flag=None, blocks_override=None, cpu_only=False):
             raise Invalid(f"duplicate row for block={key[0]} cond={cond}")
         table[key] = r
 
-    blocks = sorted({b for b, _ in table}, key=lambda x: int(x))
+    labels = {b for b, _ in table}
+    if mode == "fixedload_cpu":
+        # exact block-ID validation (audit §3): integral labels forming
+        # exactly 1..want — not merely `want` distinct arbitrary labels
+        try:
+            ids = sorted(int(b) for b in labels)
+        except (ValueError, TypeError):
+            raise Invalid(f"non-integral block label among {sorted(labels)}")
+        if ids != list(range(1, want + 1)):
+            raise Invalid(f"block ids {ids} != required exactly "
+                          f"1..{want} (CPU-only mode)")
+    blocks = sorted(labels, key=lambda x: int(x))
     if len(blocks) != want:
         raise Invalid(f"{len(blocks)} blocks found, expected exactly {want} "
                       f"(--blocks N is allowed only together with --smoke)")
@@ -292,7 +379,11 @@ def load_artifact(path, mode_flag=None, blocks_override=None, cpu_only=False):
                 raise Invalid(f"{ctx}: probe_mode={r.get('probe_mode')!r} — a "
                               f"CPU-only artifact cannot claim a live probe")
             fnum(r, "load_window_gbps", ctx, positive=True)
+            fnum(r, "load_iperf_gbps", ctx, positive=True)
+            fnum(r, "window_s", ctx, positive=True)
             fnum(r, "ping_ms", ctx, positive=True)
+            inum(r, "retransmits", ctx, lo=0)
+            inum(r, "hs_age_s", ctx, lo=0)
             inum(r, "dmesg_new", ctx, lo=0)
             for k in ("unc_n", "unc_total_ns", "steal_pulled",
                       "steal_unblocked", "steal_dryruns"):
@@ -311,6 +402,8 @@ def load_artifact(path, mode_flag=None, blocks_override=None, cpu_only=False):
             for k in ("p50_half_rtt_us", "p90_half_rtt_us",
                       "p99_half_rtt_us", "p999_half_rtt_us"):
                 fnum(r, k, ctx, positive=True)
+    if mode == "fixedload_cpu":
+        check_cpu_sidecars(path, table, next(iter(src)))
     return mode, blocks, table, src.pop()
 
 
@@ -364,6 +457,19 @@ class Analysis:
             return float(r["gbps"]) / float(r["total_busy_ce"])
         return float(r[name])
 
+    def _abs_load_row_reason(self, blk, c):
+        """Inclusive-endpoint absolute gate on one row: the measured (never
+        rounded) rate must lie in [target*(1-tol), target*(1+tol)], endpoints
+        inclusive with a 1e-9 float guard (audit §6)."""
+        lo = self.target * (1 - ABS_LOAD_TOL_PCT / 100)
+        hi = self.target * (1 + ABS_LOAD_TOL_PCT / 100)
+        l = float(self.row(blk, c)["load_window_gbps"])
+        if l < lo - 1e-9 or l > hi + 1e-9:
+            return (f"absolute load gate: block {blk} cond {c} measured "
+                    f"{l:.6g} Gb/s, target {self.target} Gb/s, allowed "
+                    f"[{lo:.3f}, {hi:.3f}] — not the predeclared regime")
+        return None
+
     def abs_load_reason(self, conds):
         """Gate B absolute plausibility: every involved row must sit at the
         intended operating point, not merely match its partner."""
@@ -371,14 +477,38 @@ class Analysis:
             return None
         for blk in self.blocks:
             for c in conds:
-                l = float(self.row(blk, c)["load_window_gbps"])
-                dev = 100 * abs(l - self.target) / self.target
-                if dev > ABS_LOAD_TOL_PCT:
-                    return (f"absolute load gate: block {blk} cond {c} "
-                            f"{l:.3f} Gb/s is {dev:.1f}% from the "
-                            f"{self.target} Gb/s target (> {ABS_LOAD_TOL_PCT}%)"
-                            f" — not the predeclared regime")
+                reason = self._abs_load_row_reason(blk, c)
+                if reason:
+                    return reason
         return None
+
+    def campaign_void_reasons(self):
+        """CPU-only campaign-level reliability preflight (audit §1/§7):
+        EVERY row must pass the absolute-load and dmesg gates, and EVERY
+        predeclared pair must pass the 1.5% paired gate in EVERY block.
+        Any failure voids the whole campaign — no primary, no secondaries,
+        no interaction, no reduced Holm family, exit 2."""
+        if self.mode != "fixedload_cpu":
+            return []
+        reasons = []
+        for blk in self.blocks:
+            for c in CONDS:
+                reason = self._abs_load_row_reason(blk, c)
+                if reason:
+                    reasons.append(reason)
+                if int(float(self.row(blk, c)["dmesg_new"])) > 0:
+                    reasons.append(f"dmesg gate: block {blk} cond {c} logged "
+                                   f"kernel warnings during the window")
+        for a, b in COMPS:
+            for blk in self.blocks:
+                la = float(self.row(blk, a)["load_window_gbps"])
+                lb = float(self.row(blk, b)["load_window_gbps"])
+                mis = 100 * abs(la - lb) / ((la + lb) / 2)
+                if mis > LOAD_GATE_PCT + 1e-9:
+                    reasons.append(f"pairwise load gate: block {blk} "
+                                   f"{a}={la:.3f} vs {b}={lb:.3f} Gb/s, "
+                                   f"mismatch {mis:.2f}% > {LOAD_GATE_PCT}%")
+        return reasons
 
     def load_void_reason(self, a, b):
         """Gate B matched-load gates for one comparison: absolute plausibility
@@ -526,6 +656,29 @@ def analyze(path, mode_flag=None, blocks_override=None, smoke=False,
               " ".join(f"{c}={means[c]:.3f}" for c in CONDS) +
               f"  — absolute + pairwise {LOAD_GATE_PCT}% gates applied per "
               f"comparison below")
+
+    # CPU-only campaign-level reliability preflight (audit §1/§7): any
+    # absolute-load, paired-load or dmesg failure anywhere in the campaign
+    # suppresses ALL inference — no primary verdict, no secondary p-values,
+    # no interaction, no CIs, no reduced Holm family. Descriptive artifact
+    # information above/below is allowed; inferential output is not.
+    if mode == "fixedload_cpu":
+        reasons = an.campaign_void_reasons()
+        if reasons:
+            print(f"\nCAMPAIGN VOID — {len(reasons)} reliability failure(s); "
+                  f"fail-closed policy suppresses every inferential result:")
+            for r_ in reasons:
+                print(f"  VOID — {r_}")
+            print("\ndescriptive diag counters (per-window means; classifier "
+                  "comparable only where wg_supp is off — off, steal4):")
+            for c in CONDS:
+                un = st.mean([float(an.row(b, c)["unc_n"]) for b in blocks])
+                sp = st.mean([float(an.row(b, c)["steal_pulled"])
+                              for b in blocks])
+                print(f"  {c:>8}: unc_n {un:>12,.0f}   steal_pulled {sp:>12,.0f}")
+            if smoke:
+                print(f"\n=== {SMOKE_MARK} — no scientific verdict is implied ===")
+            return 2
 
     verdict = {}
     for metric in metrics:
@@ -707,6 +860,26 @@ def _write(path, mode, blocks, mutate=None):
         w = csv.DictWriter(fh, fieldnames=list(rows[0]))
         w.writeheader()
         w.writerows(rows)
+    if mode == "fixedload_cpu":
+        # emit the linked sidecars the analyzer now requires (audit §5),
+        # built from the (possibly mutated) rows so they stay consistent
+        with open(path + ".meta", "w") as m:
+            m.write("campaign=fixedload_gateB\ncpu_only=1\nprobe_mode=none\n")
+            m.write(f"module_srcversion={rows[0]['srcversion']}\n")
+            m.write("audited_head=FAKEHEAD\n")
+            m.write("harness_gitrev=commit=FAKEHEAD "
+                    "branch=cloudlab-receive-path-findings dirty=0\n")
+            m.write("application_cap_gbps=3.58\n")
+            m.write("delivered_target_metric=wg0_rx_bytes_exact_window\n")
+            m.write("delivered_target_gbps=3.8\nabsolute_tolerance_pct=5\n")
+            m.write("paired_tolerance_pct=1.5\n")
+        with open(path + ".percore", "w") as pfh:
+            pfh.write("timestamp block position cond cpu busy_ce "
+                      "softirq_ce system_ce\n")
+            for r in rows:
+                for cpu in ("cpu0", "cpu1"):
+                    pfh.write(f"t {r['block']} {r['position']} {r['cond']} "
+                              f"{cpu} 0.100 0.010 0.090\n")
 
 
 def _run(path, blocks=None, smoke=False, cpu_only=False):
@@ -993,26 +1166,159 @@ def selftest():
     check("cpu-only sockperf raw_ref contradiction", "invalid",
           _run(art("cref", "fixedload_cpu", 8, cref), cpu_only=True)[0])
 
+    def suppressed(out):
+        """True iff the output contains NO inferential result whatsoever."""
+        return ("p=" not in out and "CI95" not in out and "p_holm" not in out
+                and "deltas:" not in out and "GATE B PRIMARY" not in out
+                and "CAMPAIGN VOID" in out)
+
     def clow(rows):
         for r in rows:
             r["load_window_gbps"] = "2.000"
     stat, out = _run(art("clow", "fixedload_cpu", 8, clow), cpu_only=True)
     check("cpu-only absolute-load gate", "void", stat)
-    check("  ...voids the CPU-only primary", True, "GATE B PRIMARY: VOID" in out)
+    check("  ...ALL inference suppressed (no primary/p/CI/Holm)", True,
+          suppressed(out))
+
+    def bothbad(rows):   # only 'both' rows fail; steal4-off pair itself valid
+        for r in rows:
+            if r["cond"] == "both":
+                r["load_window_gbps"] = "3.500"
+    stat, out = _run(art("bothbad", "fixedload_cpu", 8, bothbad),
+                     cpu_only=True)
+    check("campaign-invalid 'both' suppresses valid steal4-off primary",
+          "void", stat)
+    check("  ...no PRIMARY PASS despite valid steal4-off pair", True,
+          suppressed(out))
 
     def cpair(rows):
         for r in rows:
             if r["block"] == "4":
                 r["load_window_gbps"] = ("3.876" if r["cond"] == "steal4"
                                          else "3.724")
-    check("cpu-only paired-load gate", "void",
-          _run(art("cpair", "fixedload_cpu", 8, cpair), cpu_only=True)[0])
+    stat, out = _run(art("cpair", "fixedload_cpu", 8, cpair), cpu_only=True)
+    check("cpu-only paired-load gate", "void", stat)
+    check("  ...paired failure also suppresses everything", True,
+          suppressed(out))
 
     def cdm(rows):
         rows[2]["dmesg_new"] = "3"
     stat, out = _run(art("cdm", "fixedload_cpu", 8, cdm), cpu_only=True)
     check("cpu-only dmesg reliability gate", "void", stat)
     check("  ...dmesg gate named in reason", True, "dmesg gate" in out)
+    check("  ...dmesg failure suppresses ALL inference", True, suppressed(out))
+
+    # fixed five-test Holm family: ONE failing secondary pair must not shrink
+    # the family — the whole campaign voids instead (regression for the
+    # reduced-Holm defect)
+    def bb_pair(rows):   # bsteal4-both mismatch in block 3, all else valid
+        for r in rows:
+            if r["block"] == "3" and r["cond"] == "bsteal4":
+                r["load_window_gbps"] = "3.830"
+            elif r["block"] == "3" and r["cond"] == "both":
+                r["load_window_gbps"] = "3.770"
+            elif r["block"] == "3":
+                r["load_window_gbps"] = "3.800"
+    stat, out = _run(art("bb_pair", "fixedload_cpu", 8, bb_pair),
+                     cpu_only=True)
+    check("one invalid secondary pair -> campaign void", "void", stat)
+    check("  ...no reduced Holm family computed", True,
+          "p_holm" not in out and suppressed(out))
+    check("  ...the failing pair is named", True,
+          "bsteal4=3.830 vs both=3.770" in out)
+
+    # absolute-load boundary semantics (inclusive endpoints, audit §6)
+    def setload(v):
+        def f(rows):
+            for r in rows:
+                r["load_window_gbps"] = v
+        return f
+    check("abs-load 3.61 lower endpoint passes", "ok",
+          _run(art("b361", "fixedload_cpu", 8, setload("3.61")),
+               cpu_only=True)[0])
+    check("abs-load 3.99 upper endpoint passes", "ok",
+          _run(art("b399", "fixedload_cpu", 8, setload("3.99")),
+               cpu_only=True)[0])
+    check("abs-load 3.609999 voids", "void",
+          _run(art("b360", "fixedload_cpu", 8, setload("3.609999")),
+               cpu_only=True)[0])
+    check("abs-load 3.990001 voids", "void",
+          _run(art("b400", "fixedload_cpu", 8, setload("3.990001")),
+               cpu_only=True)[0])
+
+    # window_s evidence (audit §4)
+    def no_window(rows):
+        for r in rows:
+            del r["window_s"]
+    check("cpu-only missing window_s", "invalid",
+          _run(art("nowin", "fixedload_cpu", 8, no_window), cpu_only=True)[0])
+
+    def zero_window(rows):
+        rows[4]["window_s"] = "0"
+    check("cpu-only window_s=0", "invalid",
+          _run(art("zwin", "fixedload_cpu", 8, zero_window), cpu_only=True)[0])
+
+    # exact block IDs (audit §3)
+    def shift_blocks(rows):
+        for r in rows:
+            r["block"] = str(int(r["block"]) + 1)   # 2..9: eight labels, wrong ids
+    check("cpu-only blocks 2..9 rejected", "invalid",
+          _run(art("shift", "fixedload_cpu", 8, shift_blocks),
+               cpu_only=True)[0])
+
+    def nonint_block(rows):
+        for r in rows:
+            if r["block"] == "5":
+                r["block"] = "b5"
+    check("cpu-only non-integral block label rejected", "invalid",
+          _run(art("nonint", "fixedload_cpu", 8, nonint_block),
+               cpu_only=True)[0])
+    # (exact blocks 1..8 accepted is proven by the valid-full test above)
+
+    # sidecar linkage (audit §5)
+    p_ = art("meta_gone", "fixedload_cpu", 8)
+    os.remove(p_ + ".meta")
+    check("cpu-only missing .meta sidecar", "invalid",
+          _run(p_, cpu_only=True)[0])
+
+    p_ = art("meta_contra", "fixedload_cpu", 8)
+    with open(p_ + ".meta") as fh:
+        txt = fh.read()
+    with open(p_ + ".meta", "w") as fh:
+        fh.write(txt.replace("module_srcversion=ABC", "module_srcversion=XYZ"))
+    check("meta/CSV srcversion contradiction", "invalid",
+          _run(p_, cpu_only=True)[0])
+
+    p_ = art("pc_gone", "fixedload_cpu", 8)
+    os.remove(p_ + ".percore")
+    check("cpu-only missing .percore sidecar", "invalid",
+          _run(p_, cpu_only=True)[0])
+
+    p_ = art("pc_contra", "fixedload_cpu", 8)
+    with open(p_ + ".percore") as fh:
+        pls = fh.readlines()
+    pls[1] = pls[1].replace(" off ", " both ")
+    with open(p_ + ".percore", "w") as fh:
+        fh.writelines(pls)
+    check("percore/CSV condition contradiction", "invalid",
+          _run(p_, cpu_only=True)[0])
+
+    # known-value interaction construction: (bsteal4-steal4)-(both-off)
+    tbl_ = {("1", "off"): {"total_busy_ce": "1.5"},
+            ("1", "both"): {"total_busy_ce": "2.0"},
+            ("1", "steal4"): {"total_busy_ce": "3.0"},
+            ("1", "bsteal4"): {"total_busy_ce": "4.0"}}
+    an_ = Analysis("confirm", ["1"], tbl_, False, TARGET_LOAD_GBPS)
+    check("interaction known-value: (4-3)-(2-1.5) = 0.5", True,
+          abs(an_.interaction_deltas("total_busy_ce")[0] - 0.5) < 1e-12)
+
+    # campaign-void smoke stays descriptive and fails closed
+    rc, out = _run_cli(["--cpu-only", "--smoke", "--blocks", "1",
+                        art("cpu_smoke_void", "fixedload_cpu", 1,
+                            setload("2.0"))])
+    check("cpu-only smoke fails closed on reliability gates", 2, rc)
+    check("  ...smoke void watermarked, no inference", True,
+          SMOKE_MARK in out and "p=" not in out and "CAMPAIGN VOID" in out)
 
     # legacy latency mode must be untouched by the CPU-only additions
     stat, out = _run(art("legacy_regress", "fixedload", 8))
