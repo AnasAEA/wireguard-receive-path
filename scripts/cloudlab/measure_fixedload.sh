@@ -40,12 +40,27 @@
 # one-block smoke exists to catch exactly that. Payload is EXPLICIT (MSGSIZE,
 # default 64 B); percentile columns are *_half_rtt_us (ping-pong = RTT/2).
 #
+# CPU-ONLY MODE (coordinator-approved 2026-07-17, after the sockperf smoke
+# failure): CPU_ONLY=1 turns gate B into a matched-delivered-load CPU
+# confirmation with NO latency probe at all — no sockperf server, no client,
+# no latency columns, no fabricated values. The measured window is the same
+# [T0,T1] pair of byte+CPU snapshots, held open by 'sleep DUR' instead of
+# the probe. Everything else is untouched: bulk cap + 5 s stabilization,
+# liveness ping, identical warm-up, knob readbacks, classifier/steal counter
+# resets+reads (descriptive), per-core capture, per-run dmesg deltas, raw
+# iperf JSON, fail-closed aborts. LOAD defaults to 3.58 in this mode: the
+# APPLICATION-level pacing that lands the delivered wg0 rx_bytes window rate
+# on the 3.8 Gb/s scientific target (inner IP bytes carry ~6% header +
+# retransmit overhead over iperf payload — measured 2026-07-17). Artifacts
+# are fixedload_cpu_* / fixedload_cpu_smoke_* and carry cpu_only/probe_mode
+# markers in both the CSV and .meta; analyze with --cpu-only.
+#
 # PROVENANCE GUARD: refuses to run without a clean-tree ~/HARNESS_GITREV
 # stamp (see NEXT_STEPS step 0). BLOCKS != 8 renames artifacts to
-# fixedload_smoke_* so a shortened smoke can never pass as a final artifact.
+# *_smoke_* so a shortened smoke can never pass as a final artifact.
 #
 # Artifacts: $CSV, $CSV.meta, $CSV.percore, $CSV.dmesg, ${CSV%.csv}_raw/
-# (iperf JSON + raw sockperf per run).
+# (iperf JSON per run; + raw sockperf in legacy probe mode).
 #   sudo -v && nohup sudo -n bash ~/measure_fixedload.sh > ~/fixedload_run.log 2>&1 &
 set -euo pipefail
 exec 9>/tmp/wg_confirmation_campaign.lock
@@ -55,14 +70,21 @@ DUR=${2:-60}
 GEN=${3:-gen}
 NIC=${4:-$(ip -br addr | awk '/192\.168\.1\.1\//{print $1; exit}')}
 [ -n "$NIC" ] || { echo "FATAL: cannot find the experiment NIC (192.168.1.1)" >&2; exit 1; }
-LOAD=${LOAD:-3.8}            # Gb/s: total bulk cap over the single tunnel
+CPU_ONLY=${CPU_ONLY:-0}      # 1 = CPU-only mode (no latency probe); must be exactly 0 or 1
+case "$CPU_ONLY" in 0|1) ;; *) echo "FATAL: CPU_ONLY must be exactly 0 or 1 (got '$CPU_ONLY')" >&2; exit 1;; esac
+if [ "$CPU_ONLY" = "1" ]; then
+  LOAD=${LOAD:-3.58}         # application cap that delivers ~3.8 Gb/s of wg0 rx_bytes
+else
+  LOAD=${LOAD:-3.8}          # Gb/s: total bulk cap over the single tunnel (legacy)
+fi
 STREAMS=${STREAMS:-4}
-MPS=${MPS:-2000}             # probe msgs/s: 2000 x 60 s = 120k obs, p99.9 rests on ~120
-MSGSIZE=${MSGSIZE:-64}       # explicit sockperf payload bytes
+MPS=${MPS:-2000}             # probe msgs/s (legacy probe mode only)
+MSGSIZE=${MSGSIZE:-64}       # explicit sockperf payload bytes (legacy probe mode only)
 WGDIAG=${WGDIAG:-1}
 CONDS=(off both steal4 bsteal4)
 KO="$HOME/wireguard_trigger.ko"
-NAME=fixedload; [ "$BLOCKS" -eq 8 ] || NAME=fixedload_smoke   # shortened run = smoke artifact
+NAME=fixedload; [ "$CPU_ONLY" = "1" ] && NAME=fixedload_cpu
+[ "$BLOCKS" -eq 8 ] || NAME=${NAME}_smoke   # shortened run = smoke artifact
 TS=$(date +%Y%m%d_%H%M%S)
 CSV="$HOME/${NAME}_$TS.csv"; PCF="$CSV.percore"; META="$CSV.meta"; DMESGF="$CSV.dmesg"
 RAW="$HOME/${NAME}_${TS}_raw"
@@ -142,7 +164,9 @@ bash "$HOME/setup_dut_peers.sh" 8 >/dev/null
 pkill -f 'iperf3 -s -p 520' 2>/dev/null || true
 pkill -f "sockperf server -i 10.0.0.1 -p $LPORT" 2>/dev/null || true; sleep 1
 for i in $(seq 0 7); do iperf3 -s -p $((5201+i)) -D; done
-( sockperf server -i 10.0.0.1 -p $LPORT >/dev/null 2>&1 & ); sleep 1     # UDP server
+if [ "$CPU_ONLY" != "1" ]; then
+  ( sockperf server -i 10.0.0.1 -p $LPORT >/dev/null 2>&1 & ); sleep 1   # UDP server (legacy probe mode)
+fi
 ssh -n -o StrictHostKeyChecking=no "$GEN" \
   "for i in \$(seq 0 7); do ip netns exec ns_c\$i ping -c1 -W2 10.0.0.1 >/dev/null 2>&1 & done; wait" || true
 HS_SETUP=$(wg show wg0 latest-handshakes | awk '$2>0{c++} END{print c+0}')
@@ -164,14 +188,28 @@ HS_SETUP=$(wg show wg0 latest-handshakes | awk '$2>0{c++} END{print c+0}')
   echo "irqbalance=$(systemctl is-active irqbalance 2>/dev/null || echo NA)"
   echo "blocks=$BLOCKS"; echo "window_s=$DUR"; echo "streams=$STREAMS"
   echo "target_load_gbps=$LOAD"; echo "per_stream_mbit=$PSM"
-  echo "sockperf_mps=$MPS"; echo "sockperf_msgsize=$MSGSIZE"
-  echo "sockperf_latency_convention=half_rtt"
+  if [ "$CPU_ONLY" = "1" ]; then
+    echo "cpu_only=1"; echo "probe_mode=none"
+    echo "application_cap_gbps=$LOAD"
+    echo "delivered_target_metric=wg0_rx_bytes_exact_window"
+    echo "delivered_target_gbps=3.8"
+    echo "absolute_tolerance_pct=5"
+    echo "paired_tolerance_pct=1.5"
+  else
+    echo "sockperf_mps=$MPS"; echo "sockperf_msgsize=$MSGSIZE"
+    echo "sockperf_latency_convention=half_rtt"
+  fi
   echo "wgdiag=$WGDIAG"; echo "conds=${CONDS[*]}"
   echo "setup_handshakes=$HS_SETUP/8"
   echo "load_counter=wg0/statistics/rx_bytes (inner plaintext bytes delivered post-decryption, incl ~1 Mb/s probe)"
 } > "$META"
 
-echo "date,srcversion,block,position,cond,knobs,load_window_gbps,load_iperf_gbps,window_s,retransmits,total_run_sent_msgs,total_run_recv_msgs,lat_duration_s,valid_sent_msgs,valid_recv_msgs,valid_dropped_msgs,valid_dup_msgs,valid_ooo_msgs,lat_n,p50_half_rtt_us,p90_half_rtt_us,p99_half_rtt_us,p999_half_rtt_us,max_half_rtt_us,softirq_ce,system_ce,total_busy_ce,ping_ms,hs_age_s,unc_n,unc_total_ns,steal_pulled,steal_unblocked,steal_dryruns,dmesg_new,raw_ref" > "$CSV"
+if [ "$CPU_ONLY" = "1" ]; then
+  # no latency columns at all — none are measured, none are fabricated
+  echo "date,srcversion,block,position,cond,knobs,cpu_only,probe_mode,load_window_gbps,load_iperf_gbps,window_s,retransmits,softirq_ce,system_ce,total_busy_ce,ping_ms,hs_age_s,unc_n,unc_total_ns,steal_pulled,steal_unblocked,steal_dryruns,dmesg_new,raw_ref" > "$CSV"
+else
+  echo "date,srcversion,block,position,cond,knobs,load_window_gbps,load_iperf_gbps,window_s,retransmits,total_run_sent_msgs,total_run_recv_msgs,lat_duration_s,valid_sent_msgs,valid_recv_msgs,valid_dropped_msgs,valid_dup_msgs,valid_ooo_msgs,lat_n,p50_half_rtt_us,p90_half_rtt_us,p99_half_rtt_us,p999_half_rtt_us,max_half_rtt_us,softirq_ce,system_ce,total_busy_ce,ping_ms,hs_age_s,unc_n,unc_total_ns,steal_pulled,steal_unblocked,steal_dryruns,dmesg_new,raw_ref" > "$CSV"
+fi
 echo "timestamp block position cond cpu busy_ce softirq_ce system_ce" > "$PCF"
 : > "$DMESGF"
 
@@ -200,10 +238,14 @@ for BLK in $(seq 1 "$BLOCKS"); do
     fi
     DL0=$(dmesg | wc -l)
     RX0=$(cat "$WGRX"); PC0=$(percore_snap); read B0 S0 SI0 < <(cpu_snap); T0=$(date +%s.%N)
-    ssh -n -o StrictHostKeyChecking=no "$GEN" \
-      "sudo ip netns exec ns_c1 sockperf ping-pong -i 10.0.0.1 -p $LPORT -t $DUR --mps=$MPS --msg-size $MSGSIZE 2>&1" \
-      | sed -r 's/\x1b\[[0-9;]*m//g' > "$SPF" \
-      || fatal "sockperf probe failed (blk=$BLK cond=$COND) — raw in $SPF"
+    if [ "$CPU_ONLY" = "1" ]; then
+      sleep "$DUR"                              # window held open; no probe
+    else
+      ssh -n -o StrictHostKeyChecking=no "$GEN" \
+        "sudo ip netns exec ns_c1 sockperf ping-pong -i 10.0.0.1 -p $LPORT -t $DUR --mps=$MPS --msg-size $MSGSIZE 2>&1" \
+        | sed -r 's/\x1b\[[0-9;]*m//g' > "$SPF" \
+        || fatal "sockperf probe failed (blk=$BLK cond=$COND) — raw in $SPF"
+    fi
     T1=$(date +%s.%N); read B1 S1 SI1 < <(cpu_snap); PC1=$(percore_snap); RX1=$(cat "$WGRX")
     if [ "$WGDIAG" = "1" ]; then
       IFS=, read -r UN UT _ <<< "$(cat $P/wg_diag_stall_uncrypt)"
@@ -219,28 +261,30 @@ print("%.4f %d" % (d["sum_received"]["bits_per_second"]/1e9,
 PY
     ) || fatal "iperf JSON parse failed: $IPJ"
     read IPG RTX <<< "$OUT"
-    # [Total Run] includes warm-up: context only. [Valid Duration] is the
-    # window the latency distribution covers: ONLY these fields feed the
-    # loss/support gates. A missing/zero valid-period field is a sockperf
-    # format incompatibility -> fail the row (raw preserved), never fall
-    # back to Total Run denominators.
-    TRS=$(awk -F'[;= ]+' '/\[Total Run\]/{for(i=1;i<=NF;i++) if($i=="SentMessages") print $(i+1)}' "$SPF" | head -1)
-    TRR=$(awk -F'[;= ]+' '/\[Total Run\]/{for(i=1;i<=NF;i++) if($i=="ReceivedMessages") print $(i+1)}' "$SPF" | head -1)
-    VDT=$(awk -F'[;= ]+' '/\[Valid Duration\]/{for(i=1;i<=NF;i++) if($i=="RunTime") print $(i+1)}' "$SPF" | head -1)
-    VDS=$(awk -F'[;= ]+' '/\[Valid Duration\]/{for(i=1;i<=NF;i++) if($i=="SentMessages") print $(i+1)}' "$SPF" | head -1)
-    VDR=$(awk -F'[;= ]+' '/\[Valid Duration\]/{for(i=1;i<=NF;i++) if($i=="ReceivedMessages") print $(i+1)}' "$SPF" | head -1)
-    awk -v x="${VDT:-}" 'BEGIN{exit !(x+0>0)}' || fatal "sockperf [Valid Duration] RunTime missing/zero (blk=$BLK cond=$COND) — format incompatibility? raw: $SPF"
-    awk -v x="${VDS:-}" 'BEGIN{exit !(x+0>0)}' || fatal "sockperf [Valid Duration] SentMessages missing/zero (blk=$BLK cond=$COND) — raw: $SPF"
-    awk -v x="${VDR:-}" 'BEGIN{exit !(x+0>0)}' || fatal "sockperf [Valid Duration] ReceivedMessages missing/zero (blk=$BLK cond=$COND) — raw: $SPF"
-    DROP=$(sed -n 's/.*dropped messages = \([0-9]*\).*/\1/p' "$SPF" | head -1)
-    DUP=$(sed -n 's/.*duplicated messages = \([0-9]*\).*/\1/p' "$SPF" | head -1)
-    OOO=$(sed -n 's/.*out-of-order messages = \([0-9]*\).*/\1/p' "$SPF" | head -1)
-    P50=$(awk '/percentile 50.000/{print $NF}' "$SPF")
-    P90=$(awk '/percentile 90.000/{print $NF}' "$SPF")
-    P99=$(awk '/percentile 99.000/{print $NF}' "$SPF")
-    P999=$(awk '/percentile 99.900/{print $NF}' "$SPF")
-    PMAX=$(awk '/<MAX> observation/{print $NF}' "$SPF")
-    NOBS=$(awk '/observations/{for(i=1;i<=NF;i++) if($i=="Total") print $(i+1)}' "$SPF" | head -1)
+    if [ "$CPU_ONLY" != "1" ]; then
+      # [Total Run] includes warm-up: context only. [Valid Duration] is the
+      # window the latency distribution covers: ONLY these fields feed the
+      # loss/support gates. A missing/zero valid-period field is a sockperf
+      # format incompatibility -> fail the row (raw preserved), never fall
+      # back to Total Run denominators.
+      TRS=$(awk -F'[;= ]+' '/\[Total Run\]/{for(i=1;i<=NF;i++) if($i=="SentMessages") print $(i+1)}' "$SPF" | head -1)
+      TRR=$(awk -F'[;= ]+' '/\[Total Run\]/{for(i=1;i<=NF;i++) if($i=="ReceivedMessages") print $(i+1)}' "$SPF" | head -1)
+      VDT=$(awk -F'[;= ]+' '/\[Valid Duration\]/{for(i=1;i<=NF;i++) if($i=="RunTime") print $(i+1)}' "$SPF" | head -1)
+      VDS=$(awk -F'[;= ]+' '/\[Valid Duration\]/{for(i=1;i<=NF;i++) if($i=="SentMessages") print $(i+1)}' "$SPF" | head -1)
+      VDR=$(awk -F'[;= ]+' '/\[Valid Duration\]/{for(i=1;i<=NF;i++) if($i=="ReceivedMessages") print $(i+1)}' "$SPF" | head -1)
+      awk -v x="${VDT:-}" 'BEGIN{exit !(x+0>0)}' || fatal "sockperf [Valid Duration] RunTime missing/zero (blk=$BLK cond=$COND) — format incompatibility? raw: $SPF"
+      awk -v x="${VDS:-}" 'BEGIN{exit !(x+0>0)}' || fatal "sockperf [Valid Duration] SentMessages missing/zero (blk=$BLK cond=$COND) — raw: $SPF"
+      awk -v x="${VDR:-}" 'BEGIN{exit !(x+0>0)}' || fatal "sockperf [Valid Duration] ReceivedMessages missing/zero (blk=$BLK cond=$COND) — raw: $SPF"
+      DROP=$(sed -n 's/.*dropped messages = \([0-9]*\).*/\1/p' "$SPF" | head -1)
+      DUP=$(sed -n 's/.*duplicated messages = \([0-9]*\).*/\1/p' "$SPF" | head -1)
+      OOO=$(sed -n 's/.*out-of-order messages = \([0-9]*\).*/\1/p' "$SPF" | head -1)
+      P50=$(awk '/percentile 50.000/{print $NF}' "$SPF")
+      P90=$(awk '/percentile 90.000/{print $NF}' "$SPF")
+      P99=$(awk '/percentile 99.000/{print $NF}' "$SPF")
+      P999=$(awk '/percentile 99.900/{print $NF}' "$SPF")
+      PMAX=$(awk '/<MAX> observation/{print $NF}' "$SPF")
+      NOBS=$(awk '/observations/{for(i=1;i<=NF;i++) if($i=="Total") print $(i+1)}' "$SPF" | head -1)
+    fi
     [ "$RX1" -gt "$RX0" ] || fatal "wg0 rx_bytes did not advance over the window (blk=$BLK cond=$COND): tunnel delivered nothing"
     WALL=$(awk -v a=$T0 -v b=$T1 'BEGIN{printf "%.3f", b-a}')
     RXG=$(awk -v r0=$RX0 -v r1=$RX1 -v w=$WALL 'BEGIN{printf "%.4f", (r1-r0)*8/w/1e9}')
@@ -257,13 +301,23 @@ PY
     echo "$PCJ" | awk '$1!=$5{exit 1}' || fatal "CPU topology changed (blk=$BLK cond=$COND)"
     echo "$PCJ" | awk -v ts="$(date -Is)" -v b=$BLK -v p=$POS -v c=$COND -v w=$WALL -v h=$HZ \
       '{printf "%s %s %s %s %s %.3f %.3f %.3f\n", ts,b,p,c,$1,($6-$2)/(w*h),($7-$3)/(w*h),($8-$4)/(w*h)}' >> "$PCF"
-    echo "$(date -Is),$SRC,$BLK,$POS,$COND,$KNOBS,$RXG,$IPG,$WALL,$RTX,${TRS:-NA},${TRR:-NA},$VDT,$VDS,$VDR,${DROP:-NA},${DUP:-NA},${OOO:-NA},${NOBS:-NA},${P50:-NA},${P90:-NA},${P99:-NA},${P999:-NA},${PMAX:-NA},$SOFT_CE,$SYS_CE,$BUSY_CE,$PING_MS,$HS_AGE,$UN,$UT,$SP,$SU,$SD,$DM,$(basename "$IPJ");$(basename "$SPF")" >> "$CSV"
-    printf "blk=%-2s pos=%s cond=%-7s | win=%sG (iperf %sG) | p99=%-7s p999=%-8s n=%-7s drop=%-3s | soft=%s busy=%s | dmesg=%s\n" \
-      "$BLK" "$POS" "$COND" "$RXG" "$IPG" "${P99:-NA}" "${P999:-NA}" "${NOBS:-NA}" "${DROP:-NA}" "$SOFT_CE" "$BUSY_CE" "$DM" >&2
+    if [ "$CPU_ONLY" = "1" ]; then
+      echo "$(date -Is),$SRC,$BLK,$POS,$COND,$KNOBS,1,none,$RXG,$IPG,$WALL,$RTX,$SOFT_CE,$SYS_CE,$BUSY_CE,$PING_MS,$HS_AGE,$UN,$UT,$SP,$SU,$SD,$DM,$(basename "$IPJ")" >> "$CSV"
+      printf "blk=%-2s pos=%s cond=%-7s | win=%sG (iperf %sG) | soft=%s busy=%s | dmesg=%s\n" \
+        "$BLK" "$POS" "$COND" "$RXG" "$IPG" "$SOFT_CE" "$BUSY_CE" "$DM" >&2
+    else
+      echo "$(date -Is),$SRC,$BLK,$POS,$COND,$KNOBS,$RXG,$IPG,$WALL,$RTX,${TRS:-NA},${TRR:-NA},$VDT,$VDS,$VDR,${DROP:-NA},${DUP:-NA},${OOO:-NA},${NOBS:-NA},${P50:-NA},${P90:-NA},${P99:-NA},${P999:-NA},${PMAX:-NA},$SOFT_CE,$SYS_CE,$BUSY_CE,$PING_MS,$HS_AGE,$UN,$UT,$SP,$SU,$SD,$DM,$(basename "$IPJ");$(basename "$SPF")" >> "$CSV"
+      printf "blk=%-2s pos=%s cond=%-7s | win=%sG (iperf %sG) | p99=%-7s p999=%-8s n=%-7s drop=%-3s | soft=%s busy=%s | dmesg=%s\n" \
+        "$BLK" "$POS" "$COND" "$RXG" "$IPG" "${P99:-NA}" "${P999:-NA}" "${NOBS:-NA}" "${DROP:-NA}" "$SOFT_CE" "$BUSY_CE" "$DM" >&2
+    fi
     sleep 3
   done
 done
 
 echo "finished=$(date -Is)" >> "$META"
-echo "ARTIFACT $CSV  (srcversion $SRC, blocks=$BLOCKS, load=${LOAD}G, mps=$MPS, msgsize=$MSGSIZE, wg_diag=$WGDIAG)"
+if [ "$CPU_ONLY" = "1" ]; then
+  echo "ARTIFACT $CSV  (srcversion $SRC, blocks=$BLOCKS, load=${LOAD}G app cap, cpu_only=1, probe=none, wg_diag=$WGDIAG)"
+else
+  echo "ARTIFACT $CSV  (srcversion $SRC, blocks=$BLOCKS, load=${LOAD}G, mps=$MPS, msgsize=$MSGSIZE, wg_diag=$WGDIAG)"
+fi
 echo "ARTIFACT $META $PCF $DMESGF $RAW/"

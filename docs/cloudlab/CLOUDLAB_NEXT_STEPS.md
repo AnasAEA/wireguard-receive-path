@@ -48,6 +48,24 @@ nodes after a controlled environment reset does not convert the campaign into a
 fresh-node or independent-instantiation replication — report it as *a randomized paired
 confirmation on the same CloudLab instantiation after controlled environment reset*.
 
+**Status 2026-07-17 — gate B is now CPU-ONLY.** Gate A completed and REPLICATED
+(`confirm_20260716_090437.csv`). The gate B sockperf design was withdrawn after its
+mandatory smoke (`fixedload_smoke_20260717_030207.csv`): (1) the absolute-load gate
+measures wg0 rx_bytes (inner IP bytes), which run ~6% above iperf's application-level
+cap — headers + retransmits — so `LOAD=3.8` landed at 4.04 Gb/s, outside [3.61, 3.99];
+(2) sockperf UDP ping-pong freezes permanently on a single lost reply (valid window
+shrank to 11 s of 60 under `both`), making percentiles non-comparable across conditions.
+**Latency inference is withdrawn — decided BEFORE any full gate B run; no sockperf
+percentile from the failed smoke is reportable, in any document.** Gate B is now a
+**CPU-only matched-delivered-load paired confirmation**: `CPU_ONLY=1 LOAD=3.58`, where
+3.58 Gb/s is the APPLICATION-level pacing calibrated so the delivered wg0 rx_bytes
+window rate lands on the unchanged scientific target of **3.8 Gb/s** (3.58 × ~1.062
+measured overhead). The absolute gate stays [3.61, 3.99] (±5%), the paired gate stays
+1.5%, the primary stays steal4−off on `total_busy_ce` (single primary, no multiplicity;
+five-test Holm family for the secondaries). softirq/system CE, per-core, classifier and
+steal counters are descriptive only. The same-instantiation wording above is unchanged.
+A one-block CPU-only smoke is mandatory before the full run.
+
 ```bash
 # 0) PRE-FLIGHT, from the Mac. AUDITED_HEAD is the COORDINATOR-APPROVED final
 #    commit hash — copy it from the audit GO message, do NOT substitute an
@@ -94,32 +112,34 @@ export AUDITED_HEAD="<coordinator-approved final hash>"   # same value as step 0
 # REKEY_AFTER_TIME (120 s) keeps sending under the dead session for ~15 s
 # instead of re-handshaking, and the liveness gate (correctly) aborts. Sessions
 # older than 120 s re-handshake instantly. Hence the sleep guards below.
-sudo -v && sleep 130 && sudo -n env AUDITED_HEAD="$AUDITED_HEAD" bash ~/measure_confirm.sh 1   # gate A smoke
-sleep 130 && sudo -n env AUDITED_HEAD="$AUDITED_HEAD" bash ~/measure_fixedload.sh 1            # gate B smoke
-# structural check of both smoke artifacts, ON DUT. Repeated smoke attempts
-# leave several *_smoke_*.csv, so select exactly the NEWEST one explicitly —
-# the analyzer refuses more than one positional artifact. One fail-stopping
-# bash unit; the wrapper preserves the analyzer's 0/1/2 exit status:
+sudo -v && sleep 130 && sudo -n env AUDITED_HEAD="$AUDITED_HEAD" bash ~/measure_confirm.sh 1              # gate A smoke (DONE 2026-07-16)
+sleep 130 && sudo -n env CPU_ONLY=1 LOAD=3.58 AUDITED_HEAD="$AUDITED_HEAD" bash ~/measure_fixedload.sh 1  # gate B CPU-only smoke
+# structural check, ON DUT. Repeated smoke attempts leave several
+# *_smoke_*.csv, so select exactly the NEWEST one explicitly — the analyzer
+# refuses more than one positional artifact. One fail-stopping bash unit;
+# the wrapper preserves the analyzer's 0/1/2 exit status:
 bash -euo pipefail <<'BASH'
 confirm_smoke_csv="$(ls -1t "$HOME"/confirm_smoke_*.csv 2>/dev/null | head -n1 || true)"
 [[ -n "$confirm_smoke_csv" && -f "$confirm_smoke_csv" ]] \
   || { echo "No gate A smoke artifact found" >&2; exit 1; }
 echo "Analyzing gate A smoke artifact: $confirm_smoke_csv"
 python3 ~/analyze_confirm.py --mode confirm --smoke --blocks 1 "$confirm_smoke_csv"
-fixedload_smoke_csv="$(ls -1t "$HOME"/fixedload_smoke_*.csv 2>/dev/null | head -n1 || true)"
-[[ -n "$fixedload_smoke_csv" && -f "$fixedload_smoke_csv" ]] \
-  || { echo "No gate B smoke artifact found" >&2; exit 1; }
-echo "Analyzing gate B smoke artifact: $fixedload_smoke_csv"
-python3 ~/analyze_confirm.py --mode fixedload --smoke --blocks 1 "$fixedload_smoke_csv"
-echo "both smokes structurally valid (exit 0)"
+cpu_smoke_csv="$(ls -1t "$HOME"/fixedload_cpu_smoke_*.csv 2>/dev/null | head -n1 || true)"
+[[ -n "$cpu_smoke_csv" && -f "$cpu_smoke_csv" ]] \
+  || { echo "No gate B CPU-only smoke artifact found" >&2; exit 1; }
+echo "Analyzing gate B CPU-only smoke artifact: $cpu_smoke_csv"
+python3 ~/analyze_confirm.py --cpu-only --smoke --blocks 1 "$cpu_smoke_csv"
+echo "smokes structurally valid (exit 0)"
 BASH
 # smoke gate — proceed to the full runs ONLY if ALL of:
 #   1. each smoke CSV has exactly 4 rows, one per condition (positions 1-4);
 #   2. knob readbacks in every row match the condition (analyzer checks too);
-#   3. gate A rows show plausible uncapped Gb/s; gate B load_window_gbps ~3.8;
-#   4. the gate B raw dir has a sockperf_*.txt per row and the analyzer did
-#      not flag the [Valid Duration] fields (a parse failure aborts the
-#      harness run itself — that IS the format-incompatibility signal);
+#   3. gate A rows show plausible uncapped Gb/s; gate B (CPU-only)
+#      load_window_gbps within [3.61, 3.99] in every row — this is what
+#      LOAD=3.58 calibrates for; if the smoke lands outside, STOP and
+#      re-measure the overhead factor, do NOT touch --target-load;
+#   4. gate B rows carry cpu_only=1, probe_mode=none, and iperf-only raw
+#      refs (no sockperf files anywhere in the _raw dir);
 #   5. .percore sidecars have one row per cpu per run, aligned labels;
 #   6. .dmesg sidecars are empty / dmesg_new=0;
 #   7. both analyzer smoke invocations exited 0 (watermarked output, no verdicts).
@@ -152,23 +172,26 @@ tail -f "$HOME/confirm_run.log"   # one line per run: blk / pos / cond / Gb/s / 
 #    ping-pong at 2000 msg/s, 64 B payload, over the SAME tunnel (ns_c1 -> 10.0.0.1:
 #    same outer 5-tuple, same RX queue, same NAPI). 8 blocks x 4 conditions x 60 s.
 #    Load for the matched-load claim is measured over the exact T0-T1 CPU window
-#    from wg0 rx_bytes; iperf JSON is secondary evidence. Gate B validity requires
-#    every condition's exact-window delivered load to remain within +-5% of the
-#    configured target load (default 3.8 Gb/s), in addition to the 1.5%
-#    within-block paired-load gate; the analyzer's --target-load override is only
-#    for a run intentionally predeclared at a different load, never to rescue
-#    observed data. Primary: steal4-off on total_busy_ce; latency primary p99
-#    (half-RTT), the rest exploratory. wg_diag=1 (measure_steal.sh methodology):
-#    classifier + steal counters for off/steal4.
+#    from wg0 rx_bytes; iperf JSON is secondary evidence. CPU-ONLY (see the
+#    Status note above): CPU_ONLY=1, no latency probe of any kind; LOAD=3.58 is
+#    the application-level calibration whose delivered wg0 rx_bytes rate is the
+#    unchanged 3.8 Gb/s scientific target; the absolute gate is [3.61, 3.99]
+#    (+-5%) on every row and the paired gate 1.5% per block per comparison;
+#    --target-load is never used to rescue observed data. Primary: steal4-off
+#    on total_busy_ce (single primary). Secondaries: both-off, bsteal4-steal4,
+#    bsteal4-both, bsteal4-off, interaction — one five-test Holm family.
+#    softirq/system CE, per-core, classifier + steal counters (wg_diag=1) are
+#    DESCRIPTIVE only. Latency inference was withdrawn before this run; no
+#    sockperf percentile from the failed 2026-07-17 smoke is reportable.
 sudo -v      # sleep guard: see the QUIET PERIOD note in step 0b
 # Same user-side path resolution as gate A — never let root's bash expand ~.
 harness="$(readlink -f "$HOME/measure_fixedload.sh")"
 test -f "$harness"
-nohup sudo -n env AUDITED_HEAD="$AUDITED_HEAD" \
+nohup sudo -n env CPU_ONLY=1 LOAD=3.58 AUDITED_HEAD="$AUDITED_HEAD" \
   bash -c 'sleep 130; exec bash "$1"' bash "$harness" \
-  > "$HOME/fixedload_run.log" 2>&1 &
-echo "$!" | tee "$HOME/fixedload_run.pid"
-tail -f "$HOME/fixedload_run.log"
+  > "$HOME/fixedload_cpu_run.log" 2>&1 &
+echo "$!" | tee "$HOME/fixedload_cpu_run.pid"
+tail -f "$HOME/fixedload_cpu_run.log"
 
 # 3) fetch EVERYTHING immediately (the lease dies with the data), from the Mac:
 #    CSVs + .meta/.percore/.dmesg sidecars for BOTH gates AND both smokes, the
@@ -190,16 +213,16 @@ scp -r "anasait@<dut-node>.wisc.cloudlab.us:~/confirm_*_raw" \
 #    $PIPESTATUS does not exist. run_analysis therefore forces the pipeline
 #    through bash, so it works identically from zsh or bash and returns the
 #    analyzer's own 0/1/2:
-run_analysis() {
+run_analysis() {   # run_analysis <mode> <artifact> <log> [extra-flag]
   bash -o pipefail -c '
-    python3 scripts/cloudlab/analyze_confirm.py --mode "$1" "$2" 2>&1 | tee "$3"
+    python3 scripts/cloudlab/analyze_confirm.py --mode "$1" ${4:+"$4"} "$2" 2>&1 | tee "$3"
     status=${PIPESTATUS[0]}
     echo "analyzer_exit=$status"
     exit "$status"
-  ' bash "$1" "$2" "$3"
+  ' bash "$1" "$2" "$3" "${4:-}"
 }
-run_analysis confirm   data/cloudlab/confirm_<TS>.csv   data/cloudlab/confirm_<TS>.analysis.txt
-run_analysis fixedload data/cloudlab/fixedload_<TS>.csv data/cloudlab/fixedload_<TS>.analysis.txt
+run_analysis confirm   data/cloudlab/confirm_<TS>.csv       data/cloudlab/confirm_<TS>.analysis.txt
+run_analysis fixedload data/cloudlab/fixedload_cpu_<TS>.csv data/cloudlab/fixedload_cpu_<TS>.analysis.txt --cpu-only
 
 # 5) OPTIONAL, only if the lease still lives — 2 profiling windows to turn the
 #    "worker CE drops" inference (system−softirq is not isolated workers) into a

@@ -1,10 +1,25 @@
 #!/usr/bin/env python3
 """Phase D confirmation — fail-closed paired within-block analysis.
 
-Handles BOTH gate artifacts (mode autodetected from the CSV header, and
+Handles the gate artifacts (mode autodetected from the CSV header, and
 cross-checked against --mode when given):
-  confirm_*.csv    gate A: uncapped single-tunnel replication of Finding 8
-  fixedload_*.csv  gate B: matched-load CPU + same-tunnel tail latency
+  confirm_*.csv        gate A: uncapped single-tunnel replication of Finding 8
+  fixedload_*.csv      gate B legacy: matched-load CPU + same-tunnel latency
+  fixedload_cpu_*.csv  gate B CPU-ONLY (coordinator-approved 2026-07-17):
+                       matched-delivered-load CPU confirmation, no latency
+                       probe. Requires --cpu-only, and --cpu-only requires
+                       the artifact's cpu_only/probe_mode=none markers —
+                       either direction of mismatch is exit 1. Inference is
+                       total_busy_ce only: primary steal4-off (no
+                       multiplicity, single primary), secondary five-test
+                       Holm family {both-off, bsteal4-steal4, bsteal4-both,
+                       bsteal4-off, interaction}. softirq/system CE, per-core,
+                       classifier and steal counters are DESCRIPTIVE only.
+                       Latency inference was withdrawn before the full run;
+                       no sockperf field is required, parsed, or emitted.
+                       Reliability gates (exit 2): absolute load +-5% of the
+                       3.8 Gb/s delivered target, pairwise 1.5%, and any
+                       per-run kernel warning (dmesg gate, CPU-only mode).
 
 FAIL-CLOSED VALIDATION (exit 1, zero inferential output). Before ANY
 statistics: exact final block count (gate A 12, gate B 8 — a different
@@ -97,8 +112,8 @@ CONDS = ["off", "both", "steal4", "bsteal4"]
 KNOB_EXPECT = {"off": (0, 0, 0), "both": (1, 1, 0),
                "steal4": (0, 0, 4), "bsteal4": (1, 1, 4)}
 KNOB_KEYS = {"supp", "headwake", "steal", "diag", "delay", "trig_k"}
-DIAG_EXPECT = {"confirm": 0, "fixedload": 1}
-EXPECT_BLOCKS = {"confirm": 12, "fixedload": 8}
+DIAG_EXPECT = {"confirm": 0, "fixedload": 1, "fixedload_cpu": 1}
+EXPECT_BLOCKS = {"confirm": 12, "fixedload": 8, "fixedload_cpu": 8}
 COMPS = [("steal4", "off"), ("both", "off"), ("bsteal4", "steal4"),
          ("bsteal4", "both"), ("bsteal4", "off")]
 SECONDARY = [("both", "off"), ("bsteal4", "steal4"),
@@ -203,15 +218,32 @@ def check_raw_ref(row, mode, ctx):
                           f"_{row['cond']}.<ext> naming")
     if mode == "fixedload" and not any(p.startswith("sockperf_") for p in parts):
         raise Invalid(f"{ctx}: gate B row lacks a sockperf raw reference")
+    if mode == "fixedload_cpu":
+        if any(p.startswith("sockperf_") for p in parts):
+            raise Invalid(f"{ctx}: CPU-only row references a sockperf raw file "
+                          f"— contradicts probe_mode=none")
+        if not any(p.startswith("iperf_") for p in parts):
+            raise Invalid(f"{ctx}: CPU-only row lacks an iperf raw reference")
 
 
-def load_artifact(path, mode_flag=None, blocks_override=None):
+def load_artifact(path, mode_flag=None, blocks_override=None, cpu_only=False):
     with open(path) as fh:
         rows = list(csv.DictReader(fh))
     if not rows:
         raise Invalid(f"{path}: empty artifact")
-    mode = "fixedload" if "p999_half_rtt_us" in rows[0] else "confirm"
-    if mode_flag and mode_flag != mode:
+    is_cpu = "cpu_only" in rows[0]
+    if is_cpu and not cpu_only:
+        raise Invalid("artifact carries the cpu_only marker: analyze it with "
+                      "--cpu-only (a CPU-only artifact must never be judged "
+                      "against latency-era expectations)")
+    if cpu_only and not is_cpu:
+        raise Invalid("--cpu-only was passed but the artifact has no cpu_only "
+                      "marker — this is a legacy probe artifact; analyze it "
+                      "without --cpu-only")
+    mode = ("fixedload_cpu" if is_cpu else
+            "fixedload" if "p999_half_rtt_us" in rows[0] else "confirm")
+    ok_flags = {mode, "fixedload"} if mode == "fixedload_cpu" else {mode}
+    if mode_flag and mode_flag not in ok_flags:
         raise Invalid(f"--mode {mode_flag} but the artifact is a {mode} CSV")
     want = blocks_override or EXPECT_BLOCKS[mode]
 
@@ -252,6 +284,19 @@ def load_artifact(path, mode_flag=None, blocks_override=None):
             fnum(r, k, ctx, positive=pos)
         if mode == "confirm":
             fnum(r, "gbps", ctx, positive=True)
+        elif mode == "fixedload_cpu":
+            if r.get("cpu_only") != "1":
+                raise Invalid(f"{ctx}: cpu_only={r.get('cpu_only')!r} — the "
+                              f"marker must be exactly '1' in every row")
+            if r.get("probe_mode") != "none":
+                raise Invalid(f"{ctx}: probe_mode={r.get('probe_mode')!r} — a "
+                              f"CPU-only artifact cannot claim a live probe")
+            fnum(r, "load_window_gbps", ctx, positive=True)
+            fnum(r, "ping_ms", ctx, positive=True)
+            inum(r, "dmesg_new", ctx, lo=0)
+            for k in ("unc_n", "unc_total_ns", "steal_pulled",
+                      "steal_unblocked", "steal_dryruns"):
+                inum(r, k, ctx, lo=0)
         else:
             fnum(r, "load_window_gbps", ctx, positive=True)
             fnum(r, "lat_duration_s", ctx, positive=True)
@@ -322,7 +367,7 @@ class Analysis:
     def abs_load_reason(self, conds):
         """Gate B absolute plausibility: every involved row must sit at the
         intended operating point, not merely match its partner."""
-        if self.mode != "fixedload":
+        if self.mode not in ("fixedload", "fixedload_cpu"):
             return None
         for blk in self.blocks:
             for c in conds:
@@ -338,7 +383,7 @@ class Analysis:
     def load_void_reason(self, a, b):
         """Gate B matched-load gates for one comparison: absolute plausibility
         of both conditions, then the pairwise 1.5% gate per block."""
-        if self.mode != "fixedload":
+        if self.mode not in ("fixedload", "fixedload_cpu"):
             return None
         reason = self.abs_load_reason((a, b))
         if reason:
@@ -352,6 +397,18 @@ class Analysis:
                         f"{b}={lb:.3f} Gb/s, mismatch {mis:.2f}% > {LOAD_GATE_PCT}%")
         return None
 
+    def dmesg_void_reason(self, conds):
+        """CPU-only reliability gate: a kernel warning during any involved run
+        voids CPU inference (legacy modes keep dmesg as a reported field)."""
+        if self.mode != "fixedload_cpu":
+            return None
+        for blk in self.blocks:
+            for c in conds:
+                if int(float(self.row(blk, c)["dmesg_new"])) > 0:
+                    return (f"dmesg gate: block {blk} cond {c} logged kernel "
+                            f"warnings during the window")
+        return None
+
     def interaction_void_reason(self, metric):
         """The interaction is gated on its ACTUAL components:
         bsteal4-steal4 and both-off (second audit blocker)."""
@@ -359,6 +416,9 @@ class Analysis:
             reason = self.load_void_reason(a, b)
             if reason:
                 return f"component {a}-{b} failed its load gate — {reason}"
+        reason = self.dmesg_void_reason(CONDS)
+        if reason:
+            return reason
         if metric.endswith("_us"):
             reason = self.latency_void_reason(metric, CONDS)
             if reason:
@@ -419,10 +479,11 @@ class Analysis:
 
 
 def analyze(path, mode_flag=None, blocks_override=None, smoke=False,
-            target=TARGET_LOAD_GBPS):
+            target=TARGET_LOAD_GBPS, cpu_only=False):
     """Returns exit status: 0 ok, 2 validity gates voided something.
     Raises Invalid for unusable artifacts (caller exits 1)."""
-    mode, blocks, table, src = load_artifact(path, mode_flag, blocks_override)
+    mode, blocks, table, src = load_artifact(path, mode_flag, blocks_override,
+                                             cpu_only)
     an = Analysis(mode, blocks, table, smoke, target)
     n = len(blocks)
     if smoke:
@@ -436,18 +497,28 @@ def analyze(path, mode_flag=None, blocks_override=None, smoke=False,
               f"{2 / (1 << n):.6g} — do not read finer resolution into the output")
     print()
 
-    metrics = (["gbps", "total_busy_ce", "eff_gbps_per_ce"] if mode == "confirm"
-               else ["total_busy_ce", "softirq_ce",
-                     "p99_half_rtt_us", "p999_half_rtt_us",
-                     "p90_half_rtt_us", "p50_half_rtt_us"])
+    if mode == "confirm":
+        metrics = ["gbps", "total_busy_ce", "eff_gbps_per_ce"]
+        summary = metrics
+    elif mode == "fixedload_cpu":
+        metrics = ["total_busy_ce"]      # the ONLY inferential metric
+        summary = ["total_busy_ce", "softirq_ce", "system_ce"]
+    else:
+        metrics = ["total_busy_ce", "softirq_ce",
+                   "p99_half_rtt_us", "p999_half_rtt_us",
+                   "p90_half_rtt_us", "p50_half_rtt_us"]
+        summary = metrics
 
-    print(f"{'cond':>8} " + " ".join(f"{m:>18}" for m in metrics))
+    print(f"{'cond':>8} " + " ".join(f"{m:>18}" for m in summary))
     for c in CONDS:
         cells = [f"{st.mean([an.metric(m, b, c) for b in blocks]):>18.4f}"
-                 for m in metrics]
+                 for m in summary]
         print(f"{c:>8} " + " ".join(cells))
+    if mode == "fixedload_cpu":
+        print("  (softirq_ce / system_ce / per-core / diag counters are "
+              "DESCRIPTIVE only in CPU-only mode)")
 
-    if mode == "fixedload":
+    if mode in ("fixedload", "fixedload_cpu"):
         means = {c: st.mean([float(an.row(b, c)['load_window_gbps'])
                              for b in blocks]) for c in CONDS}
         print(f"\nexact-window load (wg0 rx_bytes over T0-T1), target "
@@ -462,6 +533,7 @@ def analyze(path, mode_flag=None, blocks_override=None, smoke=False,
         is_lat = metric.endswith("_us")
         fam_primary = ((mode == "confirm" and metric in ("gbps", "total_busy_ce"))
                        or (mode == "fixedload" and metric == "total_busy_ce")
+                       or (mode == "fixedload_cpu" and metric == "total_busy_ce")
                        or (mode == "fixedload" and metric == "p99_half_rtt_us"))
         print(f"\n{metric} — within-block paired deltas "
               f"(favorable direction: {'+' if fav > 0 else '-'}):")
@@ -472,7 +544,7 @@ def analyze(path, mode_flag=None, blocks_override=None, smoke=False,
         results = {}
         for a, b in COMPS:
             label = f"{a}-{b}"
-            reason = an.load_void_reason(a, b)
+            reason = an.load_void_reason(a, b) or an.dmesg_void_reason((a, b))
             if reason is None and is_lat:
                 reason = an.latency_void_reason(metric, (a, b))
             if reason:
@@ -542,6 +614,20 @@ def analyze(path, mode_flag=None, blocks_override=None, smoke=False,
                   f"must pass p<0.05 favorably): {'REPLICATED' if ok else 'NOT REPLICATED'}")
         else:
             print("GATE A CO-PRIMARY: VOID — see suppressed comparisons above")
+    elif mode == "fixedload_cpu":
+        if "total_busy_ce" in verdict:
+            print("GATE B PRIMARY (CPU-only: steal4-off on total_busy_ce at "
+                  "matched delivered load): "
+                  f"{'PASS' if verdict['total_busy_ce'] else 'no favorable effect detected'}")
+        else:
+            print("GATE B PRIMARY: VOID — a reliability gate suppressed the "
+                  "matched-load CPU claim (see VOID lines above)")
+        print("\ndescriptive diag counters (per-window means; classifier "
+              "comparable only where wg_supp is off — off, steal4):")
+        for c in CONDS:
+            un = st.mean([float(an.row(b, c)["unc_n"]) for b in blocks])
+            sp = st.mean([float(an.row(b, c)["steal_pulled"]) for b in blocks])
+            print(f"  {c:>8}: unc_n {un:>12,.0f}   steal_pulled {sp:>12,.0f}")
     else:
         if "total_busy_ce" in verdict:
             print("GATE B PRIMARY (steal4-off on total_busy_ce at matched load): "
@@ -588,6 +674,17 @@ def _write(path, mode, blocks, mutate=None):
                  "dmesg_new": "0", "raw_ref": ref}
             if mode == "confirm":
                 r["gbps"] = f"{g[c] + drift + rng.gauss(0, 0.02):.4f}"
+            elif mode == "fixedload_cpu":
+                r.update({"cpu_only": "1", "probe_mode": "none",
+                          "load_window_gbps": f"{3.8 + rng.gauss(0, 0.005):.4f}",
+                          "load_iperf_gbps": "3.58", "window_s": "60.1",
+                          "retransmits": "900", "ping_ms": "0.62",
+                          "hs_age_s": "12",
+                          "unc_n": str(800000 if "steal" not in c else 8000),
+                          "unc_total_ns": "5000000000",
+                          "steal_pulled": "2000000" if "steal" in c else "0",
+                          "steal_unblocked": "30000" if "steal" in c else "0",
+                          "steal_dryruns": "1000"})
             else:
                 q = p99[c] + drift * 100 + rng.gauss(0, 8)
                 r.update({"load_window_gbps": f"{3.8 + rng.gauss(0, 0.005):.4f}",
@@ -612,12 +709,13 @@ def _write(path, mode, blocks, mutate=None):
         w.writerows(rows)
 
 
-def _run(path, blocks=None, smoke=False):
+def _run(path, blocks=None, smoke=False, cpu_only=False):
     """analyze() with stdout captured -> ('ok'|'void'|'invalid', output)."""
     buf, old = io.StringIO(), sys.stdout
     sys.stdout = buf
     try:
-        rc = analyze(path, blocks_override=blocks, smoke=smoke)
+        rc = analyze(path, blocks_override=blocks, smoke=smoke,
+                     cpu_only=cpu_only)
         return ("void" if rc == 2 else "ok"), buf.getvalue()
     except Invalid as e:
         return "invalid", str(e)
@@ -829,6 +927,99 @@ def selftest():
     check("  ...p99 still analyzed at 50k obs", True,
           "p99_half_rtt_us — within-block" in out)
 
+    # --- CPU-only mode (coordinator-approved gate B redesign, 2026-07-17)
+    cpu_full = art("cpu_full", "fixedload_cpu", 8)
+    rc, out = _run_cli(["--cpu-only", cpu_full])
+    check("valid CPU-only full artifact", 0, rc)
+    check("  ...CPU-only primary verdict", True,
+          "GATE B PRIMARY (CPU-only" in out)
+    check("  ...no latency metrics or verdicts emitted", True,
+          "half_rtt" not in out and "LATENCY" not in out)
+    check("  ...secondary Holm family present", True, "p_holm=" in out)
+    rc, out = _run_cli(["--cpu-only", "--smoke", "--blocks", "1",
+                        art("cpu_smoke1", "fixedload_cpu", 1)])
+    check("valid CPU-only smoke", 0, rc)
+    check("  ...watermarked, descriptive only", True,
+          SMOKE_MARK in out and "p=" not in out)
+    rc, out = _run_cli(["--cpu-only", art("legacy_as_cpu", "fixedload", 8)])
+    check("--cpu-only on legacy sockperf artifact rejected", 1, rc)
+    rc, out = _run_cli([cpu_full])
+    check("CPU-only artifact without --cpu-only rejected", 1, rc)
+
+    def nomark(rows):
+        for r in rows:
+            r["cpu_only"] = ""
+    check("missing cpu_only marker", "invalid",
+          _run(art("nomark", "fixedload_cpu", 8, nomark), cpu_only=True)[0])
+
+    def badprobe(rows):
+        rows[3]["probe_mode"] = "sockperf_pingpong"
+    check("probe_mode other than none", "invalid",
+          _run(art("badprobe", "fixedload_cpu", 8, badprobe), cpu_only=True)[0])
+
+    def nocpu(rows):
+        for r in rows:
+            del r["total_busy_ce"]
+    check("cpu-only missing CPU field", "invalid",
+          _run(art("nocpuf", "fixedload_cpu", 8, nocpu), cpu_only=True)[0])
+
+    def badloadc(rows):
+        rows[5]["load_window_gbps"] = "4.2.1"
+    check("cpu-only malformed load", "invalid",
+          _run(art("badloadc", "fixedload_cpu", 8, badloadc), cpu_only=True)[0])
+
+    def cdrop(rows):
+        rows[:] = [r for r in rows
+                   if not (r["block"] == "2" and r["cond"] == "steal4")]
+    check("cpu-only incomplete pairing", "invalid",
+          _run(art("cdrop", "fixedload_cpu", 8, cdrop), cpu_only=True)[0])
+
+    def cknob(rows):
+        rows[3]["knobs"] = ""
+    check("cpu-only malformed treatment", "invalid",
+          _run(art("cknob", "fixedload_cpu", 8, cknob), cpu_only=True)[0])
+
+    def csrc(rows):
+        for r in rows:
+            r["srcversion"] = ""
+    check("cpu-only malformed provenance (empty srcversion)", "invalid",
+          _run(art("csrc", "fixedload_cpu", 8, csrc), cpu_only=True)[0])
+
+    def cref(rows):
+        rows[3]["raw_ref"] = (f"iperf_b{rows[3]['block']}p{rows[3]['position']}"
+                              f"_{rows[3]['cond']}.json;sockperf_b"
+                              f"{rows[3]['block']}p{rows[3]['position']}"
+                              f"_{rows[3]['cond']}.txt")
+    check("cpu-only sockperf raw_ref contradiction", "invalid",
+          _run(art("cref", "fixedload_cpu", 8, cref), cpu_only=True)[0])
+
+    def clow(rows):
+        for r in rows:
+            r["load_window_gbps"] = "2.000"
+    stat, out = _run(art("clow", "fixedload_cpu", 8, clow), cpu_only=True)
+    check("cpu-only absolute-load gate", "void", stat)
+    check("  ...voids the CPU-only primary", True, "GATE B PRIMARY: VOID" in out)
+
+    def cpair(rows):
+        for r in rows:
+            if r["block"] == "4":
+                r["load_window_gbps"] = ("3.876" if r["cond"] == "steal4"
+                                         else "3.724")
+    check("cpu-only paired-load gate", "void",
+          _run(art("cpair", "fixedload_cpu", 8, cpair), cpu_only=True)[0])
+
+    def cdm(rows):
+        rows[2]["dmesg_new"] = "3"
+    stat, out = _run(art("cdm", "fixedload_cpu", 8, cdm), cpu_only=True)
+    check("cpu-only dmesg reliability gate", "void", stat)
+    check("  ...dmesg gate named in reason", True, "dmesg gate" in out)
+
+    # legacy latency mode must be untouched by the CPU-only additions
+    stat, out = _run(art("legacy_regress", "fixedload", 8))
+    check("legacy fixedload mode unchanged", "ok", stat)
+    check("  ...legacy latency verdict still present", True,
+          "LATENCY PRIMARY" in out)
+
     # --- smoke CLI semantics
     one_a = art("smoke1", "confirm", 1)
     rc, out = _run_cli(["--blocks", "1", one_a])
@@ -862,6 +1053,9 @@ def main(argv):
     smoke = "--smoke" in argv
     if smoke:
         argv.remove("--smoke")
+    cpu_only = "--cpu-only" in argv
+    if cpu_only:
+        argv.remove("--cpu-only")
     mode_flag, blocks, target = None, None, TARGET_LOAD_GBPS
     for flag, cast in (("--mode", str), ("--blocks", int), ("--target-load", float)):
         if flag in argv:
@@ -890,12 +1084,13 @@ def main(argv):
                   f"(newest: ls -1t ... | head -n1)", file=sys.stderr)
         else:
             print("usage: analyze_confirm.py [--mode confirm|fixedload] "
-                  "[--smoke [--blocks N]] [--target-load G] <artifact.csv> | --selftest",
+                  "[--cpu-only] [--smoke [--blocks N]] [--target-load G] "
+                  "<artifact.csv> | --selftest",
                   file=sys.stderr)
         return 1
     try:
         return analyze(argv[0], mode_flag=mode_flag, blocks_override=blocks,
-                       smoke=smoke, target=target)
+                       smoke=smoke, target=target, cpu_only=cpu_only)
     except Invalid as e:
         print(f"INVALID ARTIFACT — no inference printed.\n{e}", file=sys.stderr)
         return 1
