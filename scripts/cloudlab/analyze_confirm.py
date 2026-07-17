@@ -238,6 +238,10 @@ CPU_META_EXACT_STR = {"cpu_only": "1", "probe_mode": "none",
                       "delivered_target_metric": "wg0_rx_bytes_exact_window"}
 CPU_META_VALIDATED = (set(CPU_META_EXACT_NUM) | set(CPU_META_EXACT_STR)
                       | {"module_srcversion", "audited_head", "harness_gitrev"})
+# audited_head must be exactly one full lowercase 40-hex Git commit hash
+# (fifth audit §1): a malformed head and a self-consistent malformed stamp
+# must never certify one another.
+AUDITED_HEAD_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
 def check_cpu_sidecars(path, table, src):
@@ -251,14 +255,25 @@ def check_cpu_sidecars(path, table, src):
         raise Invalid(f"missing metadata sidecar {meta_p}")
     kv = {}
     with open(meta_p) as fh:
-        for line in fh:
-            if "=" in line:
-                k, _, v = line.rstrip("\n").partition("=")
-                if k in CPU_META_VALIDATED and k in kv:
-                    raise Invalid(f"{meta_p}: duplicate metadata field {k!r} "
-                                  f"({kv[k]!r} then {v!r}) — ambiguous "
-                                  f"identity, artifact unusable")
-                kv[k] = v
+        for n, line in enumerate(fh, start=1):
+            body = line.rstrip("\n")
+            if not body.strip():
+                continue        # genuinely blank lines stay permitted
+            # fail closed on any nonempty non key=value line (fifth audit
+            # §2): bare text, continuation fragments, '=value' and
+            # whitespace-only keys are never silently skipped. Splitting at
+            # the FIRST '=' keeps values (e.g. harness_gitrev) free to
+            # contain '=' themselves.
+            k, sep, v = body.partition("=")
+            if not sep or not k.strip() or k != k.strip():
+                raise Invalid(f"{meta_p}:{n}: malformed metadata line "
+                              f"{body!r} — every nonempty line must be "
+                              f"key=value with a nonempty key")
+            if k in CPU_META_VALIDATED and k in kv:
+                raise Invalid(f"{meta_p}: duplicate metadata field {k!r} "
+                              f"({kv[k]!r} then {v!r}) — ambiguous "
+                              f"identity, artifact unusable")
+            kv[k] = v
     for k, want in CPU_META_EXACT_STR.items():
         got = kv.get(k)
         if got is None:
@@ -285,9 +300,9 @@ def check_cpu_sidecars(path, table, src):
                       f"{kv.get('module_srcversion')!r} != CSV srcversion "
                       f"{src!r}")
     ah = kv.get("audited_head") or ""
-    if not ah or ah != ah.strip():
-        raise Invalid(f"{meta_p}: audited_head={ah!r} must be a nonempty "
-                      f"commit with no surrounding whitespace")
+    if not AUDITED_HEAD_RE.match(ah):
+        raise Invalid(f"{meta_p}: audited_head={ah!r} must be exactly one "
+                      f"full lowercase 40-hex Git commit hash")
     # canonical provenance stamp (fourth audit §2): exact whole-line equality
     # with the harness validator's canonical form — rejects wrong branch,
     # dirty!=0, wrong/missing commit, extra/duplicate/reordered fields and
@@ -303,6 +318,7 @@ def check_cpu_sidecars(path, table, src):
     if not os.path.exists(pc_p):
         raise Invalid(f"missing per-core sidecar {pc_p}")
     runs = {}
+    seen_rows = set()
     with open(pc_p) as fh:
         header = fh.readline().split()
         if header[:8] != ["timestamp", "block", "position", "cond", "cpu",
@@ -312,6 +328,14 @@ def check_cpu_sidecars(path, table, src):
             f = line.split()
             if len(f) != 8:
                 raise Invalid(f"{pc_p}:{n}: expected 8 fields, got {len(f)}")
+            # one unique row per (block, position, cpu) (fifth audit §3):
+            # uniform duplication preserves an apparently consistent CPU
+            # set, so the per-run list comparison alone cannot catch it
+            row_key = (f[1], f[2], f[4])
+            if row_key in seen_rows:
+                raise Invalid(f"{pc_p}:{n}: duplicate per-core row for "
+                              f"block={f[1]} position={f[2]} cpu={f[4]}")
+            seen_rows.add(row_key)
             for x in f[5:8]:
                 try:
                     v = float(x)
@@ -913,8 +937,8 @@ def _write(path, mode, blocks, mutate=None):
         with open(path + ".meta", "w") as m:
             m.write("campaign=fixedload_gateB\ncpu_only=1\nprobe_mode=none\n")
             m.write(f"module_srcversion={rows[0]['srcversion']}\n")
-            m.write("audited_head=FAKEHEAD\n")
-            m.write("harness_gitrev=commit=FAKEHEAD "
+            m.write("audited_head=" + "deadbeef" * 5 + "\n")
+            m.write("harness_gitrev=commit=" + "deadbeef" * 5 + " "
                     "branch=cloudlab-receive-path-findings dirty=0\n")
             m.write("application_cap_gbps=3.58\nper_stream_mbit=895\n")
             m.write("delivered_target_metric=wg0_rx_bytes_exact_window\n")
@@ -1383,25 +1407,90 @@ def selftest():
                     "application_cap_gbps=3.58\napplication_cap_gbps=9.9")[0])
 
     # canonical harness_gitrev (fourth audit §2)
-    _G = ("harness_gitrev=commit=FAKEHEAD "
-          "branch=cloudlab-receive-path-findings dirty=0")
+    _H = "deadbeef" * 5
+    _G = (f"harness_gitrev=commit={_H} "
+          f"branch=cloudlab-receive-path-findings dirty=0")
     stat, out = _run(art("g_ok", "fixedload_cpu", 8), cpu_only=True)
     check("canonical harness_gitrev accepted", "ok", stat)
     check("meta wrong-branch gitrev rejected", "invalid",
           meta_case("g_branch", _G,
-                    "harness_gitrev=commit=FAKEHEAD branch=main dirty=0")[0])
+                    f"harness_gitrev=commit={_H} branch=main dirty=0")[0])
     check("meta dirty=1 gitrev rejected", "invalid",
           meta_case("g_dirty", _G,
-                    "harness_gitrev=commit=FAKEHEAD "
-                    "branch=cloudlab-receive-path-findings dirty=1")[0])
+                    f"harness_gitrev=commit={_H} "
+                    f"branch=cloudlab-receive-path-findings dirty=1")[0])
     check("meta wrong-commit gitrev rejected", "invalid",
           meta_case("g_commit", _G,
-                    "harness_gitrev=commit=OTHERHEAD "
+                    "harness_gitrev=commit=" + "0" * 40 + " "
                     "branch=cloudlab-receive-path-findings dirty=0")[0])
     check("meta extra-token gitrev rejected", "invalid",
           meta_case("g_extra", _G, _G + " extra=1")[0])
     check("meta duplicate gitrev field rejected", "invalid",
           meta_case("g_dupline", _G, _G + "\n" + _G)[0])
+
+    # audited_head canonical form (fifth audit §1)
+    _A = f"audited_head={_H}"
+    check("full 40-hex audited_head accepted", "ok",
+          _run(art("h_ok", "fixedload_cpu", 8), cpu_only=True)[0])
+    check("short audited_head rejected", "invalid",
+          meta_case("h_short", _A, "audited_head=abc")[0])
+    check("39-char audited_head rejected", "invalid",
+          meta_case("h_39", _A, f"audited_head={_H[:39]}")[0])
+    check("41-char audited_head rejected", "invalid",
+          meta_case("h_41", _A, f"audited_head={_H}f")[0])
+    check("audited_head internal whitespace rejected", "invalid",
+          meta_case("h_ws", _A, "audited_head=abc def")[0])
+    check("uppercase audited_head rejected", "invalid",
+          meta_case("h_up", _A, f"audited_head={_H.upper()}")[0])
+    check("non-hex audited_head rejected", "invalid",
+          meta_case("h_hex", _A, f"audited_head={'z' * 40}")[0])
+    # a malformed head + self-consistent malformed stamp must not certify
+    # one another
+    p = art("h_pair", "fixedload_cpu", 8)
+    with open(p + ".meta") as fh:
+        txt = fh.read()
+    with open(p + ".meta", "w") as fh:
+        fh.write(txt.replace(_H, "SHORT"))
+    check("malformed head + matching malformed stamp rejected", "invalid",
+          _run(p, cpu_only=True)[0])
+
+    # metadata line syntax (fifth audit §2)
+    check("bare metadata text line rejected", "invalid",
+          meta_case("l_bare", "campaign=fixedload_gateB",
+                    "campaign=fixedload_gateB\nbare text")[0])
+    check("gitrev + bare continuation line rejected", "invalid",
+          meta_case("l_cont", _G, _G + "\ncontinuation")[0])
+    check("=value-without-key rejected", "invalid",
+          meta_case("l_nokey", "campaign=fixedload_gateB",
+                    "campaign=fixedload_gateB\n=orphan")[0])
+    check("whitespace-only key rejected", "invalid",
+          meta_case("l_wskey", "campaign=fixedload_gateB",
+                    "campaign=fixedload_gateB\n  =value")[0])
+
+    # per-core row uniqueness (fifth audit §3)
+    def pc_lines(name):
+        p = art(name, "fixedload_cpu", 8)
+        with open(p + ".percore") as fh:
+            lines = fh.readlines()
+        return p, lines
+
+    p, lines = pc_lines("pcd_one")
+    lines.append(lines[1])                       # duplicate one tuple
+    with open(p + ".percore", "w") as fh:
+        fh.writelines(lines)
+    check("duplicate one per-core tuple rejected", "invalid",
+          _run(p, cpu_only=True)[0])
+
+    p, lines = pc_lines("pcd_all")
+    with open(p + ".percore", "w") as fh:        # duplicate EVERY row
+        fh.write(lines[0])
+        for l in lines[1:]:
+            fh.write(l)
+            fh.write(l)
+    check("uniform duplication of all per-core rows rejected", "invalid",
+          _run(p, cpu_only=True)[0])
+    # same cpu number across different runs is the normal shape: proven by
+    # every valid fixture (cpu0/cpu1 appear in all 32 runs of h_ok)
 
     # per-core value semantics (fourth audit §3)
     def pc_case(name, repl):
