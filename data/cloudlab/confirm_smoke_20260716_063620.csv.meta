@@ -1,0 +1,22 @@
+campaign=confirm_gateA
+started=2026-07-16T06:36:22-05:00
+hostname=dut.anasait-310649.wg-pg0.wisc.cloudlab.us
+kernel=5.15.0-177-generic
+harness_gitrev=commit=b24df1d02f94b94bc24ce65dde4fe00bb7309a81 branch=cloudlab-receive-path-findings dirty=0
+audited_head=b24df1d02f94b94bc24ce65dde4fe00bb7309a81
+module_srcversion=40814CD3CA80D0908BF87D3
+nic=enp6s0f0
+nic_driver=ixgbe
+rx_queues=40
+flow_hash=UDP over IPV4 flows use these fields for computing Hash flow key:;IP SA;IP DA;L4 bytes 0 & 1 [TCP/UDP src port];L4 bytes 2 & 3 [TCP/UDP dst port];;
+cpu_model=Intel(R) Xeon(R) CPU E5-2660 v3 @ 2.60GHz
+cpu_count=40
+governor=schedutil
+irqbalance=active
+blocks=1
+window_s=30
+streams=4
+wgdiag=0
+conds=off both steal4 bsteal4
+setup_handshakes=8/8
+load_counter=wg0/statistics/rx_bytes (inner plaintext bytes delivered post-decryption)

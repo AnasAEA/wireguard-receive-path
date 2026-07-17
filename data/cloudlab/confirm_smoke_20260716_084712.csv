@@ -1,0 +1,5 @@
+date,srcversion,block,position,cond,knobs,gbps,retransmits,rx_window_gbps,window_s,softirq_ce,system_ce,total_busy_ce,ping_ms,hs_age_s,unc_n,unc_total_ns,steal_pulled,steal_unblocked,steal_dryruns,dmesg_new,raw_ref
+2026-07-16T08:47:53-05:00,40814CD3CA80D0908BF87D3,1,1,bsteal4,supp=1;headwake=1;steal=4;diag=0;delay=0;trig_k=0,4.3838,2862,4.6008,30.388,0.990,4.658,4.689,0.585,39,NA,NA,NA,NA,NA,0,iperf_b1p1_bsteal4.json
+2026-07-16T08:48:36-05:00,40814CD3CA80D0908BF87D3,1,2,steal4,supp=0;headwake=0;steal=4;diag=0;delay=0;trig_k=0,4.4647,2267,4.6859,30.387,0.988,4.691,4.720,0.605,82,NA,NA,NA,NA,NA,0,iperf_b1p2_steal4.json
+2026-07-16T08:49:18-05:00,40814CD3CA80D0908BF87D3,1,3,off,supp=0;headwake=0;steal=0;diag=0;delay=0;trig_k=0,4.1032,1626,4.3070,30.392,0.993,4.664,4.699,0.629,4,NA,NA,NA,NA,NA,0,iperf_b1p3_off.json
+2026-07-16T08:50:00-05:00,40814CD3CA80D0908BF87D3,1,4,both,supp=1;headwake=1;steal=0;diag=0;delay=0;trig_k=0,4.2472,2459,4.4573,30.382,0.992,4.769,4.804,0.596,46,NA,NA,NA,NA,NA,0,iperf_b1p4_both.json

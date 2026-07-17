@@ -1,0 +1,7 @@
+blk=1  pos=1 cond=bsteal4 | 4.3838 Gb/s (win 4.6008) | rtx=2862  | soft=0.990 busy=4.689 CE | dmesg=0
+blk=1  pos=2 cond=steal4  | 4.4647 Gb/s (win 4.6859) | rtx=2267  | soft=0.988 busy=4.720 CE | dmesg=0
+blk=1  pos=3 cond=off     | 4.1032 Gb/s (win 4.3070) | rtx=1626  | soft=0.993 busy=4.699 CE | dmesg=0
+blk=1  pos=4 cond=both    | 4.2472 Gb/s (win 4.4573) | rtx=2459  | soft=0.992 busy=4.804 CE | dmesg=0
+ARTIFACT /users/anasait/confirm_smoke_20260716_084712.csv  (srcversion 40814CD3CA80D0908BF87D3, blocks=1, wg_diag=0)
+ARTIFACT /users/anasait/confirm_smoke_20260716_084712.csv.meta /users/anasait/confirm_smoke_20260716_084712.csv.percore /users/anasait/confirm_smoke_20260716_084712.csv.dmesg /users/anasait/confirm_smoke_20260716_084712_raw/
+cleanup done — partial artifacts preserved under /users/anasait/confirm_smoke_20260716_084712.csv* and /users/anasait/confirm_smoke_20260716_084712_raw/

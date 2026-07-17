@@ -1,0 +1,52 @@
+nohup: ignoring input
+blk=1  pos=1 cond=off     | 4.1962 Gb/s (win 4.4031) | rtx=2441  | soft=0.999 busy=4.820 CE | dmesg=0
+blk=1  pos=2 cond=steal4  | 4.4230 Gb/s (win 4.6416) | rtx=2593  | soft=0.988 busy=4.731 CE | dmesg=0
+blk=1  pos=3 cond=bsteal4 | 4.1952 Gb/s (win 4.4030) | rtx=2413  | soft=0.993 busy=4.629 CE | dmesg=0
+blk=1  pos=4 cond=both    | 4.1499 Gb/s (win 4.3569) | rtx=2217  | soft=0.995 busy=4.762 CE | dmesg=0
+blk=2  pos=1 cond=bsteal4 | 4.0993 Gb/s (win 4.3020) | rtx=2139  | soft=0.988 busy=4.518 CE | dmesg=0
+blk=2  pos=2 cond=off     | 4.1588 Gb/s (win 4.3653) | rtx=2447  | soft=0.996 busy=4.837 CE | dmesg=0
+blk=2  pos=3 cond=both    | 4.1462 Gb/s (win 4.3514) | rtx=2391  | soft=0.993 busy=4.758 CE | dmesg=0
+blk=2  pos=4 cond=steal4  | 4.3295 Gb/s (win 4.5442) | rtx=2551  | soft=0.992 busy=4.657 CE | dmesg=0
+blk=3  pos=1 cond=off     | 4.1457 Gb/s (win 4.3510) | rtx=2568  | soft=0.998 busy=4.766 CE | dmesg=0
+blk=3  pos=2 cond=bsteal4 | 4.2637 Gb/s (win 4.4751) | rtx=2465  | soft=0.991 busy=4.636 CE | dmesg=0
+blk=3  pos=3 cond=both    | 4.1410 Gb/s (win 4.3462) | rtx=2591  | soft=0.989 busy=4.763 CE | dmesg=0
+blk=3  pos=4 cond=steal4  | 4.2195 Gb/s (win 4.4303) | rtx=1936  | soft=0.986 busy=4.557 CE | dmesg=0
+blk=4  pos=1 cond=steal4  | 4.1647 Gb/s (win 4.3712) | rtx=2319  | soft=0.991 busy=4.568 CE | dmesg=0
+blk=4  pos=2 cond=off     | 4.1598 Gb/s (win 4.3659) | rtx=2386  | soft=0.993 busy=4.809 CE | dmesg=0
+blk=4  pos=3 cond=bsteal4 | 4.1945 Gb/s (win 4.4017) | rtx=2167  | soft=0.988 busy=4.583 CE | dmesg=0
+blk=4  pos=4 cond=both    | 4.1633 Gb/s (win 4.3690) | rtx=2641  | soft=0.998 busy=4.759 CE | dmesg=0
+blk=5  pos=1 cond=bsteal4 | 4.2708 Gb/s (win 4.4826) | rtx=2735  | soft=0.992 busy=4.654 CE | dmesg=0
+blk=5  pos=2 cond=both    | 4.1060 Gb/s (win 4.3095) | rtx=2125  | soft=0.993 busy=4.715 CE | dmesg=0
+blk=5  pos=3 cond=off     | 4.1715 Gb/s (win 4.3787) | rtx=2365  | soft=0.994 busy=4.766 CE | dmesg=0
+blk=5  pos=4 cond=steal4  | 4.1510 Gb/s (win 4.3573) | rtx=2240  | soft=0.992 busy=4.579 CE | dmesg=0
+blk=6  pos=1 cond=bsteal4 | 4.2021 Gb/s (win 4.4110) | rtx=2565  | soft=0.989 busy=4.552 CE | dmesg=0
+blk=6  pos=2 cond=off     | 4.1865 Gb/s (win 4.3955) | rtx=2346  | soft=0.991 busy=4.831 CE | dmesg=0
+blk=6  pos=3 cond=steal4  | 4.3086 Gb/s (win 4.5216) | rtx=2267  | soft=0.990 busy=4.660 CE | dmesg=0
+blk=6  pos=4 cond=both    | 4.2325 Gb/s (win 4.4427) | rtx=2782  | soft=0.994 busy=4.853 CE | dmesg=0
+blk=7  pos=1 cond=both    | 4.2088 Gb/s (win 4.4163) | rtx=2925  | soft=0.994 busy=4.806 CE | dmesg=0
+blk=7  pos=2 cond=steal4  | 4.3095 Gb/s (win 4.5229) | rtx=2866  | soft=0.992 busy=4.628 CE | dmesg=0
+blk=7  pos=3 cond=bsteal4 | 4.2115 Gb/s (win 4.4189) | rtx=2361  | soft=0.990 busy=4.656 CE | dmesg=0
+blk=7  pos=4 cond=off     | 4.1925 Gb/s (win 4.4005) | rtx=2407  | soft=0.993 busy=4.848 CE | dmesg=0
+blk=8  pos=1 cond=bsteal4 | 4.2688 Gb/s (win 4.4793) | rtx=2581  | soft=0.987 busy=4.632 CE | dmesg=0
+blk=8  pos=2 cond=steal4  | 4.1224 Gb/s (win 4.3265) | rtx=2430  | soft=0.990 busy=4.554 CE | dmesg=0
+blk=8  pos=3 cond=both    | 4.1737 Gb/s (win 4.3807) | rtx=2845  | soft=0.993 busy=4.788 CE | dmesg=0
+blk=8  pos=4 cond=off     | 4.1615 Gb/s (win 4.3688) | rtx=2684  | soft=0.998 busy=4.812 CE | dmesg=0
+blk=9  pos=1 cond=steal4  | 4.2538 Gb/s (win 4.4630) | rtx=2478  | soft=0.994 busy=4.622 CE | dmesg=0
+blk=9  pos=2 cond=bsteal4 | 4.2517 Gb/s (win 4.4614) | rtx=2983  | soft=0.993 busy=4.629 CE | dmesg=0
+blk=9  pos=3 cond=off     | 4.1286 Gb/s (win 4.3325) | rtx=2243  | soft=0.990 busy=4.786 CE | dmesg=0
+blk=9  pos=4 cond=both    | 4.0735 Gb/s (win 4.2743) | rtx=1935  | soft=0.986 busy=4.735 CE | dmesg=0
+blk=10 pos=1 cond=both    | 4.1501 Gb/s (win 4.3558) | rtx=2394  | soft=0.992 busy=4.742 CE | dmesg=0
+blk=10 pos=2 cond=off     | 4.1356 Gb/s (win 4.3412) | rtx=2655  | soft=0.993 busy=4.732 CE | dmesg=0
+blk=10 pos=3 cond=steal4  | 4.2950 Gb/s (win 4.5090) | rtx=2562  | soft=0.995 busy=4.641 CE | dmesg=0
+blk=10 pos=4 cond=bsteal4 | 4.3106 Gb/s (win 4.5233) | rtx=2291  | soft=0.993 busy=4.709 CE | dmesg=0
+blk=11 pos=1 cond=steal4  | 4.2500 Gb/s (win 4.4594) | rtx=2458  | soft=0.988 busy=4.671 CE | dmesg=0
+blk=11 pos=2 cond=off     | 4.1685 Gb/s (win 4.3753) | rtx=2349  | soft=0.991 busy=4.788 CE | dmesg=0
+blk=11 pos=3 cond=bsteal4 | 4.2878 Gb/s (win 4.4986) | rtx=2776  | soft=0.991 busy=4.608 CE | dmesg=0
+blk=11 pos=4 cond=both    | 4.1905 Gb/s (win 4.3981) | rtx=2229  | soft=0.991 busy=4.793 CE | dmesg=0
+blk=12 pos=1 cond=steal4  | 4.1352 Gb/s (win 4.3403) | rtx=2767  | soft=0.985 busy=4.591 CE | dmesg=0
+blk=12 pos=2 cond=off     | 4.1749 Gb/s (win 4.3815) | rtx=2664  | soft=0.993 busy=4.773 CE | dmesg=0
+blk=12 pos=3 cond=bsteal4 | 4.1853 Gb/s (win 4.3922) | rtx=2368  | soft=0.990 busy=4.565 CE | dmesg=0
+blk=12 pos=4 cond=both    | 4.1821 Gb/s (win 4.3896) | rtx=2799  | soft=0.990 busy=4.738 CE | dmesg=0
+ARTIFACT /users/anasait/confirm_20260716_090437.csv  (srcversion 40814CD3CA80D0908BF87D3, blocks=12, wg_diag=0)
+ARTIFACT /users/anasait/confirm_20260716_090437.csv.meta /users/anasait/confirm_20260716_090437.csv.percore /users/anasait/confirm_20260716_090437.csv.dmesg /users/anasait/confirm_20260716_090437_raw/
+cleanup done — partial artifacts preserved under /users/anasait/confirm_20260716_090437.csv* and /users/anasait/confirm_20260716_090437_raw/
