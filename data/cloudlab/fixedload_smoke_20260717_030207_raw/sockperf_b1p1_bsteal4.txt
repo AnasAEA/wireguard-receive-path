@@ -1,0 +1,26 @@
+sockperf: == version #3.7-no.git == 
+sockperf[CLIENT] send on:sockperf: using recvfrom() to block on socket(s)
+
+[ 0] IP = 10.0.0.1        PORT = 11111 # UDP
+sockperf: Warmup stage (sending a few dummy messages)...
+sockperf: Starting test...
+sockperf: Test end (interrupted by timer)
+sockperf: Test ended
+sockperf: [Total Run] RunTime=60.000 sec; Warm up time=400 msec; SentMessages=28967; ReceivedMessages=28966
+sockperf: ========= Printing statistics for Server No: 0
+sockperf: [Valid Duration] RunTime=23.294 sec; SentMessages=28368; ReceivedMessages=28368
+sockperf: ====> avg-latency=410.218 (std-dev=159.104)
+sockperf: # dropped messages = 0; # duplicated messages = 0; # out-of-order messages = 0
+sockperf: Summary: Latency is 410.218 usec
+sockperf: Total 28368 observations; each percentile contains 283.68 observations
+sockperf: ---> <MAX> observation = 1443.679
+sockperf: ---> percentile 99.999 = 1443.679
+sockperf: ---> percentile 99.990 = 1108.069
+sockperf: ---> percentile 99.900 =  986.608
+sockperf: ---> percentile 99.000 =  826.474
+sockperf: ---> percentile 90.000 =  610.795
+sockperf: ---> percentile 75.000 =  514.204
+sockperf: ---> percentile 50.000 =  392.785
+sockperf: ---> percentile 25.000 =  316.079
+sockperf: ---> <MIN> observation =   56.210
+sockperf: Info: The requested message-per-second rate is too high. Try tuning --mps or --burst arguments

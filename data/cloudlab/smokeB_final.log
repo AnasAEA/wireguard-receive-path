@@ -1,0 +1,7 @@
+blk=1  pos=1 cond=bsteal4 | win=4.0356G (iperf 3.3511G) | p99=826.474 p999=986.608  n=28368   drop=0   | soft=0.899 busy=4.456 | dmesg=0
+blk=1  pos=2 cond=steal4  | win=4.0364G (iperf 3.3511G) | p99=809.598 p999=956.095  n=75183   drop=0   | soft=0.906 busy=4.505 | dmesg=0
+blk=1  pos=3 cond=off     | win=4.0366G (iperf 3.3512G) | p99=598.497 p999=808.472  n=90106   drop=0   | soft=0.892 busy=5.030 | dmesg=0
+blk=1  pos=4 cond=both    | win=4.0353G (iperf 3.3512G) | p99=662.686 p999=927.083  n=16625   drop=0   | soft=0.874 busy=4.650 | dmesg=0
+ARTIFACT /users/anasait/fixedload_smoke_20260717_030207.csv  (srcversion 40814CD3CA80D0908BF87D3, blocks=1, load=3.8G, mps=2000, msgsize=64, wg_diag=1)
+ARTIFACT /users/anasait/fixedload_smoke_20260717_030207.csv.meta /users/anasait/fixedload_smoke_20260717_030207.csv.percore /users/anasait/fixedload_smoke_20260717_030207.csv.dmesg /users/anasait/fixedload_smoke_20260717_030207_raw/
+cleanup done — partial artifacts preserved under /users/anasait/fixedload_smoke_20260717_030207.csv* and /users/anasait/fixedload_smoke_20260717_030207_raw/
