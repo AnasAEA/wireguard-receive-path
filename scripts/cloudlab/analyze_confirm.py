@@ -226,16 +226,26 @@ def check_raw_ref(row, mode, ctx):
             raise Invalid(f"{ctx}: CPU-only row lacks an iperf raw reference")
 
 
-CPU_META_IDENTITY = ("application_cap_gbps", "delivered_target_metric",
-                     "delivered_target_gbps", "absolute_tolerance_pct",
-                     "paired_tolerance_pct")
+# Predeclared CPU-only identity (fourth audit §1): metadata must state
+# EXACTLY these settings — metadata is a witness of the predeclared design,
+# never a channel that redefines the analyzer's target or gates. Numeric
+# values are compared numerically after a no-surrounding-whitespace check;
+# strings must match exactly.
+CPU_META_EXACT_NUM = {"application_cap_gbps": 3.58, "per_stream_mbit": 895,
+                      "delivered_target_gbps": 3.8,
+                      "absolute_tolerance_pct": 5, "paired_tolerance_pct": 1.5}
+CPU_META_EXACT_STR = {"cpu_only": "1", "probe_mode": "none",
+                      "delivered_target_metric": "wg0_rx_bytes_exact_window"}
+CPU_META_VALIDATED = (set(CPU_META_EXACT_NUM) | set(CPU_META_EXACT_STR)
+                      | {"module_srcversion", "audited_head", "harness_gitrev"})
 
 
 def check_cpu_sidecars(path, table, src):
-    """CPU-only artifact linkage (audit §5): the .meta and .percore sidecars
-    must exist next to the CSV, agree with it, and align row-for-row.
-    Missing or contradictory linkage is exit 1 — the analyzer must not infer
-    from an artifact whose provenance or per-core evidence is broken."""
+    """CPU-only artifact linkage (audit §5 + fourth audit §1-3): the .meta
+    and .percore sidecars must exist next to the CSV, carry the EXACT
+    predeclared identity and canonical provenance, agree with the CSV, and
+    align row-for-row with finite nonnegative values. Missing or
+    contradictory linkage is exit 1 — no inference."""
     meta_p, pc_p = path + ".meta", path + ".percore"
     if not os.path.exists(meta_p):
         raise Invalid(f"missing metadata sidecar {meta_p}")
@@ -244,27 +254,51 @@ def check_cpu_sidecars(path, table, src):
         for line in fh:
             if "=" in line:
                 k, _, v = line.rstrip("\n").partition("=")
+                if k in CPU_META_VALIDATED and k in kv:
+                    raise Invalid(f"{meta_p}: duplicate metadata field {k!r} "
+                                  f"({kv[k]!r} then {v!r}) — ambiguous "
+                                  f"identity, artifact unusable")
                 kv[k] = v
-    if kv.get("cpu_only") != "1" or kv.get("probe_mode") != "none":
-        raise Invalid(f"{meta_p}: cpu_only={kv.get('cpu_only')!r} / "
-                      f"probe_mode={kv.get('probe_mode')!r} contradict the "
-                      f"CSV's CPU-only markers")
+    for k, want in CPU_META_EXACT_STR.items():
+        got = kv.get(k)
+        if got is None:
+            raise Invalid(f"{meta_p}: missing identity field {k!r}")
+        if got != want:
+            raise Invalid(f"{meta_p}: {k}={got!r} != predeclared {want!r} — "
+                          f"metadata cannot redefine the design")
+    for k, want in CPU_META_EXACT_NUM.items():
+        raw = kv.get(k)
+        if raw is None:
+            raise Invalid(f"{meta_p}: missing identity field {k!r}")
+        if raw != raw.strip() or not raw:
+            raise Invalid(f"{meta_p}: {k}={raw!r} has unexpected whitespace")
+        try:
+            num = float(raw)
+        except ValueError:
+            raise Invalid(f"{meta_p}: {k}={raw!r} is not numeric")
+        if not math.isfinite(num) or num != want:
+            raise Invalid(f"{meta_p}: {k}={raw!r} != predeclared {want} — "
+                          f"metadata cannot redefine the analyzer's target "
+                          f"or gates")
     if kv.get("module_srcversion") != src:
         raise Invalid(f"{meta_p}: module_srcversion="
                       f"{kv.get('module_srcversion')!r} != CSV srcversion "
                       f"{src!r}")
-    ah = (kv.get("audited_head") or "").strip()
-    if not ah:
-        raise Invalid(f"{meta_p}: empty/missing audited_head")
-    if not (kv.get("harness_gitrev") or "").startswith(f"commit={ah} "):
-        raise Invalid(f"{meta_p}: harness_gitrev does not certify "
-                      f"audited_head={ah}")
-    missing = [k for k in CPU_META_IDENTITY if not kv.get(k)]
-    if missing:
-        raise Invalid(f"{meta_p}: missing CPU-only identity key(s) {missing}")
-    if kv["delivered_target_metric"] != "wg0_rx_bytes_exact_window":
-        raise Invalid(f"{meta_p}: delivered_target_metric="
-                      f"{kv['delivered_target_metric']!r}")
+    ah = kv.get("audited_head") or ""
+    if not ah or ah != ah.strip():
+        raise Invalid(f"{meta_p}: audited_head={ah!r} must be a nonempty "
+                      f"commit with no surrounding whitespace")
+    # canonical provenance stamp (fourth audit §2): exact whole-line equality
+    # with the harness validator's canonical form — rejects wrong branch,
+    # dirty!=0, wrong/missing commit, extra/duplicate/reordered fields and
+    # any stray whitespace in one comparison
+    expected_gitrev = (f"commit={ah} branch=cloudlab-receive-path-findings "
+                       f"dirty=0")
+    got_gitrev = kv.get("harness_gitrev")
+    if got_gitrev != expected_gitrev:
+        raise Invalid(f"{meta_p}: harness_gitrev is not the canonical stamp "
+                      f"for audited_head — expected {expected_gitrev!r}, "
+                      f"got {got_gitrev!r}")
 
     if not os.path.exists(pc_p):
         raise Invalid(f"missing per-core sidecar {pc_p}")
@@ -280,9 +314,13 @@ def check_cpu_sidecars(path, table, src):
                 raise Invalid(f"{pc_p}:{n}: expected 8 fields, got {len(f)}")
             for x in f[5:8]:
                 try:
-                    float(x)
+                    v = float(x)
                 except ValueError:
                     raise Invalid(f"{pc_p}:{n}: malformed CE value {x!r}")
+                if not math.isfinite(v):
+                    raise Invalid(f"{pc_p}:{n}: non-finite CE value {x!r}")
+                if v < 0:
+                    raise Invalid(f"{pc_p}:{n}: negative CE value {x!r}")
             runs.setdefault((f[1], f[2]), {"cond": set(), "cpus": []})
             runs[(f[1], f[2])]["cond"].add(f[3])
             runs[(f[1], f[2])]["cpus"].append(f[4])
@@ -458,16 +496,25 @@ class Analysis:
         return float(r[name])
 
     def _abs_load_row_reason(self, blk, c):
-        """Inclusive-endpoint absolute gate on one row: the measured (never
-        rounded) rate must lie in [target*(1-tol), target*(1+tol)], endpoints
-        inclusive with a 1e-9 float guard (audit §6)."""
-        lo = self.target * (1 - ABS_LOAD_TOL_PCT / 100)
-        hi = self.target * (1 + ABS_LOAD_TOL_PCT / 100)
+        """Absolute gate on one row. fixedload_cpu: inclusive endpoints on the
+        never-rounded measured value with a 1e-9 float guard (audit §6).
+        Legacy fixedload keeps its original comparison and diagnostic wording
+        byte-for-byte (third audit §5)."""
         l = float(self.row(blk, c)["load_window_gbps"])
-        if l < lo - 1e-9 or l > hi + 1e-9:
-            return (f"absolute load gate: block {blk} cond {c} measured "
-                    f"{l:.6g} Gb/s, target {self.target} Gb/s, allowed "
-                    f"[{lo:.3f}, {hi:.3f}] — not the predeclared regime")
+        if self.mode == "fixedload_cpu":
+            lo = self.target * (1 - ABS_LOAD_TOL_PCT / 100)
+            hi = self.target * (1 + ABS_LOAD_TOL_PCT / 100)
+            if l < lo - 1e-9 or l > hi + 1e-9:
+                return (f"absolute load gate: block {blk} cond {c} measured "
+                        f"{l:.6g} Gb/s, target {self.target} Gb/s, allowed "
+                        f"[{lo:.3f}, {hi:.3f}] — not the predeclared regime")
+            return None
+        dev = 100 * abs(l - self.target) / self.target
+        if dev > ABS_LOAD_TOL_PCT:
+            return (f"absolute load gate: block {blk} cond {c} "
+                    f"{l:.3f} Gb/s is {dev:.1f}% from the "
+                    f"{self.target} Gb/s target (> {ABS_LOAD_TOL_PCT}%)"
+                    f" — not the predeclared regime")
         return None
 
     def abs_load_reason(self, conds):
@@ -869,7 +916,7 @@ def _write(path, mode, blocks, mutate=None):
             m.write("audited_head=FAKEHEAD\n")
             m.write("harness_gitrev=commit=FAKEHEAD "
                     "branch=cloudlab-receive-path-findings dirty=0\n")
-            m.write("application_cap_gbps=3.58\n")
+            m.write("application_cap_gbps=3.58\nper_stream_mbit=895\n")
             m.write("delivered_target_metric=wg0_rx_bytes_exact_window\n")
             m.write("delivered_target_gbps=3.8\nabsolute_tolerance_pct=5\n")
             m.write("paired_tolerance_pct=1.5\n")
@@ -1303,6 +1350,100 @@ def selftest():
     check("percore/CSV condition contradiction", "invalid",
           _run(p_, cpu_only=True)[0])
 
+    # exact metadata identity (fourth audit §1): edit one .meta line, expect
+    # exit 1 with zero inference
+    def meta_case(name, old, new):
+        p = art(name, "fixedload_cpu", 8)
+        with open(p + ".meta") as fh:
+            txt = fh.read()
+        assert old in txt, f"selftest fixture bug: {old!r} not in meta"
+        with open(p + ".meta", "w") as fh:
+            fh.write(txt.replace(old, new))
+        return _run(p, cpu_only=True)
+
+    check("meta application_cap_gbps mismatch", "invalid",
+          meta_case("m_cap", "application_cap_gbps=3.58",
+                    "application_cap_gbps=9.9")[0])
+    check("meta per_stream_mbit mismatch", "invalid",
+          meta_case("m_psm", "per_stream_mbit=895", "per_stream_mbit=950")[0])
+    check("meta delivered_target_gbps mismatch", "invalid",
+          meta_case("m_tgt", "delivered_target_gbps=3.8",
+                    "delivered_target_gbps=2.0")[0])
+    check("meta absolute_tolerance mismatch", "invalid",
+          meta_case("m_atol", "absolute_tolerance_pct=5",
+                    "absolute_tolerance_pct=99")[0])
+    check("meta paired_tolerance mismatch", "invalid",
+          meta_case("m_ptol", "paired_tolerance_pct=1.5",
+                    "paired_tolerance_pct=99")[0])
+    check("meta whitespace-padded value", "invalid",
+          meta_case("m_ws", "delivered_target_gbps=3.8",
+                    "delivered_target_gbps= 3.8")[0])
+    check("meta duplicate contradictory identity field", "invalid",
+          meta_case("m_dup", "application_cap_gbps=3.58",
+                    "application_cap_gbps=3.58\napplication_cap_gbps=9.9")[0])
+
+    # canonical harness_gitrev (fourth audit §2)
+    _G = ("harness_gitrev=commit=FAKEHEAD "
+          "branch=cloudlab-receive-path-findings dirty=0")
+    stat, out = _run(art("g_ok", "fixedload_cpu", 8), cpu_only=True)
+    check("canonical harness_gitrev accepted", "ok", stat)
+    check("meta wrong-branch gitrev rejected", "invalid",
+          meta_case("g_branch", _G,
+                    "harness_gitrev=commit=FAKEHEAD branch=main dirty=0")[0])
+    check("meta dirty=1 gitrev rejected", "invalid",
+          meta_case("g_dirty", _G,
+                    "harness_gitrev=commit=FAKEHEAD "
+                    "branch=cloudlab-receive-path-findings dirty=1")[0])
+    check("meta wrong-commit gitrev rejected", "invalid",
+          meta_case("g_commit", _G,
+                    "harness_gitrev=commit=OTHERHEAD "
+                    "branch=cloudlab-receive-path-findings dirty=0")[0])
+    check("meta extra-token gitrev rejected", "invalid",
+          meta_case("g_extra", _G, _G + " extra=1")[0])
+    check("meta duplicate gitrev field rejected", "invalid",
+          meta_case("g_dupline", _G, _G + "\n" + _G)[0])
+
+    # per-core value semantics (fourth audit §3)
+    def pc_case(name, repl):
+        p = art(name, "fixedload_cpu", 8)
+        with open(p + ".percore") as fh:
+            lines = fh.readlines()
+        lines[1] = lines[1].replace("0.100", repl)
+        with open(p + ".percore", "w") as fh:
+            fh.writelines(lines)
+        return _run(p, cpu_only=True)
+
+    check("percore zero value accepted", "ok", pc_case("pc_zero", "0.000")[0])
+    check("percore nan rejected", "invalid", pc_case("pc_nan", "nan")[0])
+    check("percore inf rejected", "invalid", pc_case("pc_inf", "inf")[0])
+    check("percore -inf rejected", "invalid", pc_case("pc_ninf", "-inf")[0])
+    check("percore negative rejected", "invalid",
+          pc_case("pc_neg", "-0.100")[0])
+
+    # CPU-only smoke block contract (fourth audit §4)
+    rc, out = _run_cli(["--cpu-only", "--smoke", "--blocks", "2",
+                        art("sm2", "fixedload_cpu", 2)])
+    check("cpu-only smoke --blocks 2 rejected", 1, rc)
+    rc, out = _run_cli(["--cpu-only", "--smoke",
+                        art("sm_nb", "fixedload_cpu", 1)])
+    check("cpu-only smoke without --blocks rejected", 1, rc)
+
+    def blk2(rows):
+        for r in rows:
+            r["block"] = "2"
+    check("cpu-only smoke block ID 2 rejected", "invalid",
+          _run(art("sm_id2", "fixedload_cpu", 1, blk2), blocks=1,
+               smoke=True, cpu_only=True)[0])
+
+    # legacy gate B keeps its original absolute-load wording (fourth audit §5)
+    def leg_low(rows):
+        for r in rows:
+            r["load_window_gbps"] = "2.000"
+    stat, out = _run(art("leg_low", "fixedload", 8, leg_low))
+    check("legacy abs-load wording restored", True,
+          "is 47.4% from the 3.8 Gb/s target (> 5.0%)" in out
+          and "allowed [" not in out, out[:200])
+
     # known-value interaction construction: (bsteal4-steal4)-(both-off)
     tbl_ = {("1", "off"): {"total_busy_ce": "1.5"},
             ("1", "both"): {"total_busy_ce": "2.0"},
@@ -1382,6 +1523,13 @@ def main(argv):
         print(f"--blocks {blocks} without --smoke is refused: a shortened "
               f"artifact must never produce final-looking analysis. Add "
               f"--smoke for structural validation.", file=sys.stderr)
+        return 1
+    if cpu_only and smoke and blocks != 1:
+        # fourth audit §4: the CPU-only smoke contract is exactly one block,
+        # requested explicitly — anything else (omitted, 2, ...) is refused
+        print(f"--cpu-only --smoke requires an explicit --blocks 1 "
+              f"(got {'omitted' if blocks is None else blocks}): the CPU-only "
+              f"smoke contract is exactly one block", file=sys.stderr)
         return 1
     if len(argv) != 1:
         if len(argv) > 1:
