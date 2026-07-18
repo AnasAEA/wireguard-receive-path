@@ -1,0 +1,36 @@
+nohup: ignoring input
+blk=1  pos=1 cond=bsteal4 | win=3.8014G (iperf 3.1571G) | soft=0.948 busy=4.312 | dmesg=0
+blk=1  pos=2 cond=steal4  | win=3.8017G (iperf 3.5781G) | soft=0.882 busy=4.325 | dmesg=0
+blk=1  pos=3 cond=off     | win=3.8018G (iperf 3.1572G) | soft=0.857 busy=4.265 | dmesg=0
+blk=1  pos=4 cond=both    | win=3.8016G (iperf 3.1571G) | soft=0.819 busy=4.014 | dmesg=0
+blk=2  pos=1 cond=bsteal4 | win=3.8014G (iperf 3.1571G) | soft=0.865 busy=4.231 | dmesg=0
+blk=2  pos=2 cond=both    | win=3.8015G (iperf 2.8247G) | soft=0.846 busy=4.472 | dmesg=0
+blk=2  pos=3 cond=off     | win=3.8018G (iperf 3.1571G) | soft=0.844 busy=3.882 | dmesg=0
+blk=2  pos=4 cond=steal4  | win=3.8013G (iperf 2.8247G) | soft=0.836 busy=4.073 | dmesg=0
+blk=3  pos=1 cond=steal4  | win=3.8018G (iperf 3.1572G) | soft=0.784 busy=3.447 | dmesg=0
+blk=3  pos=2 cond=both    | win=3.8015G (iperf 3.1572G) | soft=0.664 busy=3.247 | dmesg=0
+blk=3  pos=3 cond=off     | win=3.8016G (iperf 3.1572G) | soft=0.713 busy=3.292 | dmesg=0
+blk=3  pos=4 cond=bsteal4 | win=3.8016G (iperf 2.8246G) | soft=0.765 busy=3.444 | dmesg=0
+blk=4  pos=1 cond=both    | win=3.8016G (iperf 3.1570G) | soft=0.721 busy=3.366 | dmesg=0
+blk=4  pos=2 cond=off     | win=3.8017G (iperf 3.1571G) | soft=0.725 busy=3.413 | dmesg=0
+blk=4  pos=3 cond=steal4  | win=3.8017G (iperf 3.1570G) | soft=0.783 busy=3.451 | dmesg=0
+blk=4  pos=4 cond=bsteal4 | win=3.8017G (iperf 3.1570G) | soft=0.800 busy=3.496 | dmesg=0
+blk=5  pos=1 cond=off     | win=3.8018G (iperf 2.5555G) | soft=0.685 busy=3.356 | dmesg=0
+blk=5  pos=2 cond=steal4  | win=3.8017G (iperf 3.5772G) | soft=0.805 busy=3.661 | dmesg=0
+blk=5  pos=3 cond=bsteal4 | win=3.8018G (iperf 3.1570G) | soft=0.827 busy=4.008 | dmesg=0
+blk=5  pos=4 cond=both    | win=3.8016G (iperf 3.1571G) | soft=0.738 busy=4.014 | dmesg=0
+blk=6  pos=1 cond=off     | win=3.8017G (iperf 3.1570G) | soft=0.888 busy=4.492 | dmesg=0
+blk=6  pos=2 cond=steal4  | win=3.8027G (iperf 3.5779G) | soft=0.894 busy=4.242 | dmesg=0
+blk=6  pos=3 cond=bsteal4 | win=3.8015G (iperf 3.5782G) | soft=0.884 busy=4.531 | dmesg=0
+blk=6  pos=4 cond=both    | win=3.8016G (iperf 3.1571G) | soft=0.882 busy=4.681 | dmesg=0
+blk=7  pos=1 cond=both    | win=3.8017G (iperf 3.1571G) | soft=0.867 busy=4.674 | dmesg=0
+blk=7  pos=2 cond=steal4  | win=3.8017G (iperf 2.8246G) | soft=0.885 busy=4.339 | dmesg=0
+blk=7  pos=3 cond=off     | win=3.8016G (iperf 3.5781G) | soft=0.882 busy=4.652 | dmesg=0
+blk=7  pos=4 cond=bsteal4 | win=3.8015G (iperf 3.1570G) | soft=0.898 busy=4.295 | dmesg=0
+blk=8  pos=1 cond=bsteal4 | win=3.8019G (iperf 3.1570G) | soft=0.860 busy=4.468 | dmesg=0
+blk=8  pos=2 cond=off     | win=3.8018G (iperf 3.1570G) | soft=0.937 busy=4.817 | dmesg=0
+blk=8  pos=3 cond=both    | win=3.8016G (iperf 2.5556G) | soft=0.942 busy=4.712 | dmesg=0
+blk=8  pos=4 cond=steal4  | win=3.8012G (iperf 3.1570G) | soft=0.879 busy=4.255 | dmesg=0
+ARTIFACT /users/anasait/fixedload_cpu_20260718_024625.csv  (srcversion 40814CD3CA80D0908BF87D3, blocks=8, load=3.58G app cap, cpu_only=1, probe=none, wg_diag=1)
+ARTIFACT /users/anasait/fixedload_cpu_20260718_024625.csv.meta /users/anasait/fixedload_cpu_20260718_024625.csv.percore /users/anasait/fixedload_cpu_20260718_024625.csv.dmesg /users/anasait/fixedload_cpu_20260718_024625_raw/
+cleanup done — partial artifacts preserved under /users/anasait/fixedload_cpu_20260718_024625.csv* and /users/anasait/fixedload_cpu_20260718_024625_raw/

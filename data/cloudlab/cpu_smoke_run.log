@@ -1,0 +1,3 @@
+blk=1  pos=1 cond=bsteal4 | win=3.8015G (iperf 2.8247G) | soft=0.880 busy=4.404 | dmesg=0
+blk=1  pos=2 cond=steal4  | win=3.8009G (iperf 2.5555G) | soft=0.967 busy=4.501 | dmesg=0
+blk=1  pos=3 cond=both    | win=3.8017G (iperf 3.1571G) | soft=0.902 busy=4.797 | dmesg=0

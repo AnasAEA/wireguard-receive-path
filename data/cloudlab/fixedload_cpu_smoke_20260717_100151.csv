@@ -1,0 +1,5 @@
+date,srcversion,block,position,cond,knobs,cpu_only,probe_mode,load_window_gbps,load_iperf_gbps,window_s,retransmits,softirq_ce,system_ce,total_busy_ce,ping_ms,hs_age_s,unc_n,unc_total_ns,steal_pulled,steal_unblocked,steal_dryruns,dmesg_new,raw_ref
+2026-07-17T10:03:37-05:00,40814CD3CA80D0908BF87D3,1,1,steal4,supp=0;headwake=0;steal=4;diag=1;delay=0;trig_k=0,1,none,3.8015,3.1571,60.004,800,0.950,4.699,4.741,0.496,104,7394,392422454,2219853,2160789,264976,0,iperf_b1p1_steal4.json
+2026-07-17T10:05:34-05:00,40814CD3CA80D0908BF87D3,1,2,off,supp=0;headwake=0;steal=0;diag=1;delay=0;trig_k=0,1,none,3.8017,3.1572,60.004,415,0.927,4.915,4.959,0.594,98,724321,20664953939,0,0,0,0,iperf_b1p2_off.json
+2026-07-17T10:07:31-05:00,40814CD3CA80D0908BF87D3,1,3,both,supp=1;headwake=1;steal=0;diag=1;delay=0;trig_k=0,1,none,3.8013,3.1572,60.004,769,0.833,4.354,4.401,0.617,88,34464,1094975965,0,0,0,0,iperf_b1p3_both.json
+2026-07-17T10:09:18-05:00,40814CD3CA80D0908BF87D3,1,4,bsteal4,supp=1;headwake=1;steal=4;diag=1;delay=0;trig_k=0,1,none,3.8014,3.1571,60.004,1218,0.972,4.673,4.716,0.590,75,924,47328781,1843424,1796938,223848,0,iperf_b1p4_bsteal4.json

@@ -1,0 +1,11 @@
+pre-existing: 1
+blk=1  pos=1 cond=steal4  | win=3.8015G (iperf 3.1571G) | soft=0.950 busy=4.741 | dmesg=0
+blk=1  pos=2 cond=off     | win=3.8017G (iperf 3.1572G) | soft=0.927 busy=4.959 | dmesg=0
+blk=1  pos=3 cond=both    | win=3.8013G (iperf 3.1572G) | soft=0.833 busy=4.401 | dmesg=0
+blk=1  pos=4 cond=bsteal4 | win=3.8014G (iperf 3.1571G) | soft=0.972 busy=4.716 | dmesg=0
+ARTIFACT /users/anasait/fixedload_cpu_smoke_20260717_100151.csv  (srcversion 40814CD3CA80D0908BF87D3, blocks=1, load=3.58G app cap, cpu_only=1, probe=none, wg_diag=1)
+ARTIFACT /users/anasait/fixedload_cpu_smoke_20260717_100151.csv.meta /users/anasait/fixedload_cpu_smoke_20260717_100151.csv.percore /users/anasait/fixedload_cpu_smoke_20260717_100151.csv.dmesg /users/anasait/fixedload_cpu_smoke_20260717_100151_raw/
+cleanup done — partial artifacts preserved under /users/anasait/fixedload_cpu_smoke_20260717_100151.csv* and /users/anasait/fixedload_cpu_smoke_20260717_100151_raw/
+smoke_status=0
+new_artifact_count=1
+/users/anasait/fixedload_cpu_smoke_20260717_100151.csv
