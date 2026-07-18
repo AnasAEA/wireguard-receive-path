@@ -582,11 +582,11 @@ signes (plancher 2/4096 ≈ 0,000488 à 12 blocs). Les **co-primaires**, déclar
 campagne, sont le débit et la consommation CPU totale pour `steal4 − off` ; le débit par
 cœur-équivalent occupé est un **effet secondaire dérivé**, pas un co-primaire.
 
-| `steal4 − off` (co-primaires) | effet | p exact | blocs favorables |
+| `steal4 − off` — critères de la barrière A | effet | p exact | blocs favorables |
 |---|---|---|---|
-| débit | **+1,96 %** (+0,082 Gb/s, IC95 [+0,034 ; +0,130]) | **0,0103** | 9/12 |
-| consommation CPU totale | **−3,66 %** (−0,176 CE, IC95 [−0,204 ; −0,146]) | **0,000488** | 12/12 |
-| Gb/s par CE occupé *(secondaire dérivé)* | **+5,83 %** | 0,000488 | 12/12 |
+| débit *(co-primaire)* | **+1,96 %** (+0,082 Gb/s, IC95 [+0,034 ; +0,130]) | **0,0103** | 9/12 |
+| consommation CPU totale *(co-primaire)* | **−3,66 %** (−0,176 CE, IC95 [−0,204 ; −0,146]) | **0,000488** | 12/12 |
+| Gb/s par CE occupé *(critère secondaire dérivé)* | **+5,83 %** | 0,000488 | 12/12 |
 
 > Dans le régime mono-tunnel non plafonné et saturé, `wg_steal=4` a reproduit une
 > réduction de la consommation CPU totale ainsi qu'une augmentation du débit, ce qui se
@@ -599,10 +599,11 @@ fort des deux : signe parfait 12 fois sur 12 au plancher du test, contre un déb
 qui reste dans la fourchette « +2 à 4 % autour du genou » du Résultat 8, mais sous son
 estimation ponctuelle de +4,15 %.
 
-**Composition** (famille secondaire, correction de Holm) : `both − off` ne montre aucun
-effet de débit détecté (−0,13 %, p = 0,60) et une petite réduction CPU détectée
-(−0,62 %, p_holm = 0,032) — le fix côté réveils reste un null de débit au niveau
-utilisateur dans ce régime, avec une petite économie CPU réelle. Une petite réduction
+**Composition** (famille secondaire, correction de Holm) : pour `both − off`, aucun
+effet de débit n'a été détecté (−0,13 %, p = 0,60) tandis qu'une petite réduction CPU
+a été détectée (−0,62 %, p_holm = 0,032) — pour le fix côté réveils, aucun effet
+détectable sur le débit n'a été observé dans ce régime, avec en parallèle une petite
+économie CPU réelle. Une petite réduction
 CPU secondaire a été observée pour `both` par rapport à `off`, mais **aucun effet
 incrémental de débit, de CPU ou d'efficacité n'a été détecté pour `bsteal4` par rapport
 à `steal4`** (p = 0,61 / 0,75 / 0,62), et l'interaction factorielle 2×2 n'a été détectée
@@ -661,8 +662,8 @@ devient mesurable lorsque le cœur RX/softirq épinglé approche de sa limite, m
 démontre pas formellement une interaction entre saturation et traitement, ni l'absence
 d'effet sous la saturation.
 
-**La latence.** La latence sur le même tunnel a été testée lors d'un smoke test
-préliminaire sous charge, mais la sonde UDP Sockperf en boucle fermée pouvait se bloquer
+**La latence.** Une mesure de la latence sur le même tunnel a été tentée lors d'un
+smoke test préliminaire sous charge, mais la sonde UDP Sockperf en boucle fermée pouvait se bloquer
 après un paquet resté sans réponse. Cela produisait des durées valides différentes selon
 les conditions et un nombre d'observations insuffisant pour le p99,9. Les distributions
 de percentiles n'étaient donc pas comparables et aucune conclusion n'est formulée sur la
@@ -674,12 +675,15 @@ et les deux tentatives de smoke conservées (commit `63b125a`). Analyse :
 `fixedload_cpu_20260718_024625.analysis.txt` (commit `f50dd08`). Provenance du harnais :
 `d6dae228c1142a751915e72b62a7164f9cbd8034`. Srcversion du module : `40814CD3…`.
 
-> **Ce que j'ai retenu.** Les deux barrières disent la même chose ensemble : les cycles
-> que `wg_steal` récupère ne se voient sur la facture que quand le cœur épinglé n'a plus
-> un cycle à donner. Sous le plafond, le mécanisme se déclenche toujours — le
-> classifieur a vu la population bloquée disparaître — mais le compteur ne bouge pas. Un
-> null avec toutes les barrières de validité au vert n'est pas un échec : c'est la
-> frontière de la revendication, mesurée.
+> **Ce que j'ai retenu.** Le gain était détectable dans le régime non plafonné et
+> saturé, tandis qu'aucun effet CPU favorable n'a été détecté à la charge appariée
+> testée autour de 3,8 Gb/s. Ce profil est compatible avec l'idée que le cœur RX/softirq
+> épinglé doit approcher de sa limite pour que le bénéfice devienne mesurable, sans pour
+> autant démontrer un seuil exclusif de saturation ni l'absence d'effet en dessous. Le
+> mécanisme se déclenchait toujours sous le plafond — le classifieur a vu la population
+> bloquée disparaître — et une non-détection avec toutes les barrières de validité au
+> vert n'est pas un échec : c'est là où s'arrête, pour l'instant, le support de la
+> revendication.
 
 ## 4. Chronologie
 

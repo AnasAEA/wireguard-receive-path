@@ -459,10 +459,10 @@ Analysis is on **within-block paired deltas** with an exact two-sided sign-flip 
 the run, are throughput and total busy CPU for `steal4 − off`; throughput per busy
 core-equivalent is a **secondary derived endpoint**, not a co-primary.
 
-| `steal4 − off` (co-primaries) | effect | exact p | favorable blocks |
+| `steal4 − off` — Gate A endpoints | effect | exact p | favorable blocks |
 |---|---|---|---|
-| throughput | **+1.96%** (+0.082 Gb/s, CI95 [+0.034, +0.130]) | **0.0103** | 9/12 |
-| total busy CPU | **−3.66%** (−0.176 CE, CI95 [−0.204, −0.146]) | **0.000488** | 12/12 |
+| throughput *(co-primary)* | **+1.96%** (+0.082 Gb/s, CI95 [+0.034, +0.130]) | **0.0103** | 9/12 |
+| total busy CPU *(co-primary)* | **−3.66%** (−0.176 CE, CI95 [−0.204, −0.146]) | **0.000488** | 12/12 |
 | Gb/s per busy CE *(secondary derived)* | **+5.83%** | 0.000488 | 12/12 |
 
 > In the uncapped saturated single-tunnel regime, `wg_steal=4` reproduced a reduction in
@@ -474,10 +474,10 @@ stronger of the two: perfect sign consistency at the exact-test floor, versus a 
 throughput effect that sits inside Finding 8's "+2–4% around the knee" claim but below
 the sweep's +4.15% point estimate.
 
-**Composition** (secondary family, Holm-adjusted): `both − off` showed no detected
-throughput effect (−0.13%, p = 0.60) and a small detected CPU reduction (−0.62%,
-p_holm = 0.032) — the wake-only stack remains a user-level throughput null in this
-regime, with a small real CPU saving. A small secondary CPU reduction was observed for
+**Composition** (secondary family, Holm-adjusted): for `both − off`, no throughput
+effect was detected (−0.13%, p = 0.60) while a small CPU reduction was detected
+(−0.62%, p_holm = 0.032) — for the wake-only stack, no detectable throughput effect
+was observed in this regime, alongside a small real CPU saving. A small secondary CPU reduction was observed for
 `both` versus `off`, but **no incremental throughput, CPU, or efficiency effect was
 detected for `bsteal4` versus `steal4`** (p = 0.61 / 0.75 / 0.62), and the 2×2 factorial
 interaction was not detected on any metric. This does not establish equivalence or prove
@@ -542,11 +542,14 @@ both preserved smoke attempts (commit `63b125a`). Analysis:
 `fixedload_cpu_20260718_024625.analysis.txt` (commit `f50dd08`). Harness provenance:
 `d6dae228c1142a751915e72b62a7164f9cbd8034`. Module srcversion `40814CD3…`.
 
-> **What I learned.** The two gates say one thing together: the cycles `wg_steal`
-> recovers only show up on the bill when the pinned core has no cycles left to give.
-> Below the ceiling the mechanism still fires — the classifier watched the blocked
-> population vanish — but the meter does not move. A null with every validity gate green
-> is not a failure; it is the boundary of the claim, measured.
+> **What I learned.** The payoff was detectable in the uncapped saturated regime, while
+> no favorable CPU effect was detected at the tested matched load of approximately
+> 3.8 Gb/s. That pattern is consistent with the pinned RX/softirq core needing to
+> approach the binding limit before the benefit becomes measurable, but the two
+> campaigns do not prove an exclusive saturation threshold or the absence of an effect
+> below it. The mechanism still fired below the ceiling — the classifier watched the
+> blocked population vanish — and a non-detection with every validity gate green is not
+> a failure; it is where the claim's support currently ends.
 
 ## 4. Timeline of experiments
 
