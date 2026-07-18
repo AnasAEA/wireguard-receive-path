@@ -1,0 +1,36 @@
+data/cloudlab/fixedload_cpu_20260718_024625.csv  (mode fixedload_cpu, srcversion 40814CD3CA80D0908BF87D3, 8 complete blocks)
+structure OK: 8 block(s) x 4 conditions, one row each, positions 1-4, knob readbacks match labels (diag=1, delay=0, trig_k=0), raw refs named correctly
+exact sign-flip p floor with 8 blocks: 2/256 = 0.0078125 — do not read finer resolution into the output
+
+    cond      total_busy_ce         softirq_ce          system_ce
+     off             4.0211             0.8164             3.9916
+    both             4.1475             0.8099             4.1137
+  steal4             3.9741             0.8435             3.9468
+ bsteal4             4.0981             0.8559             4.0680
+  (softirq_ce / system_ce / per-core / diag counters are DESCRIPTIVE only in CPU-only mode)
+
+exact-window load (wg0 rx_bytes over T0-T1), target 3.8 Gb/s +-5.0%: off=3.802 both=3.802 steal4=3.802 bsteal4=3.802  — absolute + pairwise 1.5% gates applied per comparison below
+
+total_busy_ce — within-block paired deltas (favorable direction: -):
+  steal4-off         n=8  mean -0.0470 (-1.17%)  median +0.0490  CI95 [-0.2450,+0.1341]  +5/-3/0:0  p=0.6562  [PRIMARY, favorable]
+    deltas:    +0.06 +0.191 +0.155 +0.038 +0.305 -0.25 -0.313 -0.562
+  both-off           n=8  mean +0.1264 (+3.14%)  median -0.0115  CI95 [-0.0717,+0.3524]  +4/-4/0:0  p=0.3750  p_holm=1.0000  [SECONDARY, Holm, unfavorable]
+    deltas:    -0.251 +0.59 -0.045 -0.047 +0.658 +0.189 +0.022 -0.105
+  bsteal4-steal4     n=8  mean +0.1240 (+3.12%)  median +0.1015  CI95 [+0.0294,+0.2221]  +5/-3/0:0  p=0.0859  p_holm=0.4297  [SECONDARY, Holm, unfavorable]
+    deltas:    -0.013 +0.158 -0.003 +0.045 +0.347 +0.289 -0.044 +0.213
+  bsteal4-both       n=8  mean -0.0494 (-1.19%)  median -0.0780  CI95 [-0.2030,+0.1104]  +3/-5/0:0  p=0.5703  p_holm=1.0000  [SECONDARY, Holm, favorable]
+    deltas:    +0.298 -0.241 +0.197 +0.13 -0.006 -0.15 -0.379 -0.244
+  bsteal4-off        n=8  mean +0.0770 (+1.91%)  median +0.0650  CI95 [-0.1384,+0.2999]  +6/-2/0:0  p=0.5469  p_holm=1.0000  [SECONDARY, Holm, unfavorable]
+    deltas:    +0.047 +0.349 +0.152 +0.083 +0.652 +0.039 -0.357 -0.349
+  interaction        n=8  mean -0.0024 (-0.06%)  median +0.0670  CI95 [-0.1785,+0.1537]  +5/-3/0:0  p=0.9844  p_holm=1.0000  [SECONDARY, Holm, favorable]
+    deltas:    +0.238 -0.432 +0.042 +0.092 -0.311 +0.1 -0.066 +0.318
+    An interaction near zero would be consistent with approximate additivity on this metric's scale; a nonzero interaction indicates the incremental effect of stealing depends on whether the wake-side fixes are active. Read the estimate, CI, p and favorable direction above together — synergy/antagonism is not declared from the p-value alone.
+
+GATE B PRIMARY (CPU-only: steal4-off on total_busy_ce at matched delivered load): no favorable effect detected
+
+descriptive diag counters (per-window means; classifier comparable only where wg_supp is off — off, steal4):
+       off: unc_n      743,942   steal_pulled            0
+      both: unc_n       34,465   steal_pulled            0
+    steal4: unc_n       10,021   steal_pulled    2,323,533
+   bsteal4: unc_n        1,080   steal_pulled    1,905,574
+dmesg: any run with warnings? no (max per-run 0, total 0)
