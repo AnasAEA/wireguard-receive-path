@@ -172,7 +172,7 @@ mesure et comment :
 | **E11** | Combien de temps la tête bloque-t-elle la livraison ? | Résultat 6 : durée entre le premier poll raté et le prochain poll utile, par file NAPI, à chaque délai. |
 | **E11-C** | Cette attente, est-ce une tête chiffrée ou une file vide ? | Résultat 6 : un classifieur dans le module étiquette chaque épisode à la source (~20 lignes), avec des compteurs par classe et par tranche de durée — plus besoin de sonde externe. |
 | **Phase C** | Le fix tient-il 30 minutes sans casser ? | Résultat 7 : charge soutenue, `both` activé, 2 étages de 15 min, en surveillant débit, handshakes et journal noyau toutes les 15 s. |
-| **Phase D** | Peut-on convertir l'attente d'E11-C en gain réel ? | Résultat 8 : `wg_steal` (le poll bloqué déchiffre lui-même), puis A/B à 4 conditions, balayage mono-tunnel du réglage (5 répétitions par valeur, tests de permutation exacts) et soak avec le vol activé. |
+| **Phase D** | Peut-on convertir l'attente d'E11-C en gain réel ? | Résultat 8 : `wg_steal` (le poll bloqué déchiffre lui-même), puis A/B à 4 conditions, balayage mono-tunnel du réglage (5 répétitions par valeur, tests de permutation exacts) et soak avec le vol activé. Confirmations : Résultats 9 et 10. |
 
 (E6 à E9 n'existent pas : la numérotation a sauté au fil des réorganisations du plan.
 E2–E5 forment ensemble le « modèle de coût » cité partout.)
@@ -568,6 +568,119 @@ mérite une étude de latence d'ordonnancement avant que qui que ce soit ne l'em
 > cycles en dessous. C'est exactement la même leçon que le résultat négatif du Résultat 5,
 > vue de l'autre côté : depuis le début, ce projet parle d'où passent les cycles.
 
+### Résultat 9 — Barrière A : le gain en régime saturé tient en confirmation appariée
+
+Le Résultat 8 reposait sur un seul balayage de découverte, avec n = 5 par valeur du knob
+et un p plancher de 0,008. La barrière A l'a re-testé sous forme de **confirmation
+appariée randomisée sur la même instanciation CloudLab, après remise à zéro contrôlée de
+l'environnement** : 12 blocs appariés randomisés contenant chacun `off` / `both` /
+`steal4` / `bsteal4` une fois, en ordre re-mélangé, 30 s d'`iperf3 -P 4` sans plafond
+dans un seul tunnel par run, 48 runs complets, zéro alerte noyau pertinente, analyseur
+sorti en 0 (`measure_confirm.sh`, `confirm_20260716_090437.csv`). L'analyse porte sur
+les **deltas appariés intra-bloc**, avec un test exact bilatéral par retournement de
+signes (plancher 2/4096 ≈ 0,000488 à 12 blocs). Les **co-primaires**, déclarés avant la
+campagne, sont le débit et la consommation CPU totale pour `steal4 − off` ; le débit par
+cœur-équivalent occupé est un **effet secondaire dérivé**, pas un co-primaire.
+
+| `steal4 − off` (co-primaires) | effet | p exact | blocs favorables |
+|---|---|---|---|
+| débit | **+1,96 %** (+0,082 Gb/s, IC95 [+0,034 ; +0,130]) | **0,0103** | 9/12 |
+| consommation CPU totale | **−3,66 %** (−0,176 CE, IC95 [−0,204 ; −0,146]) | **0,000488** | 12/12 |
+| Gb/s par CE occupé *(secondaire dérivé)* | **+5,83 %** | 0,000488 | 12/12 |
+
+> Dans le régime mono-tunnel non plafonné et saturé, `wg_steal=4` a reproduit une
+> réduction de la consommation CPU totale ainsi qu'une augmentation du débit, ce qui se
+> traduit par une amélioration importante du débit délivré par cœur-équivalent occupé.
+
+« Reproduit » au sens strict : une nouvelle confirmation appariée sur les mêmes nœuds
+après remise à zéro contrôlée, pas une réplication indépendante sur du matériel neuf.
+Les deux co-primaires passent dans la direction favorable — et le côté CPU reste le plus
+fort des deux : signe parfait 12 fois sur 12 au plancher du test, contre un débit à +2 %
+qui reste dans la fourchette « +2 à 4 % autour du genou » du Résultat 8, mais sous son
+estimation ponctuelle de +4,15 %.
+
+**Composition** (famille secondaire, correction de Holm) : `both − off` ne montre aucun
+effet de débit détecté (−0,13 %, p = 0,60) et une petite réduction CPU détectée
+(−0,62 %, p_holm = 0,032) — le fix côté réveils reste un null de débit au niveau
+utilisateur dans ce régime, avec une petite économie CPU réelle. Une petite réduction
+CPU secondaire a été observée pour `both` par rapport à `off`, mais **aucun effet
+incrémental de débit, de CPU ou d'efficacité n'a été détecté pour `bsteal4` par rapport
+à `steal4`** (p = 0,61 / 0,75 / 0,62), et l'interaction factorielle 2×2 n'a été détectée
+sur aucune métrique. Cela n'établit ni l'équivalence ni la redondance.
+
+**Preuves.** Brut : `confirm_20260716_090437.csv` + sidecars `.meta`/`.percore`/`.dmesg`
+et 48 JSON iperf bruts (commit `fc9fd60`). Analyse :
+`confirm_20260716_090437.analysis.txt` (commit `87fb8d4`). Provenance du harnais,
+estampillée et vérifiée à chaque run : `9c2c35f514652d685527db0a0e0363ba1f55540e`.
+Srcversion du module : `40814CD3…`.
+
+### Résultat 10 — Barrière B : aucun effet CPU favorable détecté à charge appariée sous la saturation
+
+Restait la revendication « les mêmes octets, moins de CPU ». La barrière B l'a testée
+directement, en **confirmation appariée à charge appariée, CPU uniquement**, sur la même
+instanciation après remise à zéro contrôlée : 8 blocs appariés randomisés × les quatre
+mêmes conditions, 32 runs complets, fenêtres exactes de 60 s, `CPU_ONLY=1` (aucun
+processus Sockperf d'aucune sorte), trafic plafonné à `LOAD=3,58` Gb/s côté application
+pour que la charge **délivrée** — mesurée sur les rx_bytes de `wg0` pendant la fenêtre
+CPU exacte — atteigne la cible prédéclarée de 3,8 Gb/s (`measure_fixedload.sh`,
+`fixedload_cpu_20260718_024625.csv`, analyseur sorti en 0).
+
+Toutes les barrières de validité sont passées, et largement : charges mesurées de
+**3,8012 à 3,8027 Gb/s** (écart maximal à la cible : 0,071 %, pour une barrière à
+±5 %), pire écart apparié intra-bloc requis : **0,0316 %** (barrière : 1,5 %), sidecar
+per-core avec 1 280 triplets `(bloc, position, cpu)` uniques (32 runs × 40 CPU), zéro
+alerte dmesg pertinente, et un répertoire brut contenant exactement 32 JSON iperf et
+aucun fichier Sockperf.
+
+**Primaire** (`steal4 − off` sur la consommation CPU totale) : moyenne **−0,047 CE
+(−1,17 %)**, IC95 bootstrap **[−0,245 ; +0,134] CE**, favorable dans **3 blocs sur 8**,
+p exact = **0,6562**. Aucun effet CPU favorable à charge appariée n'a été détecté autour
+de 3,8 Gb/s. L'intervalle de confiance inclut à la fois une économie modérée et un léger
+surcoût : le résultat n'établit donc ni l'absence d'effet ni l'équivalence. Aucune
+comparaison secondaire n'a été détectée après correction de Holm (plus petit
+p_holm = 0,43 ; interaction −0,002 CE, p = 0,98).
+
+**Le mécanisme, en descriptif.** Les preuves descriptives de mécanisme à charge appariée
+montrent que le nombre moyen d'épisodes classés « tête bloquée » est tombé d'environ
+743 942 par fenêtre avec `off` à 10 021 avec `steal4`, soit une réduction d'environ
+98,7 %. La condition `steal4` a volé environ 2,32 millions de tâches de déchiffrement
+par fenêtre. Ces compteurs montrent que le vol a presque éliminé la population observée
+de têtes bloquées classées, même si cela ne s'est pas traduit par une économie de CPU
+totale détectable à cette charge. Ces compteurs sont des preuves descriptives de
+mécanisme — pas un critère testé statistiquement, ni une preuve de latence, ni une
+preuve de bénéfice visible par l'utilisateur.
+
+**Entre les deux régimes.** Dans la campagne mono-tunnel non plafonnée, où la charge
+softirq RX était proche d'un cœur-équivalent complet, `wg_steal=4` a réduit la
+consommation CPU totale de 3,66 % et augmenté le débit de 1,96 %. À charge délivrée
+strictement appariée autour de 3,8 Gb/s, avec une consommation softirq moyenne d'environ
+0,81 à 0,86 cœur-équivalent, le contraste CPU mesuré était de −0,047 CE (−1,17 % ; IC95
+[−0,245 ; +0,134], p exact = 0,656), et aucun effet CPU favorable n'a été détecté. Ce
+profil entre régimes est compatible avec l'hypothèse selon laquelle le vol de travail
+devient mesurable lorsque le cœur RX/softirq épinglé approche de sa limite, mais il ne
+démontre pas formellement une interaction entre saturation et traitement, ni l'absence
+d'effet sous la saturation.
+
+**La latence.** La latence sur le même tunnel a été testée lors d'un smoke test
+préliminaire sous charge, mais la sonde UDP Sockperf en boucle fermée pouvait se bloquer
+après un paquet resté sans réponse. Cela produisait des durées valides différentes selon
+les conditions et un nombre d'observations insuffisant pour le p99,9. Les distributions
+de percentiles n'étaient donc pas comparables et aucune conclusion n'est formulée sur la
+latence visible par l'utilisateur. Une étude future devra utiliser une sonde en boucle
+ouverte ou autrement tolérante aux pertes.
+
+**Preuves.** Brut : `fixedload_cpu_20260718_024625.csv` + sidecars, 32 JSON iperf bruts,
+et les deux tentatives de smoke conservées (commit `63b125a`). Analyse :
+`fixedload_cpu_20260718_024625.analysis.txt` (commit `f50dd08`). Provenance du harnais :
+`d6dae228c1142a751915e72b62a7164f9cbd8034`. Srcversion du module : `40814CD3…`.
+
+> **Ce que j'ai retenu.** Les deux barrières disent la même chose ensemble : les cycles
+> que `wg_steal` récupère ne se voient sur la facture que quand le cœur épinglé n'a plus
+> un cycle à donner. Sous le plafond, le mécanisme se déclenche toujours — le
+> classifieur a vu la population bloquée disparaître — mais le compteur ne bouge pas. Un
+> null avec toutes les barrières de validité au vert n'est pas un échec : c'est la
+> frontière de la revendication, mesurée.
+
 ## 4. Chronologie
 
 | Date | Expérience | Ce qui a changé | Résultat | Statut |
@@ -590,6 +703,8 @@ mérite une étude de latence d'ordonnancement avant que qui que ce soit ne l'em
 | 10/07 | Soak Phase C (#9) | `both` activé, 2×15 min + bonus entonnoir | **PASS** — 0 alerte noyau, 9,57 Gb/s | réglé |
 | 10/07 | **Phase D : `wg_steal`** (#9) | le poll vole et déchiffre lui-même | temps bloqué **−95 %** ; premier gain mono-tunnel visible | barrières le 15/07 |
 | 15/07 | **Barrières Phase D** (#10) | balayage mono-tunnel 0/1/2/4/8/16 ×5 ; soak avec vol | genou à 4 : **+4,15 % de débit** (p=0,008) ; CPU **−3 à −5 %** partout ; **efficacité +5,4 à +7,6 %** ; soak **PASS** | réglé (Résultat 8) |
+| 16/07 | **Barrière A : confirmation appariée** (#10, remise à zéro contrôlée) | 12 blocs appariés randomisés × {off, both, steal4, bsteal4}, 30 s sans plafond | co-primaires confirmés : **+1,96 % de débit** (p=0,010), **CPU −3,66 %** (p=0,0005, 12/12) ; efficacité +5,83 % (secondaire dérivé) | réglé (Résultat 9) |
+| 18/07 | **Barrière B : CPU seul à charge appariée** (#10, remise à zéro contrôlée) | 8 blocs appariés, `CPU_ONLY=1`, 3,80 Gb/s délivrés (rx_bytes wg0) | primaire **non détecté** (−1,17 %, p=0,66, IC [−6,1 % ; +3,3 %]) ; épisodes bloqués −98,7 % (descriptif) | réglé (Résultat 10) |
 
 ## 5. Incidents et corrections de méthodo
 
@@ -623,6 +738,8 @@ ci-dessus se vérifie depuis son CSV :
 | A/B `wg_steal` Phase D (R8) | `steal_20260710_1542.csv` | `cloudlab/measure_steal.sh` | — |
 | Barrière 1 — balayage mono-tunnel (R8) | `single_20260715_0516.csv` | `cloudlab/measure_single.sh`, `cloudlab/analyze_single.py` | — |
 | Barrière 2 — soak avec vol activé (R8) | `soak_20260715_0530.csv` | `cloudlab/measure_soak.sh` (`STEAL=8`) | — |
+| Barrière A — confirmation appariée (R9) | `confirm_20260716_090437.csv` + `.analysis.txt` (+ sidecars, 48 JSON iperf ; smokes conservés) | `cloudlab/measure_confirm.sh`, `cloudlab/analyze_confirm.py` | — |
+| Barrière B — CPU seul à charge appariée (R10) | `fixedload_cpu_20260718_024625.csv` + `.analysis.txt` (+ sidecars, 32 JSON iperf ; smoke à sonde retirée `fixedload_smoke_20260717_030207.csv` conservé) | `cloudlab/measure_fixedload.sh` (`CPU_ONLY=1 LOAD=3.58`), `cloudlab/analyze_confirm.py --cpu-only` | — |
 | Diagrammes explicatifs (§2, R4, R6) | — (conceptuels) | `make_explainer_figs.py` | `fig_eoi_*_fr.png`, `fig_twosided_fr.png`, `fig_fix_vs_steering_fr.png`, `fig_decsweep_wasted_fr.png` |
 | Module + knobs | — | `build/wg515-trigger/` (srcversion `EA06EE82…` jusqu'au 06/07 ; `47258C70…` = + classifieur E11-C, 09/07 ; `40814CD3…` = + `wg_steal`, à partir du 10/07) | — |
 

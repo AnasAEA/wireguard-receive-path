@@ -446,6 +446,108 @@ softirq deserves a scheduler-latency study before anyone ships it.
 > core is pegged, and it is spending some of its cycles asking a question whose answer is
 > still no". Stealing does not raise the ceiling; it stops wasting the cycles under it.
 
+### Finding 9 — Gate A: the saturated-regime win holds under paired confirmation
+
+Finding 8 rested on one discovery sweep with n=5 per knob value and a p-value floored at
+0.008. Gate A re-tested it as a **randomized paired confirmation on the same CloudLab
+instantiation after controlled environment reset**: 12 randomized paired blocks, each
+containing `off` / `both` / `steal4` / `bsteal4` once in re-shuffled order, 30 s of
+uncapped single-tunnel `iperf3 -P 4` per run, 48 complete runs, zero relevant kernel
+warnings, analyzer exit 0 (`measure_confirm.sh`, `confirm_20260716_090437.csv`).
+Analysis is on **within-block paired deltas** with an exact two-sided sign-flip test
+(floor 2/4096 ≈ 0.000488 at 12 blocks). The **co-primary endpoints**, declared before
+the run, are throughput and total busy CPU for `steal4 − off`; throughput per busy
+core-equivalent is a **secondary derived endpoint**, not a co-primary.
+
+| `steal4 − off` (co-primaries) | effect | exact p | favorable blocks |
+|---|---|---|---|
+| throughput | **+1.96%** (+0.082 Gb/s, CI95 [+0.034, +0.130]) | **0.0103** | 9/12 |
+| total busy CPU | **−3.66%** (−0.176 CE, CI95 [−0.204, −0.146]) | **0.000488** | 12/12 |
+| Gb/s per busy CE *(secondary derived)* | **+5.83%** | 0.000488 | 12/12 |
+
+> In the uncapped saturated single-tunnel regime, `wg_steal=4` reproduced a reduction in
+> total CPU and an increase in throughput, yielding a substantial improvement in
+> delivered throughput per core-equivalent.
+
+Both co-primaries passed in the favorable direction — and the CPU side is again the
+stronger of the two: perfect sign consistency at the exact-test floor, versus a +2%
+throughput effect that sits inside Finding 8's "+2–4% around the knee" claim but below
+the sweep's +4.15% point estimate.
+
+**Composition** (secondary family, Holm-adjusted): `both − off` showed no detected
+throughput effect (−0.13%, p = 0.60) and a small detected CPU reduction (−0.62%,
+p_holm = 0.032) — the wake-only stack remains a user-level throughput null in this
+regime, with a small real CPU saving. A small secondary CPU reduction was observed for
+`both` versus `off`, but **no incremental throughput, CPU, or efficiency effect was
+detected for `bsteal4` versus `steal4`** (p = 0.61 / 0.75 / 0.62), and the 2×2 factorial
+interaction was not detected on any metric. This does not establish equivalence or prove
+redundancy.
+
+**Evidence.** Raw: `confirm_20260716_090437.csv` + `.meta`/`.percore`/`.dmesg` sidecars
+and 48 raw iperf JSONs (commit `fc9fd60`). Analysis: `confirm_20260716_090437.analysis.txt`
+(commit `87fb8d4`). Harness provenance stamped and verified per run:
+`9c2c35f514652d685527db0a0e0363ba1f55540e`. Module srcversion `40814CD3…`.
+
+### Finding 10 — Gate B: no favorable CPU effect detected at matched sub-saturated load
+
+The remaining claim was "same bytes, less CPU". Gate B tested it directly, as a
+**CPU-only matched-load paired confirmation** on the same instantiation after controlled
+reset: 8 randomized paired blocks × the same four conditions, 32 complete runs, 60 s
+exact windows, `CPU_ONLY=1` (no Sockperf process of any kind), bulk capped at
+`LOAD=3.58` Gb/s at the application layer so the **delivered** load — measured from
+`wg0` rx_bytes over the exact CPU window — lands on the predeclared 3.8 Gb/s target
+(`measure_fixedload.sh`, `fixedload_cpu_20260718_024625.csv`, analyzer exit 0).
+
+The validity gates all passed, and tightly: measured loads spanned **3.8012–3.8027 Gb/s**
+(maximum deviation from target 0.071% against a ±5% gate), the worst required
+within-block paired-load mismatch was **0.0316%** (gate: 1.5%), the per-core sidecar
+carried 1,280 unique `(block, position, cpu)` tuples (32 runs × 40 CPUs), dmesg logged
+zero relevant warnings, and the raw directory holds exactly 32 iperf JSONs and no
+Sockperf file.
+
+**Primary** (`steal4 − off` on total busy CPU): mean **−0.047 CE (−1.17%)**, bootstrap
+CI95 **[−0.245, +0.134] CE**, favorable in **3/8 blocks**, exact p = **0.6562**. No
+favorable matched-load CPU effect was detected at approximately 3.8 Gb/s. The confidence
+interval includes both a moderate saving and a small cost, so the result does not
+establish absence of an effect or equivalence. No secondary comparison was detected
+after Holm adjustment (smallest p_holm = 0.43; interaction −0.002 CE, p = 0.98).
+
+**Mechanism, descriptively.** Descriptive mechanism evidence at matched load showed that
+the mean classified head-blocked count fell from approximately 743,942 episodes per
+window with `off` to 10,021 with `steal4`, a reduction of about 98.7%. The `steal4`
+condition pulled approximately 2.32 million decrypt jobs per window. These counters show
+that stealing nearly eliminated the observed classified head-blocked population, even
+though this did not translate into a detectable total-CPU saving at that load. These
+counters are descriptive mechanism evidence, not a statistically tested endpoint,
+latency evidence, or proof of user-visible benefit.
+
+**Across the two regimes.** In the uncapped single-tunnel campaign, where the RX softirq
+workload was near one full core-equivalent, `wg_steal=4` reduced total busy CPU by 3.66%
+and increased throughput by 1.96%. At an exactly matched delivered load of approximately
+3.8 Gb/s, where softirq consumption averaged about 0.81–0.86 core-equivalents, the
+measured CPU contrast was −0.047 CE (−1.17%; CI95 [−0.245, +0.134], exact p = 0.656),
+and no favorable CPU effect was detected. This cross-regime pattern is consistent with
+stealing providing its detectable payoff when the pinned RX/softirq core approaches the
+binding limit, but it does not formally establish a saturation-by-treatment interaction
+or prove that no effect exists below saturation.
+
+**Latency.** Same-tunnel latency was attempted in a preliminary loaded-tunnel smoke, but
+the closed-loop UDP Sockperf probe could stall after an unanswered packet, producing
+condition-dependent valid durations and insufficient p99.9 sample support. The resulting
+percentile distributions were not comparable, so no user-visible latency claim is made.
+A future latency study should use an open-loop or otherwise loss-tolerant probe.
+
+**Evidence.** Raw: `fixedload_cpu_20260718_024625.csv` + sidecars, 32 raw iperf JSONs,
+both preserved smoke attempts (commit `63b125a`). Analysis:
+`fixedload_cpu_20260718_024625.analysis.txt` (commit `f50dd08`). Harness provenance:
+`d6dae228c1142a751915e72b62a7164f9cbd8034`. Module srcversion `40814CD3…`.
+
+> **What I learned.** The two gates say one thing together: the cycles `wg_steal`
+> recovers only show up on the bill when the pinned core has no cycles left to give.
+> Below the ceiling the mechanism still fires — the classifier watched the blocked
+> population vanish — but the meter does not move. A null with every validity gate green
+> is not a failure; it is the boundary of the claim, measured.
+
 ## 4. Timeline of experiments
 
 | Date | Experiment | What changed | Result | Status |
@@ -472,6 +574,8 @@ softirq deserves a scheduler-latency study before anyone ships it.
 | 07-10 | Phase C soak (#9) | `both` ON, 2×15 min + funnel bonus run | **PASS** — 0 dmesg hits, no collapse, 9.57 Gb/s line rate | settled |
 | 07-10 | **Phase D: wg_steal** (#9) | work-stealing poll implemented + A/B | blocked time **−95%**; CPU neutral; probe p99 null; **single-tunnel +3–5%** | needs soak + sweep |
 | 07-15 | **Phase D gates** (#10) | single-tunnel `wg_steal` sweep 0/1/2/4/8/16 ×5; soak with steal ON | knee at 4: **+4.15% Gb/s** (p=0.008); CPU **−3–5%** at every value; **efficiency +5.4–7.6%** (p=0.008 ∀); soak **PASS** | Finding 8 |
+| 07-16 | **Gate A paired confirmation** (#10, controlled reset) | 12 randomized paired blocks × {off, both, steal4, bsteal4}, 30 s uncapped | co-primaries confirmed: **+1.96% Gb/s** (p=0.010), **CPU −3.66%** (p=0.0005, 12/12); efficiency +5.83% (secondary derived) | Finding 9 |
+| 07-18 | **Gate B CPU-only matched load** (#10, controlled reset) | 8 paired blocks, `CPU_ONLY=1`, delivered 3.80 Gb/s from wg0 rx_bytes | primary **not detected** (−1.17%, p=0.66, CI [−6.1%, +3.3%]); blocked episodes −98.7% (descriptive) | Finding 10 |
 
 ## 5. Journal — the decisions, entry by entry
 
@@ -716,6 +820,8 @@ permutation tests are the right instrument; `analyze_single.py` documents this.
 | Phase D wg_steal A/B (Finding 8) | `steal_20260710_1542.csv` | `measure_steal.sh` | — |
 | Phase D gate 1 — single-tunnel sweep (Finding 8) | `single_20260715_0516.csv` | `measure_single.sh`, `analyze_single.py` | — |
 | Phase D gate 2 — soak with steal ON (Finding 8) | `soak_20260715_0530.csv` | `measure_soak.sh` (`STEAL=8`) | — |
+| Gate A paired confirmation (Finding 9) | `confirm_20260716_090437.csv` + `.analysis.txt` (+ sidecars, 48 iperf JSONs; smoke attempts preserved) | `measure_confirm.sh`, `analyze_confirm.py` | — |
+| Gate B CPU-only matched load (Finding 10) | `fixedload_cpu_20260718_024625.csv` + `.analysis.txt` (+ sidecars, 32 iperf JSONs; withdrawn-probe smoke `fixedload_smoke_20260717_030207.csv` preserved) | `measure_fixedload.sh` (`CPU_ONLY=1 LOAD=3.58`), `analyze_confirm.py --cpu-only` | — |
 | Module + knobs | — | `build/wg515-trigger/` (srcversion `EA06EE82…` campaigns ≤07-06; `47258C70…` = + E11-C classifier, 07-09; `40814CD3…` = + `wg_steal`, 07-10 on) | — |
 
 **E10/E11 per-cell provenance** (the raw dirs contain cold windows — use these):
