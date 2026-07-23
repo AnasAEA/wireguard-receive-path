@@ -1,4 +1,71 @@
 \section{Related Work}
 \label{sec:related}
 
-% Placeholder owned by the narrative writing pass.
+Our mechanism sits at the intersection of kernel VPN performance, receive-side
+scaling, ordered parallel processing, and work stealing. We position it against
+each, and state plainly what it is not: not a new tunnel protocol or cipher, not
+a receive-steering algorithm, and not a general-purpose task scheduler. It is a
+bounded receive-path mechanism that operates inside WireGuard's existing
+ordering model.
+
+\paragraph{WireGuard and its receive path.}
+WireGuard~\cite{donenfeld2017} is an in-kernel VPN built on the Noise
+framework~\cite{noise} and ChaCha20-Poly1305~\cite{rfc8439}. Its receive path
+decrypts in parallel and delivers in order, which is the source of the inversion
+we study.
+% TECHNICAL REVIEW: confirm this one-line characterization of prior work is
+% accurate -- that mounah2025 improves the same WireGuard receive path by
+% changing where deferred receive processing executes. This claim is not
+% covered by CLAIM_EVIDENCE_MATRIX.md; the same summary appears once in
+% 02-introduction.tex (paragraph 4).
+Closest to our work, \citet{mounah2025} analyze kernel asynchronous
+APIs in a kernel VPN and improve the same receive path by changing where
+deferred receive processing executes, lowering the cost that a related inversion
+imposes. We take a different lever: instead of relocating or cheapening the
+deferred work, we let the blocked delivery context advance the pending
+decryption that it is waiting on. Kernel-bypass designs such as
+XDP~\cite{hoiland2018xdp} avoid the stack entirely to reach high rates;
+WireGuard deliberately stays in the kernel networking stack, and our mechanism
+does too, so it inherits the same interoperability and isolation.
+
+\paragraph{NAPI and receive steering.}
+Interrupt mitigation through NAPI is long-standing~\cite{salim2001beyond}, and
+receive-side scaling distributes flows across cores by hashing flow identifiers,
+with software variants and connection-placement schemes improving
+locality~\cite{linux-napi,pesterev2012affinity}. These techniques operate
+\emph{between} flows: they choose which core serves a flow. They cannot divide a
+single WireGuard tunnel, whose fixed outer five-tuple hashes to one queue. Our
+mechanism is orthogonal and complementary: it acts \emph{within} the one RX/NAPI
+context that a single tunnel is bound to, exactly the case steering cannot
+spread.
+
+\paragraph{Parallel processing with ordered completion.}
+Reconciling parallel execution with ordered output is a recurring kernel
+problem. The \texttt{padata} framework parallelizes IPsec cryptography across
+cores and restores order through a dedicated serialization
+stage~\cite{linux-padata}. WireGuard instead records arrival order in a per-peer
+queue and decrypts through a device-wide ring, so ordering is enforced at the
+single delivery consumer rather than by a reorder stage. We do not add a
+reordering stage, and our implementation is not \texttt{padata}; we keep the
+existing per-peer ordered queue and let the blocked consumer make progress on
+the shared decrypt work. Head-of-line blocking of this kind is general to
+ordered parallel pipelines, but here it is specific to the boundary between
+parallel decryption and single-consumer ordered delivery, which is what our
+design targets.
+
+\paragraph{Work stealing and cooperative execution.}
+Work stealing is a classic load-balancing discipline: an idle worker takes tasks
+from a busy worker's deque, with strong bounds and a widely used runtime
+realization in Cilk~\cite{blumofe1999,frigo1998cilk}. Our mechanism borrows the
+name but differs in intent and structure. The context that steals is not an idle
+worker seeking load balance; it is a delivery consumer blocked on an ordering
+constraint. It pulls from a single shared ring rather than from per-worker
+deques, its budget is small and bounded per pass, and its goal is to unblock
+ordered delivery rather than to maximize parallel throughput. In that respect it
+is closer to cooperative schemes such as flat combining, where one thread
+performs others' pending operations to reduce
+synchronization~\cite{hendler2010flat}: \texttt{wg\_steal} likewise has the
+blocked context perform pending work, but to relieve a single-core receive
+bottleneck, within a hard bound, and in softirq context. These constraints, and
+the ordering guarantee they preserve, are what distinguish a receive-path
+scheduling mechanism from a general-purpose work-stealing scheduler.

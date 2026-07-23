@@ -1,4 +1,36 @@
 \section{Conclusion}
 \label{sec:conclusion}
 
-% Placeholder owned by the narrative writing pass.
+WireGuard's parallel decryption and ordered delivery create an execution-order
+inversion: a later packet can finish before the ordered head, and the receive
+poll then stalls with useful decrypt work still pending. We showed that
+suppressing the premature polls this inversion produces is real but reclaims
+little CPU on the tested hardware, because the entire empty-poll population
+occupies only about two hundredths of a core. The more consequential cost is the
+tens of microseconds delivery spends blocked behind an incomplete head, where
+the head waits to be scheduled onto a worker rather than to be decrypted.
+\texttt{wg\_steal} targets that interval: the blocked NAPI context performs a
+bounded amount of pending decrypt work from the device-wide ring before
+yielding, entirely within WireGuard's existing ordering.
+
+In the uncapped saturated single-tunnel regime, where one receive core is the
+binding resource, stealing raised throughput and reduced total CPU, its two
+co-primary endpoints. At an exactly matched load near 3.8~Gb/s, no favorable CPU
+effect was detected, even though mechanism counters show the classified
+blocked-head population was still nearly eliminated. This cross-regime pattern is
+consistent with the benefit becoming measurable as the pinned receive core
+approaches its binding limit. The two campaigns do not establish a saturation
+threshold or a formal treatment-by-saturation interaction, and we make no
+user-visible latency claim.
+
+The mechanism is a research prototype, and its limits point to concrete next
+steps. Stolen decryption runs in softirq and is not charged to NAPI's delivery
+budget, so a production design should account that work against a scheduling
+budget to bound softirq duration and to measure per-peer fairness, especially
+because a stolen job may belong to another peer. The effect should be validated
+across NICs, CPUs, and kernel versions, and the withdrawn closed-loop latency
+probe should be replaced by a loss-tolerant, open-loop study. More broadly, the
+result frames a question for any ordered parallel receive path: when a delivery
+consumer is blocked on work owned by another scheduling path, letting it advance
+that work under a strict bound is a lever worth measuring wherever one core is
+the receive-side ceiling.
