@@ -1,4 +1,181 @@
 \section{Design and Implementation}
 \label{sec:design}
 
-% Placeholder owned by the technical writing pass.
+\subsection{Receive-Path Execution Model}
+\label{sec:design-model}
+
+WireGuard separates decryption order from delivery order.  On receive, a data
+packet is first appended to a per-peer \emph{ordered queue} and marked
+\textsc{uncrypted}.  The same packet is then published to a
+device-wide decrypt ring.  The ring feeds per-CPU workers from WireGuard's
+cryptographic workqueue; it may contain packets from any peer attached to that
+WireGuard device.  A worker consumes a ring entry, authenticates and decrypts
+it, and changes its state to \textsc{crypted}, or to \textsc{dead} on
+failure~\cite{wireguard-linux,linux-workqueue}.
+
+These two queues deliberately enforce different constraints.  The device ring
+allows workers to decrypt independent packets in parallel.  The per-peer queue
+records arrival order and has one consumer: that peer's NAPI receive
+poll~\cite{linux-napi}.  The poll examines the ordered head and removes entries
+only after an acquire load observes a terminal state.  A \textsc{crypted}
+packet proceeds through replay validation and normal stack delivery; a
+\textsc{dead} packet is drained and freed.  An \textsc{uncrypted} head stops
+the loop.  Consequently, a later packet may have completed decryption but
+cannot pass an earlier incomplete head.
+
+This is the execution-order inversion addressed here.  Decryption completes in
+worker execution order, while the receive poll must commit packets in arrival
+order.  When those orders differ, the NAPI consumer can be runnable yet unable
+to deliver.  Pending decrypt jobs can simultaneously remain in the shared
+device ring.
+
+\subsection{Detecting an Ordered-Head Stall}
+\label{sec:design-detection}
+
+The implementation detects blocking at the point where the existing ordered
+delivery loop stops.  After peeking the per-peer queue, it reads the head state
+with acquire semantics.  A present head whose state remains
+\textsc{uncrypted} is an ordered-head stall; an empty queue is a distinct
+condition.  This distinction matters because neither a wake nor work stealing
+can make progress for the same reason in both cases.
+
+For mechanism validation, optional instrumentation records contiguous blocked
+episodes under the class observed when the episode opens.  Separate arrays
+store the episode count, cumulative and maximum duration, and four duration
+buckets for empty-queue and \textsc{uncrypted}-head episodes.  Additional
+counters classify the head state against the NAPI \textsc{missed} bit and
+record work-stealing pulls, unblocking passes, and zero-pull dry runs.  These
+global counters are intentionally lightweight, racy integer accumulators.
+They support descriptive ratios and order-of-magnitude comparisons, not exact
+concurrent accounting or inferential endpoints.
+
+\subsection{Wake-Side Mechanisms}
+\label{sec:design-wake}
+
+Before changing where decryption executes, we implemented two complementary
+wake-side mechanisms (Table~\ref{tab:design-knobs}).  They address polls that
+are scheduled before the ordered head can be delivered, but they do not
+perform pending decrypt work.
+
+\paragraph{Consumer-side suppression (\texttt{wg\_supp}).}
+When a poll is about to complete with an \textsc{uncrypted} head, a concurrently
+completed non-head packet may have set NAPI's \textsc{missed} bit.  Leaving the
+bit set immediately reschedules the poll, which observes the same incomplete
+head and does no useful work.  The suppression path clears \textsc{missed},
+executes an ordering barrier, and rechecks the head.  If the head became
+terminal during that window, it restores \textsc{missed}; otherwise the poll
+parks until a later completion schedules it.  This recheck prevents a
+completion racing the clear from being lost.
+
+\paragraph{Producer-side head gating (\texttt{wg\_headwake}).}
+At the completion point, a worker ordinarily requests NAPI execution for every
+packet.  Head gating instead lets the poll publish the packet on which it is
+blocked.  A producer schedules NAPI only when it completes that exact packet,
+or when the poll observed an empty queue and any new packet becomes the head.
+The producer compares the published pointer but never dereferences it.
+Store-release publication of the packet state, a full barrier, and the poll's
+publish-then-recheck sequence form a two-sided lost-wakeup protocol.  Error
+completions remain on the immediate wake path so that \textsc{dead} entries are
+drained.
+
+\input{tables/design_knobs}
+
+The two mechanisms compose: head gating suppresses producer wakes for
+non-head completions, while consumer suppression clears a \textsc{missed}
+reschedule that reached the poll through a concurrent path.  Both reduce
+premature execution.  Neither changes the \textsc{uncrypted} head's state, so
+neither can directly shorten an episode in which pending decryption is the
+missing prerequisite.
+
+\subsection{Bounded Receive-Side Work Stealing}
+\label{sec:design-steal}
+
+\texttt{wg\_steal} acts after the normal delivery loop reaches an
+\textsc{uncrypted} head and before the poll completes.  If the treatment is
+enabled and delivery budget remains, the current NAPI/softirq CPU consumes an
+entry from the device-wide decrypt ring using the same locked consume primitive
+as a normal worker.  It decrypts the returned packet synchronously and invokes
+WireGuard's normal per-peer receive-completion function with the resulting
+\textsc{crypted} or \textsc{dead} state.  The completion may concern any peer:
+the ring is device-wide, and the stolen entry need not be the head that caused
+the current poll to block.
+
+After each completion, the steal loop rechecks the current peer's ordered
+head.  It stops when the head is absent or terminal, the configured number of
+jobs has been consumed, or the device ring is empty.  Ring emptiness does not
+mean no decryption is in progress: a normal worker may already have removed
+the relevant head and be processing it.  Workers continue to run concurrently
+with the stealing poll.
+
+If at least one job was pulled and the current head has become terminal, the
+poll returns to the original delivery loop.  No stolen packet is injected
+directly into the network stack.  A job first completes through the normal
+per-peer path, and delivery still removes packets from the ordered queue.
+Thus work stealing changes which context executes decryption, not the order in
+which packets become visible above WireGuard.
+
+\subsection{Ownership and Ordering Preservation}
+\label{sec:design-safety}
+
+Exclusive ownership follows from the existing ring interface.  Both per-CPU
+workers and the NAPI stealing path call the bottom-half-safe consume operation,
+which holds the ring's consumer lock while removing one entry.  A successful
+consume advances the ring and transfers the returned packet to exactly one
+caller.  A worker and the NAPI path therefore cannot consume the same ring
+element.
+
+State publication follows the stock synchronization discipline.  Enqueue first
+marks a packet \textsc{uncrypted} with release semantics, records it in the
+per-peer queue, and then publishes it to the device ring.  The unique consumer
+performs decryption and calls the normal completion helper, which publishes
+\textsc{crypted} or \textsc{dead} with a release store.  The NAPI consumer reads
+that state with acquire semantics.  Peer and key references, replay checks,
+error draining, and stack delivery are unchanged.  In particular,
+\texttt{wg\_steal} never removes an entry from the per-peer ordered queue and
+cannot bypass the head.
+
+These properties provide a source-level safety argument for exclusive ring
+ownership and order preservation.  They are not a formal proof of all lifetime,
+scheduling, or cross-version properties.  The evaluation additionally checks
+for kernel warnings, stalled handshakes, and failures in the tested campaigns,
+but absence of an observed failure is not evidence of production safety.
+
+\subsection{Selecting and Bounding the Steal Budget}
+\label{sec:design-budget}
+
+The parameter is a per-\emph{pass} bound.  With
+\texttt{wg\_steal=4}, one entry into the steal loop can successfully consume at
+most four jobs.  It may consume fewer because the ring becomes empty or the
+ordered head becomes terminal.  Four denotes neither decryption workers nor
+CPUs, and it is not guaranteed that four jobs are available.
+
+Nor is four necessarily a limit for an entire NAPI poll.  When a pass unblocks
+the head, the same poll returns to delivery.  It can later reach another
+\textsc{uncrypted} head and enter a new steal pass whose local counter starts
+at zero.  A complete poll can therefore steal more than four jobs in total.
+The ordinary NAPI budget still bounds delivered packets, but synchronous
+decrypt time is not charged to the poll's \texttt{work\_done} count.
+
+This accounting motivates a small bound.  A large value could extend
+bottom-half execution, delay other softirq work, or consume jobs belonging to
+other peers.  The bound limits each uninterrupted pull sequence, while the
+evaluation separates exploratory budget selection from the final paired test
+of budget four.
+
+\subsection{Implementation Limitations}
+\label{sec:design-limitations}
+
+The prototype trades scheduling delay for synchronous work in softirq context.
+That trade can be favorable when one RX/softirq core is the binding resource,
+but it creates three limitations.  First, a device-wide steal is not
+peer-local, so the blocked peer may perform work that benefits another peer.
+Second, stolen crypto is not represented in NAPI's delivery accounting, which
+weakens the budget's relationship to CPU time.  Third, longer bottom-half
+execution can affect fairness and scheduler latency even when throughput or
+aggregate CPU improves.
+
+The implementation is therefore a research prototype.  The experiments test
+specific Linux 5.15, CloudLab c220g2, traffic, and budget configurations.  A
+production design would require broader kernel validation, an explicit
+time-based or work-accounting policy, multi-peer fairness measurements, and a
+loss-tolerant latency study.

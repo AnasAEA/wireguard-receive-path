@@ -1,0 +1,20 @@
+\begin{table}[t]
+  \caption{Receive-path treatments. All knobs are disabled at zero.}
+  \label{tab:design-knobs}
+  \small
+  \begin{tabularx}{\columnwidth}{@{}lX@{}}
+    \toprule
+    Knob & Action when enabled \\
+    \midrule
+    \texttt{wg\_supp} &
+      Clears a pending \textsc{missed} reschedule when the ordered head remains
+      \textsc{uncrypted}, then rechecks for a racing completion. \\
+    \texttt{wg\_headwake} &
+      Wakes NAPI only when completion makes the published head deliverable, or
+      when the poll had observed an empty queue. \\
+    \texttt{wg\_steal} &
+      Bounds successful device-ring consumes and synchronous decryptions in
+      one blocked-head steal pass. \\
+    \bottomrule
+  \end{tabularx}
+\end{table}
