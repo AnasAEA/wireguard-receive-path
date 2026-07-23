@@ -1,0 +1,82 @@
+\documentclass[nonacm,sigconf,10pt]{acmart}
+
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{array}
+\usepackage{subcaption}
+\usepackage{microtype}
+
+\graphicspath{{figures/}{figures/conceptual/}{figures/generated/}}
+\urlstyle{same}
+\settopmatter{printacmref=false}
+\pagestyle{plain}
+
+\title{Breaking Ordered-Delivery Stalls in WireGuard with Bounded Work Stealing}
+
+% The author order and contact details are provisional and may be adjusted later.
+\author{Anas Ait El Hadj}
+\affiliation{%
+  \institution{Univ. Grenoble Alpes, CNRS, Grenoble INP, LIG}
+  \city{Grenoble}
+  \country{France}
+}
+\author{Alain Tchana}
+\affiliation{%
+  \institution{Univ. Grenoble Alpes, CNRS, Grenoble INP, LIG}
+  \city{Grenoble}
+  \country{France}
+}
+
+\begin{document}
+
+\begin{abstract}
+\input{abstract}
+\end{abstract}
+
+\begin{CCSXML}
+<ccs2012>
+ <concept>
+  <concept_id>10011007.10010940</concept_id>
+  <concept_desc>Software and its engineering~Operating systems</concept_desc>
+  <concept_significance>500</concept_significance>
+ </concept>
+ <concept>
+  <concept_id>10003033.10003068</concept_id>
+  <concept_desc>Networks~Network protocols</concept_desc>
+  <concept_significance>500</concept_significance>
+ </concept>
+ <concept>
+  <concept_id>10003033.10003099.10003100</concept_id>
+  <concept_desc>Networks~Network performance evaluation</concept_desc>
+  <concept_significance>500</concept_significance>
+ </concept>
+ <concept>
+  <concept_id>10003752.10003753.10003758</concept_id>
+  <concept_desc>Theory of computation~Concurrency</concept_desc>
+  <concept_significance>300</concept_significance>
+ </concept>
+</ccs2012>
+\end{CCSXML}
+
+\ccsdesc[500]{Software and its engineering~Operating systems}
+\ccsdesc[500]{Networks~Network protocols}
+\ccsdesc[500]{Networks~Network performance evaluation}
+\ccsdesc[300]{Theory of computation~Concurrency}
+
+\keywords{WireGuard, Linux networking, NAPI, work stealing, ordered delivery,
+kernel scheduling, receive-side processing}
+
+\maketitle
+
+\input{02-introduction}
+\input{03-background-motivations}
+\input{04-contributions}
+\input{05-evaluation}
+\input{06-related}
+\input{07-conclusion}
+
+\bibliographystyle{ACM-Reference-Format}
+\bibliography{reference}
+
+\end{document}
