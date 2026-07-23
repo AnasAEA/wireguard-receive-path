@@ -1,0 +1,27 @@
+\begin{table*}[t]
+  \caption{Prespecified confirmation contrasts for steal4 minus off. Gate A
+  throughput and total busy CPU are co-primary; efficiency is secondary and
+  derived. Gate B total busy CPU is primary. Confidence intervals are paired
+  bootstrap intervals; $p$ values are exact two-sided sign-flip tests.}
+  \label{tab:confirmation-results}
+  \small
+  \centering
+  \begin{tabular}{@{}llrrrrl@{}}
+    \toprule
+    Regime & Endpoint & Mean effect & Relative & CI95 & Favorable & Exact $p$ \\
+    \midrule
+    Saturated & Throughput (co-primary) &
+      $+0.0818$ Gb/s & $+1.96\%$ &
+      $[+0.0343,+0.1297]$ Gb/s & 9/12 & 0.0103 \\
+    Saturated & Total busy CPU (co-primary) &
+      $-0.1757$ CE & $-3.66\%$ &
+      $[-0.2038,-0.1459]$ CE & 12/12 & 0.000488 \\
+    Saturated & Efficiency (secondary) &
+      $+0.0506$ Gb/s/CE & $+5.83\%$ &
+      $[+0.0427,+0.0582]$ Gb/s/CE & 12/12 & 0.000488 \\
+    Matched 3.8 Gb/s & Total busy CPU (primary) &
+      $-0.0470$ CE & $-1.17\%$ &
+      $[-0.2450,+0.1341]$ CE & 3/8 & 0.6562 \\
+    \bottomrule
+  \end{tabular}
+\end{table*}

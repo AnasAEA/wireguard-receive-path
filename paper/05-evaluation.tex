@@ -1,4 +1,331 @@
 \section{Evaluation}
 \label{sec:evaluation}
 
-% Placeholder owned by the technical writing pass.
+\subsection{Experimental Setup and Methodology}
+\label{sec:eval-method}
+
+\paragraph{Testbed.}
+The experiments use two bare-metal CloudLab c220g2 nodes: one load generator and
+one instrumented receiver.  Each node has two Intel Xeon E5-2660 v3 sockets
+(20 physical cores and 40 hardware threads in total) and an Intel X520 10-GbE
+interface.  The receiver exposes 40 RX queues through the \texttt{ixgbe}
+driver.  It runs Ubuntu 22.04 with Linux 5.15.0-177 and an out-of-tree
+WireGuard module rebuilt from pristine Ubuntu 5.15 source plus the five-file
+implementation overlay described in Section~\ref{sec:design}.  The final
+work-stealing campaigns use module source version
+\texttt{40814CD3CA80D0908BF87D3}.
+
+The generator creates network namespaces and WireGuard peers, sends through the
+physical link, and drives receiver-side \texttt{iperf3} servers.  Multi-tunnel
+experiments use distinct UDP ports; the confirmation experiments use four
+parallel TCP streams inside one WireGuard tunnel.  Thus the latter remains one
+outer five-tuple even though its inner workload contains several streams.
+
+\paragraph{Treatments.}
+We use a $2\times2$ treatment structure in the final campaigns.  \emph{Off}
+disables the wake changes and stealing.  \emph{Both} enables
+\texttt{wg\_supp} and \texttt{wg\_headwake}.  \emph{Steal4} enables only
+\texttt{wg\_steal=4}; \emph{bsteal4} combines both wake changes with steal4.
+Injected decrypt delay and the earlier timer-based trigger are disabled.
+Gate A disables diagnostic counters; Gate B enables them for descriptive
+mechanism accounting.
+
+\paragraph{Metrics.}
+Throughput is received \texttt{iperf3} goodput in the uncapped experiment.
+The matched-load experiment instead computes delivered rate from the change in
+\texttt{wg0} receive bytes over exactly the CPU measurement interval.  CPU
+snapshots come from \texttt{/proc/stat} for all 40 logical CPUs.  We report
+\emph{core-equivalents} (CE): 1 CE means one CPU core was busy continuously
+over the measurement window.  Total busy CE sums busy time across all CPUs;
+softirq CE is reported separately as descriptive context.  Module counters
+measure classified ordered-head episodes and pulled jobs, but are not
+inferential endpoints.
+
+\paragraph{Experimental hierarchy and statistics.}
+Mechanism studies and the steal-budget sweep are exploratory or descriptive.
+Budget selection is kept separate from both confirmations.  Each final
+campaign randomizes the four treatments within a block and analyzes
+within-block contrasts.  The saturated campaign declares throughput and total
+busy CPU as co-primary endpoints for steal4 minus off.  Efficiency
+(Gb/s per busy CE) is secondary and derived.  The matched-load campaign
+declares total busy CPU as its single primary endpoint.  We use exact
+two-sided sign-flip tests on paired block differences and 10,000-resample
+paired bootstrap confidence intervals with the analyzer's fixed seed.
+Secondary factorial contrasts use Holm adjustment.  Every final run records
+knob readbacks, module version, raw-result identity, per-core snapshots, and
+new kernel-warning lines; the analyzer rejects incomplete blocks or failed
+validity gates.
+
+\subsection{Receive Steering and the Single-Tunnel Bottleneck}
+\label{sec:eval-steering}
+
+We first distinguish aggregate multi-tunnel scaling from the single-tunnel
+problem studied by work stealing.  With the tested NIC's default UDP hash
+fields (\texttt{sd}, source and destination addresses), eight tunnels between
+the same two hosts concentrated receive work on one queue and delivered
+4.08--4.13 Gb/s.  The hottest CPU was fully busy and approximately 97.6\% of
+its time was softirq.  Adding UDP source and destination ports to the hash
+(\texttt{sdfn}) distributed the tunnels across roughly eight receive cores and
+delivered 8.99 Gb/s (Figure~\ref{fig:steering}).
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\columnwidth]{steering_baseline.pdf}
+  \caption{Receive-side CPU distribution under the tested NIC hash settings.
+  Adding UDP ports spreads eight distinct tunnels; it does not split one
+  tunnel's outer five-tuple. Aggregate throughput values are the two-run ranges
+  recorded by the committed harness summary.}
+  \label{fig:steering}
+\end{figure}
+
+Port-aware hashing therefore addresses a multi-tunnel placement bottleneck.
+It cannot create several RX flows from one tunnel with fixed outer addresses
+and ports.  In the uncapped single-tunnel confirmation, mean softirq
+consumption remained 0.990--0.994 CE across conditions.  That near-one-core
+receive path is the regime in which changing work performed by the NAPI CPU can
+alter the binding limit.
+
+\subsection{Wake-Side Mechanism Validation}
+\label{sec:eval-wake}
+
+The two-sided wake intervention substantially changes poll composition.  In a
+15-s peer sweep with port-aware receive steering, the stock wasted-poll
+fraction was 27.0\%, 27.3\%, 26.8\%, and 27.5\% for 8, 16, 32, and 64 peers.
+Enabling both wake mechanisms reduced those values to 14.8\%, 13.8\%, 13.1\%,
+and 14.4\%, respectively.  The reduction is real but does not increase with
+peer count in this real-NIC setup.
+
+To test whether the intervention responds to the interval during which the
+head remains incomplete, we injected 0, 1, 2, 5, or 10 us of busy-wait delay
+per decrypt.  The capped generator delivered approximately 0.96--1.05 Gb/s;
+we do not treat its nominal 2-Gb/s setting as delivered load.  Across five
+repetitions per cell, the median stock wasted fraction remained near
+33--35\%.  The both treatment reduced it from 34.4\% to 15.2\% at native cost
+and from 34.6\% to 3.8\% at 10 us (Figure~\ref{fig:wake-delay}).  The removed
+fraction increased monotonically from 56\% to 89\% across the tested doses.
+This is mechanism evidence that the wake paths act on premature polls; it does
+not establish an application-level benefit.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\columnwidth]{wake_delay_response.pdf}
+  \caption{Wasted receive polls versus injected decrypt delay. Points show all
+  five repetitions; lines and bands show medians and interquartile ranges.
+  This dose-response experiment is exploratory.}
+  \label{fig:wake-delay}
+\end{figure}
+
+\subsection{Why Premature Polls Are Too Cheap}
+\label{sec:eval-poll-cost}
+
+Poll counts alone do not reveal their CPU importance.  We therefore summed the
+duration of receive-poll invocations returning zero with a BPF kretprobe over
+30-s windows.  After excluding cold windows according to the prespecified
+per-cell provenance, a measured wasted poll occupied approximately
+1.14--1.36 us.  Probe overhead makes this an upper-bound estimate of the
+uninstrumented function.
+
+At native decrypt cost, stock executed 483,116 wasted polls whose measured
+duration summed to 656.7 ms.  That population consumed 0.0219 CE over the
+window.  At the 10-us injected delay, a comparable stock window consumed
+0.0231 CE.  Figure~\ref{fig:poll-cost} contrasts per-poll duration with the
+aggregate budget.  The wake treatment can remove many events yet the complete
+stock population occupies only about two hundredths of a core.  This scale is
+consistent with the absence of a clear throughput or aggregate-CPU payoff in
+the wake-mechanism campaigns, but it does not prove that the wake changes are
+redundant.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\columnwidth]{empty_poll_cost.pdf}
+  \caption{Measured wasted-poll duration and aggregate CPU budget for valid
+  cost-accounting windows. Duration includes kretprobe overhead; no
+  unmeasured confidence interval is implied.}
+  \label{fig:poll-cost}
+\end{figure}
+
+\subsection{Characterizing Ordered-Head Blocking}
+\label{sec:eval-blocking}
+
+The cost measurement motivated a different question: how long is delivery
+blocked behind a head known to be \textsc{uncrypted}, rather than how long one
+unsuccessful poll executes?  The in-module classifier separates empty-queue
+episodes from episodes opened on an \textsc{uncrypted} head.  We use the
+spread-guaranteed rerun with three 30-s repetitions at native, 5-us, and 10-us
+decrypt delay.
+
+Across those conditions, the classifier recorded approximately 150,000 to
+298,000 \textsc{uncrypted}-head episodes per window.  Their repetition means
+ranged from 35 to 94 us, and most observations fell in the 16--128-us bucket
+(Figure~\ref{fig:blocking}).  At most about 1\% exceeded 1 ms; the empty-queue
+class, not the encrypted-head class, carried most of the millisecond tail.
+Thus the blocked interval is tens of times larger than the approximately
+1.2-us cost of asking prematurely.  These episode durations delimit a
+scheduling opportunity; they are not packet or application latency.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\columnwidth]{classified_blocking.pdf}
+  \caption{Count and mean duration of classified
+  \textsc{uncrypted}-head episodes in the spread-guaranteed rerun. Each marker
+  is one 30-s repetition; the evidence is descriptive.}
+  \label{fig:blocking}
+\end{figure}
+
+\subsection{Selecting the Steal Budget}
+\label{sec:eval-selection}
+
+An initial four-condition experiment established feasibility: the stealing
+path pulled device-ring jobs and reduced classified blocked wall time from
+approximately 9.50 s to 0.44 s per 30-s window.  Because that comparison used
+four repetitions and budget eight, we use it only as mechanism evidence.
+
+We selected the final budget in a separate uncapped single-tunnel sweep:
+values 0, 1, 2, 4, 8, and 16, each with five shuffled 20-s repetitions.
+Table~\ref{tab:steal-sweep} reports the exploratory means relative to off.
+Each value was compared with off using an exact independent permutation test
+with 252 allocations; the five throughput comparisons used a Bonferroni
+threshold of 0.01.  Budget four was the only value whose throughput comparison
+passed that threshold: +4.15\%, $p=0.0079$.  Its CPU estimate was -3.20\%
+($p=0.0159$), and its derived efficiency estimate was +7.60\%
+($p=0.0079$).  We selected four because it combined the largest observed
+throughput and efficiency means with a small per-pass bound.  The sweep neither
+proves global optimality nor supplies the final effect estimate.
+
+\input{tables/steal_sweep}
+
+\subsection{Saturated Paired Confirmation}
+\label{sec:eval-gatea}
+
+The uncapped confirmation (Gate A) comprises 12 randomized paired blocks.
+Every block contains off, both, steal4, and bsteal4 once in a newly shuffled
+order; all 48 runs use 30-s single-tunnel windows.  The campaign ran on the
+same CloudLab instantiation as the selection study after a controlled reset.
+All knob, structure, raw-identity, per-core, and dmesg gates passed.
+
+Figure~\ref{fig:gate-a} displays every paired steal4-minus-off block.  Mean
+throughput increased by 0.0818 Gb/s, or 1.96\%, with bootstrap CI95
+[+0.0343,+0.1297] Gb/s.  Nine of 12 blocks were favorable and the exact
+two-sided sign-flip test gives $p=0.0103$.  Mean total busy CPU fell by
+0.1757 CE, or 3.66\%, with CI95 [-0.2038,-0.1459] CE.  All 12 blocks were
+favorable and the exact test reaches its two-sided resolution floor,
+$p=0.000488$.  Both declared co-primary endpoints therefore pass in the
+favorable direction.
+
+\begin{figure*}[t]
+  \centering
+  \includegraphics[width=0.92\textwidth]{gate_a_paired.pdf}
+  \caption{Saturated paired confirmation. Each point is the within-block
+  steal4-minus-off difference; the diamond and horizontal interval show the
+  mean and paired-bootstrap CI95. Throughput and total busy CPU are
+  co-primary.}
+  \label{fig:gate-a}
+\end{figure*}
+
+The secondary derived efficiency increased by 0.0506 Gb/s/CE, or 5.83\%,
+with CI95 [+0.0427,+0.0582], favorable in all 12 blocks
+($p=0.000488$).  It is not a third primary endpoint.  In the Holm-adjusted
+composition family, both minus off showed no detected throughput effect
+(-0.13\%, raw $p=0.6035$) and a small detected CPU reduction
+(-0.62\%, Holm $p=0.0322$).  No incremental throughput, CPU, or efficiency
+effect was detected for bsteal4 over steal4.  Those non-detections neither
+establish treatment equivalence nor make the wake mechanisms redundant.
+
+\input{tables/confirmation_results}
+
+\subsection{Matched-Load CPU Confirmation}
+\label{sec:eval-gateb}
+
+The matched-load confirmation (Gate B) asks the narrower question ``same
+delivered bytes, less total CPU?''  It removes the invalid closed-loop latency
+probe and runs in CPU-only mode.  Eight randomized blocks provide 32 complete
+60-s windows.  The application cap is 3.58 Gb/s, calibrated so that delivered
+inner traffic measured from \texttt{wg0} receive bytes targets 3.8 Gb/s over
+the exact CPU window.
+
+All validity gates passed.  Individual delivered loads span
+3.8012--3.8027 Gb/s; the maximum target deviation is approximately 0.071\%,
+and the worst required within-block paired mismatch is 0.0316\%.  These values
+are far inside the predeclared 5\% absolute and 1.5\% paired gates.
+The artifact set contains 1,280 unique block/position/CPU tuples, exactly 32
+raw \texttt{iperf3} JSON files, no Sockperf file, and no relevant dmesg record.
+
+Figure~\ref{fig:gate-b} shows both the load check and all eight primary paired
+CPU differences.  The steal4-minus-off mean is -0.047 CE (-1.17\%), with
+CI95 [-0.245,+0.134] CE.  Three of eight blocks favor steal4 and the exact
+test gives $p=0.6562$.  We therefore detect no favorable total-CPU effect at
+the tested matched load.  The interval includes both a moderate saving and a
+small cost, so the experiment does not establish equivalence or absence of an
+effect.  No secondary contrast was detected after Holm adjustment.
+
+\begin{figure*}[t]
+  \centering
+  \includegraphics[width=0.92\textwidth]{gate_b_matched.pdf}
+  \caption{Matched-load CPU confirmation. Left: all 32 exact-window delivered
+  loads. Right: the eight paired steal4-minus-off total-CPU differences with
+  mean and CI95. The interval spans benefit and cost; the result is a
+  non-detection, not equivalence.}
+  \label{fig:gate-b}
+\end{figure*}
+
+Descriptive counters show that the mechanism still activated below the
+uncapped ceiling.  In the two conditions without wake suppression, the mean
+classified \textsc{uncrypted}-head count fell from approximately 743,942 per
+window with off to 10,021 with steal4, a 98.7\% reduction.  Steal4 pulled
+approximately 2.32 million decrypt jobs per window.  These counters demonstrate
+mechanism activation and a changed blocked-head population; they are not
+latency measurements or statistically tested performance endpoints.
+
+\subsection{Cross-Regime Interpretation}
+\label{sec:eval-cross-regime}
+
+The two confirmations expose different operating contexts.  In the uncapped
+single-tunnel campaign, condition means for RX softirq occupancy are
+approximately 0.99 CE, and stealing both lowers total CPU and raises the
+throughput ceiling.  At the exactly matched 3.8-Gb/s load, condition means are
+approximately 0.81--0.86 softirq CE; classified blocking is almost eliminated,
+but the total-CPU contrast is not detected.
+
+This pattern is consistent with the stolen work producing a detectable payoff
+as the pinned RX/softirq core approaches its binding limit.  It does not
+formally establish a saturation-by-treatment interaction: the campaigns have
+different load controls, block counts, durations, and diagnostic settings.
+Nor does it establish saturation as the cause of the different estimates or
+an exclusive operating threshold for the treatment.
+
+\subsection{Limitations and Threats to Validity}
+\label{sec:eval-limitations}
+
+\paragraph{External validity.}
+Measurements cover one server class, 10-GbE NIC family, Linux 5.15 module, and
+small set of tunnel/load configurations.  Receive hashing and scheduler costs
+can differ on other NICs and kernels.  The original steering throughput
+summary is preserved as committed experimental documentation rather than its
+machine-readable harness output; the per-core CSV evidence is committed.
+
+\paragraph{Replication and dependence.}
+Randomized blocks control temporal drift within each campaign, but Gate A and
+Gate B ran on the same CloudLab instantiation after controlled resets.  They
+are paired confirmations, not independent fresh-node replications.  The
+cross-regime comparison is descriptive rather than a pooled or factorial
+interaction test.
+
+\paragraph{Instrumentation.}
+The cost probe adds overhead, so its per-poll duration is an upper bound.
+Diagnostic arrays are racy global counters suitable for ratios and
+order-of-magnitude mechanism evidence.  Gate A disables them; Gate B enables
+them uniformly, but only off and steal4 have comparable classifier semantics
+because the wake treatments also change episode formation.
+
+\paragraph{Latency.}
+A preliminary loaded-tunnel smoke used closed-loop UDP Sockperf.  An unanswered
+packet could freeze the probe, producing condition-dependent valid durations
+and insufficient p99.9 support.  Those distributions are withdrawn.  We make
+no user-visible latency claim; an open-loop or loss-tolerant study is required.
+
+\paragraph{Safety and fairness.}
+The campaigns and two 15-minute stealing soaks recorded no relevant kernel
+warning, tunnel collapse, or lost handshake.  This did not reveal a reliability
+problem in the tested regimes, but it is not proof of production safety.
+Synchronous softirq crypto is not charged to NAPI's delivery budget, and this
+study does not quantify per-peer fairness or scheduler-latency effects.
