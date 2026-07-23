@@ -1,5 +1,7 @@
 \section{Evaluation}
 \label{sec:evaluation}
+\begingroup
+\setlength{\emergencystretch}{1.5em}
 
 \subsection{Experimental Setup and Methodology}
 \label{sec:eval-method}
@@ -12,8 +14,8 @@ interface.  The receiver exposes 40 RX queues through the \texttt{ixgbe}
 driver.  It runs Ubuntu 22.04 with Linux 5.15.0-177 and an out-of-tree
 WireGuard module rebuilt from pristine Ubuntu 5.15 source plus the five-file
 implementation overlay described in Section~\ref{sec:design}.  The final
-work-stealing campaigns use module source version
-\texttt{40814CD3CA80D0908BF87D3}.
+work-stealing campaigns use the same audited module build; every run records
+its exact source version.
 
 The generator creates network namespaces and WireGuard peers, sends through the
 physical link, and drives receiver-side \texttt{iperf3} servers.  Multi-tunnel
@@ -71,6 +73,9 @@ delivered 8.99 Gb/s (Figure~\ref{fig:steering}).
 \begin{figure}[t]
   \centering
   \includegraphics[width=\columnwidth]{steering_baseline.pdf}
+  \Description{Two panels compare stock and port-aware NIC hash settings.
+  Stock traffic concentrates on one CPU at about 4.1 Gb/s; port-aware hashing
+  distributes work over eight CPUs at about 9.0 Gb/s.}
   \caption{Receive-side CPU distribution under the tested NIC hash settings.
   Adding UDP ports spreads eight distinct tunnels; it does not split one
   tunnel's outer five-tuple. Aggregate throughput values are the two-run ranges
@@ -109,6 +114,9 @@ not establish an application-level benefit.
 \begin{figure}[t]
   \centering
   \includegraphics[width=\columnwidth]{wake_delay_response.pdf}
+  \Description{A dose-response plot shows the wasted-poll fraction under stock
+  and both wake mechanisms for injected decrypt delays from zero to ten
+  microseconds.}
   \caption{Wasted receive polls versus injected decrypt delay. Points show all
   five repetitions; lines and bands show medians and interquartile ranges.
   This dose-response experiment is exploratory.}
@@ -138,6 +146,8 @@ redundant.
 \begin{figure}[t]
   \centering
   \includegraphics[width=\columnwidth]{empty_poll_cost.pdf}
+  \Description{A two-panel plot shows wasted-poll duration in microseconds and
+  the aggregate core-equivalent budget for each valid measurement window.}
   \caption{Measured wasted-poll duration and aggregate CPU budget for valid
   cost-accounting windows. Duration includes kretprobe overhead; no
   unmeasured confidence interval is implied.}
@@ -166,6 +176,8 @@ scheduling opportunity; they are not packet or application latency.
 \begin{figure}[t]
   \centering
   \includegraphics[width=\columnwidth]{classified_blocking.pdf}
+  \Description{Two panels show the count and mean duration of classified
+  uncrypted-head episodes for three repetitions at each decrypt-delay level.}
   \caption{Count and mean duration of classified
   \textsc{uncrypted}-head episodes in the spread-guaranteed rerun. Each marker
   is one 30-s repetition; the evidence is descriptive.}
@@ -215,8 +227,11 @@ favorable direction.
 \begin{figure*}[t]
   \centering
   \includegraphics[width=0.92\textwidth]{gate_a_paired.pdf}
+  \Description{Two paired-difference panels show all twelve blocks for
+  throughput and total busy CPU, together with their mean and paired-bootstrap
+  confidence interval.}
   \caption{Saturated paired confirmation. Each point is the within-block
-  steal4-minus-off difference; the diamond and horizontal interval show the
+  steal4-minus-off difference; the horizontal line and shaded band show the
   mean and paired-bootstrap CI95. Throughput and total busy CPU are
   co-primary.}
   \label{fig:gate-a}
@@ -261,6 +276,9 @@ effect.  No secondary contrast was detected after Holm adjustment.
 \begin{figure*}[t]
   \centering
   \includegraphics[width=0.92\textwidth]{gate_b_matched.pdf}
+  \Description{The left panel shows all thirty-two delivered loads near 3.8
+  gigabits per second. The right panel shows all eight paired total-CPU
+  differences and a confidence interval crossing zero.}
   \caption{Matched-load CPU confirmation. Left: all 32 exact-window delivered
   loads. Right: the eight paired steal4-minus-off total-CPU differences with
   mean and CI95. The interval spans benefit and cost; the result is a
@@ -329,3 +347,4 @@ warning, tunnel collapse, or lost handshake.  This did not reveal a reliability
 problem in the tested regimes, but it is not proof of production safety.
 Synchronous softirq crypto is not charged to NAPI's delivery budget, and this
 study does not quantify per-peer fairness or scheduler-latency effects.
+\par\endgroup

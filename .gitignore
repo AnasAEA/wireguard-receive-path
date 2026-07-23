@@ -33,6 +33,7 @@ Thumbs.db
 # ── Generated PDFs (research papers in Documents Read/ are kept) ──
 report/*.pdf
 *.pdf
+!paper/figures/generated/*.pdf
 !Documents Read/*.pdf
 !resources/instructions_2526.pdf
 

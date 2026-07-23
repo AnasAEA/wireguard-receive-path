@@ -45,6 +45,7 @@ Vector figures under `figures/generated/` are produced from committed
 experimental evidence. After the technical plotting scripts are added, run:
 
 ```sh
+python3 -m pip install -r ../scripts/paper/requirements.txt
 make figures
 ```
 
