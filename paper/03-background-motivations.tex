@@ -1,4 +1,218 @@
 \section{Background and Motivation}
 \label{sec:background}
 
-% Placeholder owned by the narrative writing pass.
+This section builds the model a reader needs to follow the mechanism. It
+introduces the receive path, the two orderings that collide on it, the
+single-tunnel setting in which the collision binds, and the measurement unit we
+use for CPU. Readers familiar with WireGuard internals may skip to
+Section~\ref{sec:background-inversion}.
+
+\subsection{WireGuard Receive Processing}
+\label{sec:background-recv}
+
+A modern NIC exposes several hardware receive queues. It hashes each incoming
+packet's flow identifier and steers the packet to a queue, so that different
+flows are served by different CPUs~\cite{linux-napi,salim2001beyond}. Linux
+drains a queue with NAPI: after the first interrupt, the kernel masks further
+interrupts for that queue and repeatedly runs a poll function in softirq
+context, delivering packets in batches until the queue drains or a budget is
+reached. Softirq is a deferred, high-priority kernel context that runs after
+hardware interrupts and cannot sleep.
+
+WireGuard adds decryption between the NIC and the network stack, and it uses two
+distinct structures to do so (Figure~\ref{fig:recv-overview}). When a data
+packet arrives, WireGuard appends it to a \emph{per-peer ordered queue} in
+arrival order and marks it \textsc{uncrypted}. It also publishes the same packet
+to a \emph{device-wide decrypt ring}, a single lock-protected ring shared by the
+whole WireGuard device~\cite{wireguard-linux}. Per-CPU \emph{decrypt workers}
+consume the ring in parallel, authenticate and decrypt each packet with
+ChaCha20-Poly1305~\cite{rfc8439}, and mark it \textsc{crypted}, or
+\textsc{dead} on failure. The two structures serve deliberately different
+purposes: the device ring chooses \emph{which CPU} decrypts a packet, while the
+per-peer queue records the order in which packets must \emph{leave}. The ring
+does not preserve packet order, and it never needs to, because ordering is the
+per-peer queue's responsibility.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\columnwidth]{c1_recv_overview.pdf}
+  \Description{A pipeline diagram. The NIC feeds one receive queue and an
+  RX/NAPI context for one tunnel. Arriving packets are recorded in a per-peer
+  ordered queue and also published to a device-wide decrypt ring. Several
+  per-CPU decrypt workers pull jobs from the ring in parallel and mark packets
+  decrypted. The RX/NAPI poll delivers packets from the head of the ordered
+  queue to the network stack.}
+  \caption{WireGuard's receive path for one tunnel. The device-wide ring
+  \emph{assigns} decrypt work to any available worker; the per-peer queue
+  \emph{preserves} delivery order. A single RX/NAPI poll is that queue's only
+  consumer. The ring does not order packets.}
+  \label{fig:recv-overview}
+\end{figure}
+
+\subsection{Parallel Decryption and Ordered Delivery}
+\label{sec:background-order}
+
+Two orderings coexist on this path. \emph{Arrival order} is fixed when a packet
+enters the per-peer queue and does not change. \emph{Completion order} is the
+order in which workers finish decrypting, and it is set by per-CPU scheduling
+and load, not by arrival. Because consecutive packets of one tunnel are handed
+to different workers, they decrypt concurrently and can complete in any order.
+
+Delivery, however, is strictly ordered. The per-peer queue has exactly one
+consumer, the tunnel's RX/NAPI poll. The poll examines the \emph{ordered head},
+the next packet the queue is allowed to release, and removes it only after an
+acquire load observes a terminal state: a \textsc{crypted} head proceeds to the
+network stack, and a \textsc{dead} head is drained. An \textsc{uncrypted} head
+stops the poll. A later packet that has already completed cannot pass an
+incomplete head, because releasing it would deliver the tunnel's packets out of
+order.
+
+\subsection{Execution-Order Inversion}
+\label{sec:background-inversion}
+
+When completion order diverges from arrival order, the poll can be runnable yet
+unable to make progress. Figure~\ref{fig:eoi-timeline} traces the smallest case.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\columnwidth]{c2_eoi_timeline.pdf}
+  \Description{A timeline with two decrypt lanes and one delivery lane. Packet
+  P1 arrives first and P2 second, but P2 finishes decrypting before P1. When
+  P2 completes, the delivery poll runs and finds the head P1 still encrypted, so
+  it delivers nothing. A shaded interval marks the blocked window that lasts
+  until P1 finishes, after which both packets are delivered in order.}
+  \caption{Execution-order inversion for two packets of one tunnel. \texttt{P2}
+  completes before the ordered head \texttt{P1}, so the poll that \texttt{P2}
+  wakes delivers nothing; delivery stays blocked until \texttt{P1} completes.
+  Holding the ready \texttt{P2} behind \texttt{P1} is correct ordered delivery,
+  not an error.}
+  \label{fig:eoi-timeline}
+\end{figure}
+
+\begin{enumerate}
+  \item Packet \texttt{P1} arrives first and becomes the ordered head.
+  \item Packet \texttt{P2} arrives second and is queued behind it.
+  \item Both packets are published to the device ring and dispatched to parallel
+    decrypt workers.
+  \item \texttt{P2}'s worker finishes first, so \texttt{P2} becomes
+    \textsc{crypted} while \texttt{P1} is still \textsc{uncrypted}.
+  \item \texttt{P2} is ready, but it cannot be delivered: it sits behind the
+    incomplete head \texttt{P1}.
+  \item The receive poll reaches \texttt{P1}, observes \textsc{uncrypted}, and
+    stops without delivering anything.
+  \item Meanwhile, pending decrypt jobs may still remain in the device-wide
+    ring, including \texttt{P1}'s own job if no worker has claimed it yet.
+  \item The blocked poll is the one context that has noticed the stall, and it
+    is idle. This is the opportunity that bounded work stealing exploits.
+\end{enumerate}
+
+We call this pattern head-of-line blocking under an execution-order inversion.
+Two points are worth stating plainly, because both guard against a natural
+misreading. First, stock WireGuard handles \texttt{P2} correctly: holding a
+ready follower behind an incomplete head is exactly what ordered delivery
+requires, not a bug. Second, the stall is not caused by \texttt{P1} being
+inherently slow to decrypt; as Section~\ref{sec:background-wake} shows, the head
+usually waits to be \emph{scheduled} onto a worker. The inefficiency is a
+scheduling one: useful decrypt work is pending, and the context that needs it
+completed is doing nothing.
+
+\subsection{Receive Steering and the Single-Tunnel Bottleneck}
+\label{sec:background-steering}
+
+Receive steering determines how much of this matters. Flow hashing distributes
+distinct flows across receive queues and cores, and receive-side scaling has a
+long line of work on placing connections to improve
+locality~\cite{linux-napi,pesterev2012affinity}. For WireGuard, steering acts on
+the \emph{outer} UDP flow. Several tunnels between the same two hosts share a
+source and destination IP address, so the default address-only hash sends them
+all to one queue; adding the UDP ports to the hash spreads them across cores. In
+our testbed, the default hash concentrated eight tunnels on a single receive
+core at about 4.1~Gb/s, while a port-aware hash spread them across roughly eight
+cores at about 9.0~Gb/s (Section~\ref{sec:eval-steering}).
+
+That result is about placing \emph{many} tunnels; it cannot split \emph{one}. A
+single tunnel is a single outer five-tuple, so every packet hashes to the same
+queue and its ordered delivery runs in one RX/NAPI context regardless of how
+many cores are idle. In the uncapped single-tunnel experiments, that context's
+softirq processing stayed near one core-equivalent across conditions. The
+single-heavy-tunnel case, common in site-to-site links, is therefore the regime
+where the receive core is the binding resource and where changing the work that
+context performs can move the ceiling.
+
+\subsection{From Premature Wakes to Pending Decrypt Work}
+\label{sec:background-wake}
+
+There are two ways an inversion wastes the receive core, and they cost very
+differently. The visible symptom is \emph{premature polls}: a completed non-head
+packet wakes the poll, which runs, finds the head still \textsc{uncrypted}, and
+delivers nothing. Wake-side changes target these polls, and they work. Two
+composable changes, described in Section~\ref{sec:design-wake}, cut the
+wasted-poll fraction from about 27\% to 13--15\%, and the share they remove
+grows as decryption is slowed, which ties the effect directly to the inversion.
+
+Yet removing premature polls does not help throughput or aggregate CPU on this
+hardware, because each premature poll is cheap. Summing the duration of every
+empty poll over a measurement window shows that the entire stock population
+occupies only about $0.02$ core-equivalents
+(Section~\ref{sec:eval-poll-cost}). The wake-side changes remove many events,
+but the events are individually inexpensive, so the reclaimed CPU is far below
+the run-to-run noise. This is a genuine result rather than a failed fix: it
+locates the cost, and it redirects attention to a different quantity.
+
+That quantity is the time delivery spends \emph{blocked} behind an incomplete
+head. A per-episode classifier that separates empty-queue stalls from
+incomplete-head stalls shows the incomplete-head intervals last tens of
+microseconds, with means of roughly 35--94~us
+(Section~\ref{sec:eval-blocking}). The head is not slow to decrypt; it is slow
+to be scheduled onto a worker, and the blocked poll waits out that scheduling
+delay. Figure~\ref{fig:investigation} summarizes the reasoning: premature polls
+are real but cheap, whereas the blocked interval is longer-lived and is where a
+direct intervention can act. Bounded work stealing is that intervention. Rather
+than merely avoiding a wake, it advances the pending decrypt work that the
+delivery consumer is waiting for. Figure~\ref{fig:steal-panels} contrasts the
+stock stall with a stealing pass; Section~\ref{sec:design-steal} specifies the
+mechanism.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\columnwidth]{c4_investigation.pdf}
+  \Description{A vertical flow of five steps. Premature polls are observed;
+  wake-side changes remove many of them; the measured cost of an empty poll is
+  small; ordered-head blocking lasts far longer; bounded work stealing targets
+  the pending decrypt work behind the blocked head.}
+  \caption{Why the investigation moved from suppressing wakes to advancing
+  pending work. Removing premature polls is real but cheap; the longer-lived
+  cost is the interval spent blocked behind an incomplete head.}
+  \label{fig:investigation}
+\end{figure}
+
+\begin{figure*}[t]
+  \centering
+  \includegraphics[width=0.95\textwidth]{c3_stock_vs_steal.pdf}
+  \Description{Two panels sharing one RX/NAPI CPU. In the stock panel, the
+  ordered head is encrypted, the poll finds nothing to deliver, and it yields
+  while pending jobs remain in the device ring. In the stealing panel, the same
+  CPU consumes up to four pending jobs from the device ring one at a time,
+  decrypts them itself while workers continue in parallel, rechecks the head,
+  and resumes ordered delivery once the head becomes ready.}
+  \caption{Stock behavior versus one bounded stealing pass, on the same RX/NAPI
+  CPU. Stock yields with the head still encrypted while pending jobs wait.
+  Stealing lets that CPU consume up to $k$ jobs from the device-wide ring (here
+  $k=4$), decrypt them sequentially while normal workers continue in parallel,
+  and resume delivery once the head is ready. It is one CPU doing bounded extra
+  work, not four workers, and it never removes a packet out of order.}
+  \label{fig:steal-panels}
+\end{figure*}
+
+\subsection{Measuring Receive-Side CPU}
+\label{sec:background-ce}
+
+Throughput alone cannot show where receive-side cost goes, so we report CPU in
+\emph{core-equivalents} (CE). One core-equivalent represents one CPU core busy
+continuously over the measurement interval; four CE can mean four continuously
+busy cores or an equivalent aggregate occupancy spread across more cores. We
+compute CE from per-CPU busy time over the exact measurement window, sum it
+across all logical CPUs for total busy CE, and report softirq CE separately as
+descriptive context. This unit lets us compare the cost of the same delivered
+bytes under different treatments, and it is the endpoint on which the
+confirmatory experiments in Section~\ref{sec:evaluation} rest.

@@ -1,4 +1,103 @@
 \section{Introduction}
 \label{sec:introduction}
 
-% Placeholder owned by the narrative writing pass.
+WireGuard decrypts a tunnel's packets in parallel to raise throughput, yet must
+hand them to the network stack in the order they arrived. On the receive path,
+each data packet is recorded in a per-peer queue in arrival order and, at the
+same time, published to a device-wide ring that per-CPU workers drain and
+decrypt~\cite{donenfeld2017,wireguard-linux}. Parallel decryption is what lets a
+single tunnel use more than one core. Ordered delivery is a protocol
+requirement: the packet due next must be committed before any packet behind it.
+These two requirements meet at one difficult point. The packet due for delivery
+next may be one of the last to finish decrypting.
+
+Consider two packets from one tunnel. \texttt{P1} arrives first and becomes the
+ordered head; \texttt{P2} arrives behind it. Both are dispatched to the shared
+decrypt ring, and a worker completes \texttt{P2} before the worker handling
+\texttt{P1}. \texttt{P2} is now decrypted, but it cannot be delivered: the
+receive poll advances the per-peer queue only from its head, and the head,
+\texttt{P1}, is still encrypted. The poll reaches \texttt{P1}, stops, and
+delivers nothing, even though ready data waits behind it and pending decrypt
+work may still sit in the shared ring. We call this an execution-order
+inversion. The consumer that would deliver is runnable, but the work it needs is
+owned by a different scheduling path. Ordered delivery itself is correct here;
+the inefficiency is that the blocked context waits while useful work remains
+available.
+
+This inversion matters most for a single tunnel. On a multicore receiver, the
+NIC hashes each packet's flow to a receive queue, and distinct flows land on
+distinct cores~\cite{linux-napi,salim2001beyond}. Flow hashing therefore spreads
+\emph{many} tunnels across cores, but it does not divide \emph{one}: a WireGuard
+tunnel is a single outer UDP flow with fixed addresses and ports, so its packets
+hash to one receive queue and its ordered delivery runs in one RX/NAPI context.
+In our single-tunnel measurements, that context's softirq processing occupies
+close to one full core and becomes the throughput ceiling. Site-to-site and
+single-heavy-tunnel deployments stay bound to one receive core no matter how
+many cores the machine has, and the inversion is felt exactly there.
+
+Because a completed non-head packet wakes the receive poll, an inversion
+produces polls that run before the head is ready and deliver nothing.
+Suppressing those premature wakes is a natural first step, and one that connects
+to prior work on the same receive path, which improved it by changing where
+deferred receive processing executes~\cite{mounah2025}. We implemented two
+composable wake-side changes that remove premature wakes directly. They reduce
+the wasted-poll fraction substantially, from about 27\% to 13--15\% across peer
+counts, and their effect strengthens as decryption is made slower, which
+confirms that they act on the inversion. Direct accounting, however, shows the
+reclaimed work is small: the entire population of wasted polls occupies only
+about two hundredths of a core on the tested hardware. The wake-side changes
+remove many events, but each event is cheap, so no throughput or aggregate-CPU
+benefit follows on this platform. The changes are real and they work as
+intended; they are simply not where the cost lives.
+
+The quantity that matters is not how often the poll fires early, but how long
+delivery stays blocked behind an encrypted head. Classified instrumentation
+shows those intervals last tens of microseconds: the head is not slow to
+decrypt, it is slow to be \emph{scheduled} for decryption, while the blocked
+context sits idle. \texttt{wg\_steal} puts that idle context to work. When
+ordered delivery stalls behind an incomplete head, the blocked NAPI context
+performs a bounded amount of pending decrypt work itself before yielding. It
+consumes jobs from the device-wide decrypt ring, decrypts them on its own core,
+and publishes each through WireGuard's normal completion path, then rechecks the
+head and resumes ordered delivery. Normal workers keep running in parallel, the
+borrowed work is bounded, and packet order is never bypassed.
+
+% EVIDENCE REVIEW: the headline figures restated in this paragraph
+% (+1.96% throughput and -3.66% total CPU for the saturated confirmation;
+% -1.17% CPU non-detection for the matched-load confirmation) are taken
+% verbatim from docs/paper/CLAIM_EVIDENCE_MATRIX.md (C11, C12, C17) and
+% paper/tables/confirmation_results.tex. Restated for the reader, not recomputed.
+We evaluate a bounded budget of four jobs per stealing pass in two paired
+confirmations on 10-GbE CloudLab hardware. In the uncapped saturated
+single-tunnel regime, where the receive core is the binding resource, stealing
+raised throughput by 1.96\% and reduced total busy CPU by 3.66\%; both were
+declared co-primary endpoints, and both moved in the favorable direction. At an
+exactly matched delivered load near 3.8~Gb/s, no favorable CPU effect was
+detected: the estimate is $-1.17\%$, with a confidence interval that spans both
+a saving and a small cost. Mechanism counters show that the classified
+blocked-head population was still nearly eliminated at that load, so the
+mechanism remained active even where its aggregate-CPU effect was not
+detectable. This pattern is consistent with stealing becoming measurable as the
+pinned receive core approaches its binding limit. It does not establish a
+saturation threshold, and we make no user-visible latency claim.
+
+This paper makes the following contributions.
+\begin{itemize}
+  \item A source-level characterization of execution-order inversion and
+    ordered-head blocking in WireGuard's parallel receive path
+    (Section~\ref{sec:background}, Section~\ref{sec:design-model}).
+  \item Instrumentation that separates premature polling from longer-lived
+    encrypted-head waiting, and that quantifies the cost of each
+    (Section~\ref{sec:eval-poll-cost}, Section~\ref{sec:eval-blocking}).
+  \item \texttt{wg\_steal}, a bounded, ordering-preserving mechanism that lets a
+    blocked receive context perform pending decrypt work from the device-wide
+    ring (Section~\ref{sec:design-steal}).
+  \item A paired CloudLab evaluation that detects a throughput and total-CPU
+    benefit in the uncapped saturated regime and reports a valid matched-load
+    CPU non-detection near 3.8~Gb/s (Section~\ref{sec:eval-gatea},
+    Section~\ref{sec:eval-gateb}).
+  \item An explicit account of the mechanism's limits, including fairness and
+    softirq-duration trade-offs and the absence of a valid user-visible latency
+    result (Section~\ref{sec:design-limitations},
+    Section~\ref{sec:eval-limitations}).
+\end{itemize}
